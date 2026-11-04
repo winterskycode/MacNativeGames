@@ -8,6 +8,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __ANDROID__
+#include "player_files.h"
+#endif
 /* The six verified files: name, size, decoded font size and SHA-256 from shared-fonts.txt in the game data folder
    (game_data.h, scripts/prepare_shared_fonts.py), read with the fonts. */
 #define SHARED_FONT_COUNT 6
@@ -17,6 +20,12 @@ static uint8_t *region;static uint64_t offsets[SHARED_FONT_COUNT];
 static pthread_once_t once=PTHREAD_ONCE_INIT;
 static void need(int c,const char *m){if(!c)runtime_fail(m);}
 static void load(void){
+#ifdef __ANDROID__
+ /* From the player's own files there is no firmware: all six are the app's font (host/player_files.c), plain at its address */
+ if(player_on&&player_on()){uint64_t n=0;region=(uint8_t *)player_shared_font(&n);need(region&&n,"shared font in the app");
+  for(int i=0;i<SHARED_FONT_COUNT;i++){offsets[i]=0;rows[i].font_bytes=n;}
+  fprintf(stderr,"[totk] shared fonts: the app's own font, %llu bytes\n",(unsigned long long)n);return;}
+#endif
  uint64_t total=0;
  for(int i=0;i<SHARED_FONT_COUNT;i++){char key[32];
   snprintf(key,sizeof key,"FONT%d_FILE",i);rows[i].path=runtime_game_text("shared-fonts.txt",key);need(!strchr(rows[i].path,'/'),"shared font file name");

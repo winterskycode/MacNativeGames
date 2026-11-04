@@ -14,6 +14,8 @@
 // 3D textures: all depth slices of this level are decoded at once; slice k is at dst_linear + k × dst_pitch × block row count of this level.
 // Linear / linear-render-target storage is copied by pitch. Multisampling and BUFFER return -1; success returns 0.
 int nvn_deswizzle(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src_storage, void *dst_linear, size_t dst_pitch);
+uint32_t nvn_deswizzle_rows_count(const nvn_texdesc *d, unsigned level, unsigned layer);   /* rows a level splits into (slices * rows) */
+int nvn_deswizzle_rows(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src_storage, void *dst_linear, size_t dst_pitch, uint32_t r0, uint32_t r1);   /* rows [r0, r1) only */
 // 反向（单测往返用）：线性 src_linear → 写进整张贴图存储 dst_storage 的对应级 / 层
 // Reverse (for unit test round trips): linear src_linear → written into the corresponding level / layer of the whole-texture storage dst_storage
 int nvn_swizzle(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src_linear, size_t src_pitch, void *dst_storage);

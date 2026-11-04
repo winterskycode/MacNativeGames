@@ -22,7 +22,7 @@
      mscan base                   module bases, the heap and the alias region
    Reads go through mach_vm_read_overwrite, so a page the game unmaps during a scan is skipped instead of faulting, and
    only pages mincore reports as touched are read, so a scan does not make mapped but untouched memory resident. */
-#if !TARGET_OS_IPHONE
+#if !TARGET_OS_IPHONE && !defined(__ANDROID__)   /* Mac only: Mach thread state and watchpoints */
 #include <math.h>
 #include <stdarg.h>
 #include <pthread.h>

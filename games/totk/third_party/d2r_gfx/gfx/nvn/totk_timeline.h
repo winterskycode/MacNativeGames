@@ -24,7 +24,15 @@ enum {
     TL_CW_IN, TL_CW_OUT,            /* a guest thread waits for a virtual core (threads.c core_take) */
     TL_WB_IN, TL_WB_OUT,            /* GPU renderings written back to memory (nvn_mtl.m wb_write_list): in a = entries; out a = entries, b = 1 a read-back blit was among them */
     TL_WB_STEP,                     /* inside it: a = 1 the renderings' fences passed (b = fence), 2 the uploads finished, 3 a texture read back, all levels and layers (b = serial) */
+    TL_INPUT,                       /* TOTK Android: the game read the controller (a = buttons, b = right stick x); a = 1 << 40 | axis: input.now set that stick to b */
+    TL_SHOWN,                       /* TOTK Android: a picture reached the screen (VK_GOOGLE_display_timing): t = actual
+                                       present time, a = present id, b = when it was presented (same clock) */
+    TL_PIXELS,                      /* TOTK Android (TOTK_LATENCY_PROBE): how much picture a changed from the one before (b) */
+    TL_REC_END,                     /* TOTK Android: nvnCommandBufferEndRecording (a = bytes recorded; the thread is the recording thread) */
+    TL_REC_BEGIN,                   /* TOTK Android: nvnCommandBufferBeginRecording (a = the command buffer) */
+    TL_REC_COPY,                    /* TOTK Android: CopyCommands / CallCommands inlines handle a into command buffer b */
 };
+#define TL_INPUT_SCRIPTED (1ull << 40)   /* TL_INPUT a: input.now set stick axis (a & 0xff) to b (latency_report.py: a >> 40) */
 
 int totk_tl_on(void);                                   /* the window is open (cheap after the first call) */
 void totk_tl(int kind, uint64_t a, uint64_t b);         /* event now, on this thread */

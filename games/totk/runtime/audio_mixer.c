@@ -60,7 +60,7 @@ typedef struct Mixer {
 static _Atomic float device_volume = 1.0f;
 static _Atomic int g_active_channels = 0;
 
-#if !TARGET_OS_IPHONE
+#if !TARGET_OS_IPHONE && !defined(__ANDROID__)   /* Android: stereo (the AAudio output, compat/src) */
 /* Whether the output device's own channel layout has a centre and an LFE channel (after PR #1224): a channel count of 6
    or more alone also matches a recording interface or an 8-channel HDMI output wired to two speakers, where 5.1 would
    send the dialogue (centre) and the surrounds to channels nobody hears. A layout that cannot be read counts as stereo;
@@ -99,7 +99,7 @@ static int detect_output_channels(AudioComponentInstance unit) {
     const char *e = getenv("TOTK_AUDIO_CHANNELS");
     if (e && !strcmp(e, "6")) return 6;
     if (e && !strcmp(e, "2")) return 2;
-#if !TARGET_OS_IPHONE
+#if !TARGET_OS_IPHONE && !defined(__ANDROID__)
     if (unit) {
         AudioStreamBasicDescription hw_fmt = {0};
         UInt32 sz = sizeof(hw_fmt);
@@ -122,7 +122,7 @@ static int detect_system_channels(void) {
     const char *e = getenv("TOTK_AUDIO_CHANNELS");
     if (e && !strcmp(e, "6")) return 6;
     if (e && !strcmp(e, "2")) return 2;
-#if !TARGET_OS_IPHONE
+#if !TARGET_OS_IPHONE && !defined(__ANDROID__)
     AudioComponentDescription d = {kAudioUnitType_Output, kAudioUnitSubType_DefaultOutput, kAudioUnitManufacturer_Apple, 0, 0};
     AudioComponent c = AudioComponentFindNext(NULL, &d);
     if (c) {
@@ -288,9 +288,11 @@ static void output_open(Mixer *m, int rate) {
         m->channels = 6;
         err = AudioUnitSetProperty(m->unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &f6, sizeof f6);
         if (!err) {
+#ifndef __ANDROID__   /* Android (AAudio): six channels are 5.1 in this order already */
             AudioChannelLayout layout = {0};
             layout.mChannelLayoutTag = kAudioChannelLayoutTag_AudioUnit_5_1;
             (void)AudioUnitSetProperty(m->unit, kAudioUnitProperty_AudioChannelLayout, kAudioUnitScope_Input, 0, &layout, sizeof layout);
+#endif
             err = AudioUnitSetProperty(m->unit, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0, &cb, sizeof cb);
         }
         if (!err) err = AudioUnitInitialize(m->unit);
@@ -603,11 +605,25 @@ static void voice_render(AudioRenderer *r, ServerVoice *v, float out[6][MAX_FRAM
     memcpy(w.valid, v->valid, sizeof w.valid);
     walk_skip_empty(&w);
     int cc = (int)v->in.channel_count; double frac = v->fraction;
+    /* s0, s1: the samples at w and next. Each is decoded once however many output frames it spans, and one step along
+       reuses s1: per frame this walk was 1.9% of the CPU in play (2026-11-04) */
+    Walk next; float s0[6], s1[6]; int have = 0;
     for (int k = 0; k < frames; k++) {
-        Walk next = w; walk_step(&next);
-        for (int c = 0; c < cc; c++) { float s0 = sample_at(&w, c), s1 = sample_at(&next, c); out[c][k] = (float)(s0 + (s1 - s0) * frac); }
+        if (!have) {
+            next = w; walk_step(&next); have = 1;
+            for (int c = 0; c < cc; c++) { s0[c] = sample_at(&w, c); s1[c] = sample_at(&next, c); }
+        }
+        for (int c = 0; c < cc; c++) out[c][k] = (float)(s0[c] + (s1[c] - s0[c]) * frac);
         frac += step;
-        while (frac >= 1.0) { frac -= 1.0; walk_step(&w); }
+        if (frac < 1.0) continue;
+        frac -= 1.0;
+        if (frac < 1.0) {
+            w = next; next = w; walk_step(&next);
+            for (int c = 0; c < cc; c++) { s0[c] = s1[c]; s1[c] = sample_at(&next, c); }
+        } else {
+            have = 0; walk_step(&w);
+            while (frac >= 1.0) { frac -= 1.0; walk_step(&w); }
+        }
     }
     v->adpcm.history[0] = w.h1; v->adpcm.history[1] = w.h2; v->adpcm.buffer = w.abuf; v->adpcm.at = w.aat;
 }

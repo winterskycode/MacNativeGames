@@ -1,6 +1,6 @@
 using System;
 using System.Collections.Generic;
-using System.Security.Cryptography;
+
 
 // TOTK 1.1.2 / 1.4.3 visibility counter: each invocation passing its input test
 // participates in a ballot; the highest active lane adds popcount(ballot) to s1[0].
@@ -16,10 +16,12 @@ static class VertexCounterLowering
     // 1.1.2's s0[8304 + vertex_id*4]. The guarded ballot/popcount/atomic tail
     // has the same reduction: one increment for every passing invocation.
     const string InstanceCodeHash = "F5F4D23149565ACD852F6B7091F64CC8CB3AA019CCB33BA3F88CED62C6D1FF7B";
-    internal static byte[] Apply(byte[] code, string stage, byte[] spirv, List<string> notes)
+    // vsSubgroups: the host runs subgroup operations in vertex shaders (Android, Turnip: job "vs_subgroups"), so the
+    // counter's ballot / popcount / atomic stays as the game wrote it.
+    internal static byte[] Apply(byte[] code, string stage, byte[] spirv, List<string> notes, bool vsSubgroups = false)
     {
-        if (stage != "vs") return spirv;
-        string codeHash=Convert.ToHexString(SHA256.HashData(code));
+        if (stage != "vs" || vsSubgroups) return spirv;
+        string codeHash=Convert.ToHexString(Sha256Managed.HashData(code));   // managed: no OpenSSL inside the Android app
         if(codeHash!=VertexCodeHash&&codeHash!=InstanceCodeHash)return spirv;
         uint[] w = new uint[spirv.Length / 4]; Buffer.BlockCopy(spirv, 0, w, 0, spirv.Length);
         uint lane = 0, uintType = 0, vectorType = 0, trueId = 0;
@@ -32,7 +34,10 @@ static class VertexCounterLowering
             if (op == 41) trueId = w[i + 2]; // OpConstantTrue
             if (op == 339) { vectorType = w[i + 1]; ballots++; if (w[i + 4] != trueId) throw new InvalidOperationException("counter ballot predicate changed"); }
         }
-        if (lane == 0 || uintType == 0 || vectorType == 0 || ballots != 1)
+        // A host subgroup wider than 32 (Android: 64 / 128) emulates the 32-lane warp: one ballot per 32-lane word, the
+        // word picked by lane >> 5, and the lane compared as lane & 31. With every lane read as 0 and every ballot as
+        // (1,0,0,0) that still selects word 0 = 1: FindUMsb 0 == lane & 31, one increment per vertex.
+        if (lane == 0 || uintType == 0 || vectorType == 0 || ballots == 0)
             throw new InvalidOperationException("analysed vertex counter SPIR-V shape changed");
         uint zero = w[3]++, one = w[3]++, mask = w[3]++;
         var result = new List<uint>(w.Length + 16); result.AddRange(w.AsSpan(0, 5).ToArray());
@@ -53,7 +58,7 @@ static class VertexCounterLowering
                 result.AddRange(new uint[] { (4u << 16) | 83, w[i + 1], w[i + 2], mask });
             else result.AddRange(w.AsSpan(i, (int)(w[i] >> 16)).ToArray());
         }
-        if (loads != 1 || !constants) throw new InvalidOperationException("counter lane use changed");
+        if (loads == 0 || !constants) throw new InvalidOperationException("counter lane use changed");
         notes.Add("verified vertex visibility counter: singleton reduction (one atomic per passing vertex)");
         byte[] output = new byte[result.Count * 4]; Buffer.BlockCopy(result.ToArray(), 0, output, 0, output.Length);
         return output;

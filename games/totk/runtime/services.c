@@ -219,8 +219,18 @@ static uint64_t alias_map(int unmap,uint64_t addr,uint64_t size){
   for(unsigned i=0;i<nstack_maps;i++)if(overlaps(addr,size,stack_maps[i].src,stack_maps[i].size)){pthread_mutex_unlock(&memory_lock);return 0xdc01;}
   uint64_t released=0;for(unsigned i=0;i<count;i++)if(alias_pages[first+i]){alias_pages[first+i]=0;alias_stale[first+i]=1;released+=4096;}alias_bytes-=released;
   uint64_t low=addr&~0x3fffULL,high=(addr+size+0x3fff)&~0x3fffULL;
-  for(uint64_t page=low;page<high;page+=0x4000){unsigned p=(unsigned)((page-start)/4096);if(!alias_pages[p]&&!alias_pages[p+1]&&!alias_pages[p+2]&&!alias_pages[p+3]){
+  /* TOTK_ALIAS_DECOMMIT=0 (Android): the pages stay mapped and resident when the game unmaps them; a later map zeroes
+     the stale ones in user space (below). Giving them back (a hole punch, then a kernel fault and zero-fill on every
+     first touch after the re-map) was most of the game threads' kernel time during streaming (Zora Domain profile,
+     2026-11-01: 15.7% of all CPU in one kernel path, with bursts of 60-140 ms frames). The pool accounting is unchanged. */
+  static int decommit=-1;if(decommit<0){const char *e=getenv("TOTK_ALIAS_DECOMMIT");decommit=!e||atoi(e)!=0;}
+  if(decommit)for(uint64_t page=low;page<high;page+=0x4000){unsigned p=(unsigned)((page-start)/4096);if(!alias_pages[p]&&!alias_pages[p+1]&&!alias_pages[p+2]&&!alias_pages[p+3]){
+#ifdef __ANDROID__
+   /* memfd-backed guest memory (compat/mach_compat.c): punch the page out of the file, so later aliases still share it */
+   if(compat_decommit((void *)page,0x4000))runtime_fail("decommit physical alias page");
+#else
    if(mmap((void *)page,0x4000,PROT_NONE,MAP_FIXED|MAP_PRIVATE|MAP_ANON,-1,0)!=(void *)page)runtime_fail("decommit physical alias page");
+#endif
    memset(alias_stale+p,0,4);}}
  }else if(fresh){
   uint64_t low=addr&~0x3fffULL,high=(addr+size+0x3fff)&~0x3fffULL;
@@ -362,12 +372,46 @@ void *runtime_override(const char *name) {
  for(size_t i=0;i<sizeof(entries)/sizeof(entries[0]);i++)if(!strcmp(name,entries[i].name))return entries[i].fn;
  void *input=runtime_input_override(name);if(input)return input;void *font=runtime_font_override(name);if(font)return font;void *codec=runtime_codec_override(name);if(codec)return codec;void *movie=runtime_movie_override(name);if(movie)return movie;void *clock=runtime_time_override(name);if(clock)return clock;void *applet=runtime_applet_override(name);if(applet)return applet;void *swkbd=runtime_swkbd_override(name);if(swkbd)return swkbd;void *account=runtime_account_override(name);if(account)return account;void *fs=runtime_fs_override(name);if(fs)return fs;void *front=runtime_front_override(name);return front?front:runtime_gfx_override(name);
 }
+/* TOTK_HEAP_PREFAULT=1 (Android; off by default until measured): the pages of a heap extension are populated by a helper
+   thread right after the commit, 32 MiB at a time from the low end, so the game's first touch of fresh heap finds the
+   page there instead of taking a fault (a zeroed shmem page, ~1-3 us each, on the game thread holding a virtual core).
+   Loading the bench save, the game threads spent ~70% of their CPU in the kernel (2026-10 profile); 1.4.3 sets a 2.2 GiB
+   heap during nninitStartup, so the whole of it becomes resident up front (~0.5-1 s of one core, off the game's threads). */
+#ifndef MADV_POPULATE_WRITE
+#define MADV_POPULATE_WRITE 23
+#endif
+static void *heap_prefault_main(void *arg){
+ uint8_t *base=((uint8_t **)arg)[0];size_t size=(size_t)((uint8_t **)arg)[1];free(arg);
+ struct timespec t0;clock_gettime(CLOCK_MONOTONIC,&t0);
+ for(size_t done=0;done<size;){size_t chunk=size-done>(32u<<20)?(32u<<20):size-done;
+  if(madvise(base+done,chunk,MADV_POPULATE_WRITE)){for(size_t o=0;o<chunk;o+=4096)((volatile uint8_t *)base)[done+o]+=0;}   /* an older kernel: touch */
+  done+=chunk;}
+ struct timespec t1;clock_gettime(CLOCK_MONOTONIC,&t1);
+ fprintf(stderr,"[totk-mem] heap prefault: %zu MiB populated in %.0f ms\n",size>>20,(t1.tv_sec-t0.tv_sec)*1e3+(t1.tv_nsec-t0.tv_nsec)/1e6);
+ return NULL;
+}
+static void heap_prefault(uint8_t *base,size_t size){
+ static int on=-1;if(on<0){const char *e=getenv("TOTK_HEAP_PREFAULT");on=e&&atoi(e)>0;}
+ if(!on||size<(2u<<20))return;
+ uint8_t **arg=malloc(2*sizeof *arg);if(!arg)return;arg[0]=base;arg[1]=(uint8_t *)size;
+ pthread_t th;pthread_attr_t a;pthread_attr_init(&a);pthread_attr_setdetachstate(&a,PTHREAD_CREATE_DETACHED);
+ if(pthread_create(&th,&a,heap_prefault_main,arg))free(arg);
+ pthread_attr_destroy(&a);
+}
 void runtime_core_checkpoint(void);
 #ifdef GAME_BOTW
 /* Breath of the Wild (botw.md): the preemption point is also after every SVC. A thread the SVC woke competes for a core at
    once (threads.c wake_queue); when it beats this one on this core, Horizon runs it before the SVC returns. */
 uint64_t runtime_svc_inner(unsigned num,uint64_t *r,const char *module,uint64_t offset);
 uint64_t runtime_svc(unsigned num,uint64_t *r,const char *module,uint64_t offset){uint64_t v=runtime_svc_inner(num,r,module,offset);runtime_core_checkpoint();return v;}
+#define runtime_svc runtime_svc_inner
+#else
+// TOTK_SVC_STATS=1: every SVC timed (threads.c runtime_svc_stats_add)
+int runtime_svc_stats_on(void);void runtime_svc_stats_add(unsigned num,uint64_t ns);uint64_t runtime_now_ns(void);
+uint64_t runtime_svc_inner(unsigned num,uint64_t *r,const char *module,uint64_t offset);
+uint64_t runtime_svc(unsigned num,uint64_t *r,const char *module,uint64_t offset){
+ if(!runtime_svc_stats_on())return runtime_svc_inner(num,r,module,offset);
+ uint64_t t0=runtime_now_ns(),v=runtime_svc_inner(num,r,module,offset);runtime_svc_stats_add(num,runtime_now_ns()-t0);return v;}
 #define runtime_svc runtime_svc_inner
 #endif
 uint64_t runtime_svc(unsigned num,uint64_t *r,const char *module,uint64_t offset) {
@@ -390,7 +434,8 @@ uint64_t runtime_svc(unsigned num,uint64_t *r,const char *module,uint64_t offset
   case 2:value=ALIAS_START;break;case 3:value=ALIAS_SIZE;break;
   case 4:value=(uintptr_t)heap;break;case 5:value=HEAP_CAP;break;
   case 6:case 21:value=APP_POOL;break;case 7:case 22:value=runtime_image_bytes()+heap_size+alias_bytes;
-   { static unsigned polls; if(getenv("TOTK_MEM_LOG")&&(polls++%600)==0) fprintf(stderr,"[totk-mem] GetInfo(%u) total=%#llx used=%#llx image=%#llx heap=%#llx alias=%#llx\n",id,(unsigned long long)APP_POOL,(unsigned long long)value,(unsigned long long)runtime_image_bytes(),(unsigned long long)heap_size,(unsigned long long)alias_bytes); }
+   { static unsigned polls; static int memlog=-1; if(memlog<0)memlog=getenv("TOTK_MEM_LOG")!=NULL;   /* read once: GetInfo(7/22) is called every frame */
+     if(memlog&&(polls++%600)==0) fprintf(stderr,"[totk-mem] GetInfo(%u) total=%#llx used=%#llx image=%#llx heap=%#llx alias=%#llx\n",id,(unsigned long long)APP_POOL,(unsigned long long)value,(unsigned long long)runtime_image_bytes(),(unsigned long long)heap_size,(unsigned long long)alias_bytes); }
    break;
   case 8:value=0;break;case 10:value=0;break;
   case 11:arc4random_buf(&value,8);break;
@@ -438,6 +483,7 @@ uint64_t runtime_svc(unsigned num,uint64_t *r,const char *module,uint64_t offset
  case 0x01:{size_t size=r[1];if(getenv("TOTK_MEM_LOG"))fprintf(stderr,"[totk-mem] SetHeapSize %#zx (image=%#llx alias=%#llx pool=%#llx)\n",size,(unsigned long long)runtime_image_bytes(),(unsigned long long)alias_bytes,(unsigned long long)APP_POOL);
   if(size>HEAP_CAP||size%0x200000||size+runtime_image_bytes()>APP_POOL){r[0]=0xd401;return r[0];}
   if(size>heap_size&&mprotect(heap+heap_size,size-heap_size,PROT_READ|PROT_WRITE))runtime_fail("commit heap");
+  if(size>heap_size)heap_prefault(heap+heap_size,size-heap_size);
   if(size<heap_size&&mprotect(heap+size,heap_size-size,PROT_NONE))runtime_fail("decommit heap");heap_size=size;r[0]=0;r[1]=(uintptr_t)heap;return 0;}
  case 0x0c: r[0]=0;r[1]=44;return 0;
  case 0x0e: r[0]=0;r[1]=0;r[2]=15;return 0;
@@ -446,7 +492,7 @@ uint64_t runtime_svc(unsigned num,uint64_t *r,const char *module,uint64_t offset
  /* SynchronizePreemptionState: the SDK calls it after clearing ThreadLocalRegion disable_count (+0x100) when interrupt_flag
     (+0x102) was set by a preemption that had to wait (threads.c totk_preempt_signal). The switch itself happened at this
     SVC's entry (runtime_core_checkpoint); here the flag is cleared, as Horizon does. */
- case 0x36:{volatile uint16_t *tlr=pthread_getspecific(runtime_keys[2]);if(tlr)tlr[0x102/2]=0;r[0]=0;return 0;}
+ case 0x36:{volatile uint16_t *tlr=runtime_tsd_get(2);if(tlr)tlr[0x102/2]=0;r[0]=0;return 0;}
  case 0x26: {uint32_t result=0;if(r[1]&&r[2]>=4)memcpy(&result,(void *)(uintptr_t)r[1],4);fprintf(stderr,"[totk] guest Break reason=%llx result=%x\n",(unsigned long long)r[0],result);runtime_trace_guest(r[29],r[30]);if(r[0]&0x80000000ULL)return 0;runtime_fail("original SDK Break");}
  case 0x27: {size_t n=r[1];if(n>65536)runtime_fail("debug string too long");fwrite((void *)(uintptr_t)r[0],1,n,stderr);r[0]=0;return 0;}
  case 0x0b:{int64_t ns=(int64_t)r[0];if(ns>0){struct timespec t={ns/1000000000,ns%1000000000};nanosleep(&t,NULL);}r[0]=0;return 0;}

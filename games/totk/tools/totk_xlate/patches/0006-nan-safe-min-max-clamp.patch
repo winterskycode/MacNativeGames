@@ -1,0 +1,23 @@
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/SpirvDelegates.cs	2026-10-21 00:37:41.234005418 -0600
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/SpirvDelegates.cs	2026-10-21 00:37:41.234736795 -0600
+@@ -171,9 +171,9 @@
+             IAdd = context.IAdd;
+             FDiv = context.FDiv;
+             SDiv = context.SDiv;
+-            GlslFMax = context.GlslFMax;
++            GlslFMax = context.GlslNMax;   // TOTK: Maxwell FMNMX returns the non-NaN operand (NMax); FMax leaves NaN undefined and Turnip passes it through
+             GlslSMax = context.GlslSMax;
+-            GlslFMin = context.GlslFMin;
++            GlslFMin = context.GlslNMin;   // TOTK: likewise (NMin)
+             GlslSMin = context.GlslSMin;
+             FMod = context.FMod;
+             FMul = context.FMul;
+@@ -210,7 +210,7 @@
+             AtomicXor = context.AtomicXor;
+ 
+             // Ternary
+-            GlslFClamp = context.GlslFClamp;
++            GlslFClamp = context.GlslNClamp;   // TOTK: .SAT clamps NaN to 0 (NClamp); FClamp leaves NaN undefined
+             GlslSClamp = context.GlslSClamp;
+             GlslFma = context.GlslFma;
+ 

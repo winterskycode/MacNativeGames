@@ -79,10 +79,11 @@ def main():
             code = subprocess.run(command, env=env, stdout=log, stderr=subprocess.STDOUT).returncode
         text = (result / 'merge.log').read_text()
         # A game file that holds the update and DLC in an XCI had their NCAs converted from title-key crypto: their headers
-        # changed, so the header and NPDM RSA signatures no longer verify. The content is still verified by its hash tree
+        # changed, so the header and NPDM RSA signatures no longer verify. The ACID `Signature (FAIL)` line is accepted too: a dump
+        # tool re-signs the NPDM (the user's packages, as with Tears of the Kingdom's 1.4.3 update, 2026-10). The content is still verified by its hash tree
         # (the FS headers' hashes and all six IVFC levels below); every other check stays strict.
-        unsigned = re.findall(r'^\s*(Fixed-Key Signature|NPDM Signature) \(FAIL\)', text, re.M)
-        bad = re.search(r'\(FAIL\)|\(INVALID\)|Failed to|Error:', re.sub(r'^\s*(Fixed-Key Signature|NPDM Signature) \(FAIL\).*$', '', text, flags=re.M))
+        unsigned = re.findall(r'^\s*(Fixed-Key Signature|NPDM Signature|Signature) \(FAIL\)', text, re.M)
+        bad = re.search(r'\(FAIL\)|\(INVALID\)|Failed to|Error:', re.sub(r'^\s*(Fixed-Key Signature|NPDM Signature|Signature) \(FAIL\).*$', '', text, flags=re.M))
         if code or bad:
             (a.output.parent / (a.output.name + '-failure.log')).write_text(re.sub(r'[0-9A-Fa-f]{32,}', '<hex removed>', text))
         require(code == 0 and not bad, 'BKTR verification failed')

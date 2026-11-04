@@ -23,8 +23,11 @@
 // All waits hang on one global lock G, with one condition variable per thread; correctness first, performance to be measured later.
 #include "thread_compat.h"
 #include "dm_wait_stats.h"
+#include "uc_compat.h"
 #include "ipc.h"
 #include <errno.h>
+#include <stdatomic.h>
+#include <unistd.h>
 #include <sched.h>
 #include <signal.h>
 #include <sys/mman.h>
@@ -86,12 +89,141 @@ typedef struct thr {
 #ifdef GAME_BOTW
     uint64_t cwait_ns;            // when it last queued for a virtual core (starvation rule, core_beats)
     uint64_t protect_until;       // given a core by the starvation rule: no priority preemption before this
-    int cqueued;                  // in g_core_wait: queued by core_take, or by wake_queue the moment it was woken
 #endif
+    int cqueued;                  // in g_core_wait: queued by core_take, or by wake_queue / totk_wake_queue the moment it was woken
+    int spin_short;   /* the last wait ended within the spin window: spin again before sleeping (sync_spin); last, the layout before it is shared */
+    _Atomic int spinning;   /* in sync_spin's loop (set and cleared under G): a wake needs no futex wake, the spinner sees the flag */
 } thr_t;
 static thr_t *g_all;
 
 static pthread_mutex_t G = PTHREAD_MUTEX_INITIALIZER;
+/* TOTK_SVC_STATS: how long G is held, by the line that took it (the holder alone writes g_held_since). */
+static uint64_t g_held_since, g_hold_ns[4096], g_hold_n[4096]; static int g_held_line;   // hold time by the line that took G (W<line>: taken back after a wait, by the line that released it)
+int runtime_svc_stats_on(void);
+static inline void g_acquired(int line) { if (runtime_svc_stats_on()) { g_held_since = now_ns(); g_held_line = line; } }
+/* Wakes and preemption signals made under G are sent after G is released (TOTK_DEFER_SIGNAL=0: under G, as before):
+   a futex wake or a tgkill is a few microseconds of syscall that every other thread then waits for (svc-stats
+   2026-11-01, Zora Domain streaming: G taken 50,000 times a second, held 300-500 ms a second, waited for 400-700 ms a
+   second). The releasing thread drains its own list; a thread about to wait on G drains first. */
+static int g_defer_on = -1;
+static int defer_on(void) { if (g_defer_on < 0) { const char *e = getenv("TOTK_DEFER_SIGNAL"); g_defer_on = !(e && !strcmp(e, "0")); } return g_defer_on; }
+static __thread struct { pthread_cond_t *cv[32]; pthread_t kill[8]; int ncv, nkill; } g_pend;
+static void pend_drain(void) {
+    for (int i = 0; i < g_pend.ncv; i++) pthread_cond_signal(g_pend.cv[i]); g_pend.ncv = 0;
+    for (int i = 0; i < g_pend.nkill; i++) pthread_kill(g_pend.kill[i], SIGUSR2); g_pend.nkill = 0;
+}
+static inline void g_unlock_site(pthread_mutex_t *m, int line) {
+    if (m == &G && g_held_since) { uint64_t d = now_ns() - g_held_since; unsigned i = g_held_line > 0 ? (unsigned)g_held_line & 2047 : 2048 + ((unsigned)line & 2047); g_hold_ns[i] += d; g_hold_n[i]++; g_held_since = 0; }
+    pthread_mutex_unlock(m);
+    if (m == &G && (g_pend.ncv || g_pend.nkill)) pend_drain();
+}
+static inline int g_lock_site(pthread_mutex_t *m, int line) { int r = pthread_mutex_lock(m); if (m == &G) g_acquired(line); return r; }
+#define pthread_mutex_unlock(m) g_unlock_site((m), __LINE__)
+#define pthread_mutex_lock(m) g_lock_site((m), __LINE__)
+/* TOTK_SVC_STATS=1 (diagnostics): calls and wall time per SVC (runtime_svc_stats_add, from runtime_svc), acquisitions of G
+   that had to wait and how long, and waits for a virtual core; one [svc-stats] line every 5 s. */
+static int g_stats = -1;
+static _Atomic uint64_t g_lock_n, g_lock_contended, g_lock_wait_ns, g_core_wait_n, g_core_wait_ns;
+int runtime_svc_stats_on(void) { if (g_stats < 0) g_stats = getenv("TOTK_SVC_STATS") != NULL; return g_stats; }
+static inline void g_lock_at(int line) {
+    int stats = runtime_svc_stats_on();
+    if (stats) g_lock_n++;
+    if (!pthread_mutex_trylock(&G)) { g_acquired(line); return; }
+    uint64_t t0 = stats ? now_ns() : 0; g_lock_site(&G, line);
+    if (stats) { g_lock_contended++; g_lock_wait_ns += now_ns() - t0; }
+}
+#define g_lock() g_lock_at(__LINE__)
+/* A thread's own waits under G (core hand-over, WaitForAddress, arbitration, start), on its condition variable. */
+static _Atomic uint64_t g_spin_wakes_skipped;   /* wakes that needed no syscall: the waiter was spinning (svc-stats) */
+static void tev_signal(thr_t *t) {   // holding G: sent when G is released (pend_drain); no syscall when the waiter is spinning
+    /* A spinning waiter (sync_spin, between its release of G and its re-lock) watches its condition itself; the flag it
+       waits for is set under G before this call, and it looks once more under G before it sleeps, so the futex wake can be
+       left out. On the loading screen the wake syscalls were a third of the game threads' CPU (2026-11-02 call-graph
+       profile: 40% of the kernel time in the deferred cond_signal drain, 30% in the waits). */
+    if (atomic_load_explicit(&t->spinning, memory_order_acquire)) { atomic_fetch_add_explicit(&g_spin_wakes_skipped, 1, memory_order_relaxed); return; }
+    if (defer_on() && g_pend.ncv < 32) g_pend.cv[g_pend.ncv++] = &t->cv; else pthread_cond_signal(&t->cv);
+}
+/* TOTK_SYNC_SPIN_US=<us> (default 100 on Android, 0 elsewhere; =0 off) with TOTK_SYNC_SPINNERS=<n> spinners at most (default 0 in play on Android: loading screens only, see SYNC_SPIN_BOOST): before sleeping on its condition variable, a waiting guest thread releases G and spins
+   that long watching for what it waits for (a virtual core handed to it, or its wake). The game's job system hands cores
+   and work between its ~20 threads about 250 times a frame, mostly in waits far shorter than a futex sleep and wake
+   (2026-10-31 scheduler trace: 18,700 wakeups a second, three quarters of the run slices under 50 us; 28% of the game
+   threads' CPU in the kernel). A thread spins only while its previous wait also ended within the window, so a thread
+   that waits long sleeps as before. The device has eight cores for three virtual ones: the spinners have room. */
+static int64_t g_sync_spin_ns = -1;
+#ifdef __ANDROID__
+#define SYNC_SPIN_DEFAULT_US 100   /* Android, 2026-11-01: cold start of the bench save, loading screen 10.3 -> 7.5 s (-27%) with 2 spinners, 6.9 s with 3;
+                                      Zora Domain route alone: fps unchanged, frames over 33 ms 26-32 -> 8-9; the full route: -2% fps (SYNC_SPINNERS_DEFAULT) */
+#define SYNC_SPINNERS_DEFAULT 0   /* in play no waiter spins: 2 spinners cost 2% fps on the full route, 3 cost 2.5% (Korok Forest, Depths -4..5%; they take physical cores from the translation threads). A loading screen gets 3 (runtime_sync_spin_boost) */
+#else
+#define SYNC_SPIN_DEFAULT_US 0
+#define SYNC_SPINNERS_DEFAULT 2
+#endif
+#define SYNC_SPIN_BOOST 3   /* spinners while a loading screen shows (Android: cold start loading screen 10.3 -> 6.9 s) */
+static int64_t sync_spin_ns(void) { if (g_sync_spin_ns < 0) { const char *e = getenv("TOTK_SYNC_SPIN_US"); g_sync_spin_ns = (e ? atoll(e) : SYNC_SPIN_DEFAULT_US) * 1000; } return g_sync_spin_ns; }
+static _Atomic uint64_t g_spin_waits, g_spin_hits;   /* waits that spun, and spins that saw their condition (svc-stats) */
+static _Atomic int g_spinners;   /* at most spinners_max() threads spin at once: with every thread spinning at a load screen the
+                                    three running ones were starved of physical cores (2026-10-31: the game never reached a frame) */
+static _Atomic int g_spin_boost;   /* spinners added while a loading screen shows (nvn_vulkan.c load_cap) */
+void runtime_sync_spin_boost(int on) { atomic_store(&g_spin_boost, on ? SYNC_SPIN_BOOST : 0); }
+static int spinners_max(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_SYNC_SPINNERS"); v = e ? atoi(e) : SYNC_SPINNERS_DEFAULT; } return v + atomic_load_explicit(&g_spin_boost, memory_order_relaxed); }   /* TOTK_SYNC_SPINNERS=<n> (default 2) */
+static int sync_spin_mode(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_SYNC_SPIN_MODE"); v = e ? atoi(e) : 3; } return v; }   /* bisection: 1 core waits, 2 condition waits */
+/* TOTK_SYNC_SPIN_SMART=1 (default off): the spin is sized per wait site. Each wait keys on what it waits for (a core, a
+   condition key, a mutex / arbiter address, the first handle of a synchronization) and keeps a running average of how
+   long waits there take; a site whose waits usually outlast the spin limit is not spun at all, a short one is spun for
+   about twice its average. The job hand-offs are tens of microseconds, the frame waits milliseconds: this keeps the
+   spin where it pays and off the CPU elsewhere. Measured 2026-11-02 on the full route with the game on the six performance
+   cores, 300 us, 3 spinners: 45.6 fps with it, 45.5 without, the same lows and the same 62.6 C skin -- no gain, the
+   stand-in's extra heat is the game running harder, not the spinning. Kept as a knob, off. */
+#define SITE_SLOTS 1024
+static _Atomic uint64_t g_site_ewma[SITE_SLOTS];   /* ns, exponential average of the waits seen at the site */
+static int spin_smart_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_SYNC_SPIN_SMART"); v = e && atoi(e) > 0; } return v; }
+static unsigned site_slot(const thr_t *t, int for_core) {
+    uint64_t k = for_core ? 1 : t->wkind == 2 ? t->wkey : t->wkind == 4 ? t->wh[0] : t->waddr;
+    k ^= (uint64_t)t->wkind << 56; k *= 0x9E3779B97F4A7C15ull; return (unsigned)(k >> 54) % SITE_SLOTS;
+}
+static void site_note(const thr_t *t, int for_core, uint64_t waited_ns) {   /* after a wait: fold its length into the site's average */
+    if (!spin_smart_on()) return;
+    if (waited_ns > 10000000ull) waited_ns = 10000000ull;
+    _Atomic uint64_t *e = &g_site_ewma[site_slot(t, for_core)]; uint64_t old = atomic_load_explicit(e, memory_order_relaxed);
+    atomic_store_explicit(e, old ? old - old / 4 + waited_ns / 4 : waited_ns, memory_order_relaxed);
+}
+static int sync_spin(thr_t *t, int for_core) {   // holding G; 1: the condition came while spinning (G held again)
+    int64_t ns = sync_spin_ns(); if (ns <= 0 || !(sync_spin_mode() & (for_core ? 1 : 2))) return 0;
+    if (spin_smart_on()) {   /* the site decides: no spin where waits are long, a short spin where they are short */
+        uint64_t e = atomic_load_explicit(&g_site_ewma[site_slot(t, for_core)], memory_order_relaxed);
+        if (e > (uint64_t)ns) return 0;
+        if (e) { int64_t lim = (int64_t)(2 * e) + 10000; if (lim < ns) ns = lim; }
+    } else if (!t->spin_short) return 0;
+    if (atomic_fetch_add(&g_spinners, 1) >= spinners_max()) { atomic_fetch_sub(&g_spinners, 1); return 0; }
+    atomic_store_explicit(&t->spinning, 1, memory_order_release);   /* under G: a signaller that sees it skips the futex wake */
+    pthread_mutex_unlock(&G);
+    uint64_t t0 = now_ns(); int ok = 0; g_spin_waits++;
+    for (;;) {
+        if (for_core ? __atomic_load_n(&t->cur_core, __ATOMIC_ACQUIRE) >= 0 : __atomic_load_n(&t->woke, __ATOMIC_ACQUIRE)) { ok = 1; break; }
+        if ((int64_t)(now_ns() - t0) >= ns) break;
+        __asm__ __volatile__("yield");
+    }
+    atomic_fetch_sub(&g_spinners, 1);
+    g_lock();
+    atomic_store_explicit(&t->spinning, 0, memory_order_release);   /* under G again: from here a wake is signalled */
+    /* the wake may land between the spin's last look and the lock: its signal found nobody waiting, so look once more
+       under the lock (the callers' loops otherwise went to sleep on a wait that had already ended: a stall at start,
+       2026-11-01) */
+    if (!ok && (for_core ? t->cur_core >= 0 : t->woke)) ok = 1;
+    if (ok) g_spin_hits++; else t->spin_short = 0;
+    return ok;
+}
+/* Holding G: release it, wait for a signal (or until abs_rt, a CLOCK_REALTIME deadline, or rel_ns), take it again.
+   0, or ETIMEDOUT. Spurious returns are possible: callers loop on their condition. */
+static int tev_wait(thr_t *t, const struct timespec *abs_rt, int64_t rel_ns) {
+    int r;
+    if (g_pend.ncv || g_pend.nkill) pend_drain();   // what this thread owes before it sleeps (still under G)
+    if (g_held_since) { uint64_t d = now_ns() - g_held_since; unsigned i = g_held_line > 0 ? (unsigned)g_held_line & 2047 : 2048 + (__LINE__ & 2047); g_hold_ns[i] += d; g_hold_n[i]++; g_held_since = 0; }   // the wait releases G
+    if (abs_rt) r = pthread_cond_timedwait(&t->cv, &G, abs_rt);
+    else if (rel_ns > 0) { struct timespec rt = {rel_ns / 1000000000, rel_ns % 1000000000}; r = pthread_cond_timedwait_relative_np(&t->cv, &G, &rt); }
+    else r = pthread_cond_wait(&t->cv, &G);
+    g_acquired(0); return r;
+}
 #define MAX_H 4096
 static struct { int type; void *obj; } g_h[MAX_H];
 static pthread_key_t g_keythr;
@@ -172,6 +304,8 @@ static thr_t *pick(int kind, uint64_t a) {
 }
 #ifdef GAME_BOTW
 static void wake_queue(thr_t *t);   /* below, with the virtual cores */
+#else
+static void totk_wake_queue(thr_t *t);
 #endif
 /* TOTK_TIMELINE (diagnostics, off by default): guest waits, wakes and core waits in the gfx timeline (totk_timeline.c,
    whose definitions replace these weak ones; the thread probes and tests link threads.c without it). */
@@ -181,9 +315,11 @@ enum { TLK_GW_IN = 19, TLK_GW_OUT, TLK_GWAKE, TLK_CW_IN, TLK_CW_OUT };   /* totk
 static int tl_on(void) { return totk_tl_on(); }
 static void wake(thr_t *t, int64_t res) {
     if (tl_on()) { uint64_t id = 0; pthread_threadid_np(t->pt, &id); totk_tl(TLK_GWAKE, id, (uint64_t)t->wkind); }
-    wait_unlink(t); t->wkind = 0; t->woke = 1; t->wres = res; pthread_cond_signal(&t->cv);
+    wait_unlink(t); t->wkind = 0; t->woke = 1; t->wres = res; tev_signal(t);
 #ifdef GAME_BOTW
     wake_queue(t);
+#else
+    totk_wake_queue(t);
 #endif
 }
 // 挂起直到被唤醒或超时（ns<0 无限、0 立即超时）；返回 wres 或 R_TIMEOUT
@@ -277,7 +413,7 @@ static void core_grant(int c) {   // holding G: give free core c to the best wai
         if (core_allowed(*p, c) && (!b || (*p)->prio < b->prio || ((*p)->prio == b->prio && (*p)->cseq < b->cseq))) { b = *p; bp = p; }
 #endif
     if (!b) return;
-    *bp = b->cnext; b->cnext = NULL; b->cur_core = c; b->core_since = now_ns(); core_wait_complete(b, b->core_since); g_core_owner[c] = b; pthread_cond_signal(&b->cv);
+    *bp = b->cnext; b->cnext = NULL; b->cqueued = 0; b->cur_core = c; b->core_since = now_ns(); core_wait_complete(b, b->core_since); g_core_owner[c] = b; tev_signal(b);
 }
 static void core_put(thr_t *t) {   // holding G
     if (t->cur_core < 0) return;
@@ -419,7 +555,9 @@ static int totk_ap_on(void) {   // holding G
         /* On by default on the Mac since 2026-10-25 (user's choice; two short 1.4.3 runs at Lookout Landing: dropped
            refreshes 1.42% -> 0.84%, frame-time p95 15.2 -> 14.3 ms, too short to be conclusive; the author measured
            2.61% -> 0.93%). TOTK_ASYNC_PREEMPT=0 turns it off: the first thing to try when a hang, crash or new stutter
-           shows up. Off on iPhone / iPad until it has run there (=1 turns it on). */
+           shows up. Off on iPhone / iPad until it has run there (=1 turns it on). On by default on Android since
+           2026-10-28: the benchmark (tools/bench.py, uncapped) had 60-80% fewer frames over 33 ms in five of six
+           scenes and 1% more frames overall (Korok Forest 6% fewer). */
         const char *e = getenv("TOTK_ASYNC_PREEMPT");
 #if TARGET_OS_IPHONE
         g_totk_ap = e && !strcmp(e, "1");
@@ -448,10 +586,48 @@ static int totk_should_yield(const thr_t *t) {   // holding G: does a better wai
    at most every AP_RESIGNAL_NS. The handler still checks both itself (the owner may have moved meanwhile). */
 #define AP_RESIGNAL_NS 2000000ull
 static uint64_t g_ap_skip_host, g_ap_skip_disabled, g_ap_skip_recent;
+/* TOTK_CORE_DIAG: where the owners that refused were (host code, by pc): an owner in a host function is then signalled
+   anyway, so the handler sees the pc; the core table prints the most frequent places. Lock-free, lossy table. */
+#define AP_PC_SLOTS 256
+static struct { _Atomic uint64_t key; uint64_t pc, lr, fp1; _Atomic uint64_t n; } g_ap_pcs[AP_PC_SLOTS];
+static void ap_note_pc(uint64_t pc, uint64_t lr, uint64_t fp1) {
+    uint64_t key = (pc ^ lr * 31 ^ fp1 * 961) | 1, h = (key ^ key >> 17) * 0x9E3779B97F4A7C15ull;
+    for (int k = 0; k < 8; k++) {
+        unsigned i = (unsigned)((h + (uint64_t)k) % AP_PC_SLOTS); uint64_t have = atomic_load_explicit(&g_ap_pcs[i].key, memory_order_acquire);
+        if (!have && atomic_compare_exchange_strong(&g_ap_pcs[i].key, &have, key)) { g_ap_pcs[i].pc = pc; g_ap_pcs[i].lr = lr; g_ap_pcs[i].fp1 = fp1; have = key; }
+        if (have == key) { atomic_fetch_add(&g_ap_pcs[i].n, 1); return; }
+    }
+}
+static void ap_describe(uint64_t a, char *out, size_t n) {   // runtime_describe_address, else the library and offset (for addr2line), else the mapping
+    a &= (1ull << 48) - 1;   // a return address read from a frame record carries pointer-authentication bits
+    for (int shift = 48; shift >= 39; shift -= 9) {
+        uint64_t b = a & ((1ull << shift) - 1);
+        runtime_describe_address(b, out, n);
+        if (out[0] != '0' || out[1] != 'x') return;
+        Dl_info di; if (dladdr((void *)(uintptr_t)b, &di) && di.dli_fname) { const char *f = strrchr(di.dli_fname, '/'); snprintf(out, n, "%s+0x%llx", f ? f + 1 : di.dli_fname, (unsigned long long)(b - (uintptr_t)di.dli_fbase)); return; }
+        FILE *m = fopen("/proc/self/maps", "r"); if (!m) continue;
+        char line[512]; while (fgets(line, sizeof line, m)) {
+            unsigned long long lo, hi, off; char perm[8], name[256] = "";
+            if (sscanf(line, "%llx-%llx %7s %llx %*s %*s %255s", &lo, &hi, perm, &off, name) < 4 || b < lo || b >= hi) continue;
+            const char *f = strrchr(name, '/'); snprintf(out, n, "%s+0x%llx", name[0] ? (f ? f + 1 : name) : "[anon]", (unsigned long long)(b - lo + off)); fclose(m); return; }
+        fclose(m);
+    }
+}
+static void ap_print_pcs(void) {
+    struct { unsigned i; uint64_t n; } top[12] = {{0}}; int nt = 0;
+    for (unsigned i = 0; i < AP_PC_SLOTS; i++) {
+        uint64_t n = atomic_exchange(&g_ap_pcs[i].n, 0); if (!atomic_load(&g_ap_pcs[i].key) || !n) continue;
+        int j = nt < 12 ? nt++ : 11; if (j == 11 && top[11].n >= n) continue;
+        top[j].i = i; top[j].n = n;
+        while (j > 0 && top[j - 1].n < top[j].n) { typeof(top[0]) tmp = top[j - 1]; top[j - 1] = top[j]; top[j] = tmp; j--; }
+    }
+    for (int i = 0; i < nt; i++) { char d[128], l[128], f[128]; ap_describe(g_ap_pcs[top[i].i].pc, d, sizeof d); ap_describe(g_ap_pcs[top[i].i].lr, l, sizeof l); ap_describe(g_ap_pcs[top[i].i].fp1, f, sizeof f);
+        fprintf(stderr, "[core-table]   refused in host code at %s <- %s <- %s: %llu times\n", d, l, f, (unsigned long long)top[i].n); }
+}
 static void totk_note_self(thr_t *t) {   // the calling thread, once its slots are set (guest_thread_init): for totk_kick
     if (t->hle_slot || !runtime_hle_tsd_off) return;
-    void *tlr = pthread_getspecific(runtime_keys[2]); if (!tlr) return;
-    uintptr_t tp; __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(tp));
+    void *tlr = runtime_tsd_get(2); if (!tlr) return;
+    uintptr_t tp = runtime_host_tsd();   // the slot block (runtime.h): tpidrro_el0 on Darwin, bionic's app slot on Android
     t->tlr16 = tlr; __atomic_store_n(&t->hle_slot, (volatile uintptr_t *)(tp + runtime_hle_tsd_off), __ATOMIC_RELEASE);
 }
 static int totk_kick(thr_t *t) {   // holding G, t waiting: mark (and signal) the owners t beats; returns how many
@@ -463,11 +639,12 @@ static int totk_kick(thr_t *t) {   // holding G, t waiting: mark (and signal) th
         __atomic_store_n(&o->preempt, 1, __ATOMIC_RELEASE); n++;
         if (!totk_ap_on()) continue;
         volatile uintptr_t *slot = __atomic_load_n(&o->hle_slot, __ATOMIC_ACQUIRE);
-        if (slot && !*slot) { g_ap_skip_host++; continue; }   // in a host function: marked, it yields at its next SVC
+        if (slot && !*slot && !core_diag_on()) { g_ap_skip_host++; continue; }   // in a host function: marked, it yields at its next SVC (TOTK_CORE_DIAG: signalled for its pc)
         if (slot && o->tlr16 && o->tlr16[0x100 / 2]) { o->tlr16[0x102 / 2] = 1; g_ap_skip_disabled++; continue; }   // preemption disabled: SVC 0x36 switches
         if (!now) now = now_ns();
         if (o->ap_sig_ns && now - o->ap_sig_ns < AP_RESIGNAL_NS) { g_ap_skip_recent++; continue; }
-        if (!pthread_kill(o->pt, SIGUSR2)) { g_ap_kicks++; o->ap_sig_ns = now; }
+        if (defer_on() && g_pend.nkill < 8) { g_pend.kill[g_pend.nkill++] = o->pt; g_ap_kicks++; o->ap_sig_ns = now; }   // sent when G is released
+        else if (!pthread_kill(o->pt, SIGUSR2)) { g_ap_kicks++; o->ap_sig_ns = now; }
     }
     return n;
 }
@@ -475,10 +652,12 @@ static void totk_preempt_signal(int sig, siginfo_t *si, void *context) {
     (void)sig; (void)si;
     thr_t *t = me_or_null();
     if (!t || !__atomic_load_n(&t->preempt, __ATOMIC_ACQUIRE) || t->cur_core < 0) return;
-    uint64_t pc = (uint64_t)((ucontext_t *)context)->uc_mcontext->__ss.__pc;
-    uintptr_t tp; __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(tp));
+    uint64_t pc = (uint64_t)UC_PC(((ucontext_t *)context));
+    uintptr_t tp = runtime_host_tsd();
     if (!runtime_hle_tsd_off || !*(volatile uintptr_t *)(tp + runtime_hle_tsd_off) || !runtime_guest_code_pc(pc)) {
-        __atomic_fetch_add(&g_ap_refused, 1, __ATOMIC_RELAXED); return; }   // in a host function: its next SVC gives the core up
+        __atomic_fetch_add(&g_ap_refused, 1, __ATOMIC_RELAXED); if (core_diag_on()) { uint64_t fp = (uint64_t)UC_FP(((ucontext_t *)context)), sp = (uint64_t)UC_SP(((ucontext_t *)context)), fp1 = 0;
+            if (fp >= sp && fp - sp < (1u << 20) && !(fp & 15)) fp1 = ((const uint64_t *)(uintptr_t)fp)[1];   // the caller's return address, when the frame chain looks sane
+            ap_note_pc(pc, (uint64_t)UC_LR(((ucontext_t *)context)), fp1); } return; }   // in a host function: its next SVC gives the core up
     /* Horizon's preemption disable (ThreadLocalRegion +0x100 disable_count, +0x102 interrupt_flag): the SDK's spin locks
        (sdk+0x1277e0 and siblings) set disable_count while they hold or try the lock word, and after clearing it call
        SynchronizePreemptionState (SVC 0x36) when interrupt_flag is set. The kernel does not preempt such a thread; it
@@ -493,6 +672,25 @@ static void totk_preempt_signal(int sig, siginfo_t *si, void *context) {
     else t->preempt = 0;
     pthread_mutex_unlock(&G);
     errno = saved;
+}
+static void totk_core_unqueue(thr_t *t) {   // holding G: out of the core wait queue, if it is in it
+    if (!t->cqueued) return;
+    for (thr_t **p = &g_core_wait; *p; p = &(*p)->cnext) if (*p == t) { *p = t->cnext; break; }
+    t->cnext = NULL; t->cqueued = 0;
+}
+/* A woken thread competes for a core from the moment it is woken, as in Horizon, where it is ready at once (BotW's
+   wake_queue). Before, it queued only once it ran again (core_take after its wait): a futex wake and a schedule
+   later, and only then kicked the owner it beats, for a second wake once the owner gave the core up. Queued at the wake,
+   the owner is signalled at once and the core is granted while the thread is still waking (svc-stats 2026-11-01, Zora
+   Domain streaming: the main thread waited for a core 600 times a second, 0.2 ms each). TOTK_WAKE_QUEUE=0 turns it off. */
+static int g_wake_queue_on = -1;
+static void totk_wake_queue(thr_t *t) {   // holding G
+    if (g_wake_queue_on < 0) { const char *e = getenv("TOTK_WAKE_QUEUE"); g_wake_queue_on = !(e && !strcmp(e, "0")); fprintf(stderr, "[threads] woken threads compete for a core at once: %s\n", g_wake_queue_on ? "on (TOTK_WAKE_QUEUE=0 turns it off)" : "off"); }
+    if (!g_wake_queue_on || !cores_enabled() || t->cur_core >= 0 || t->cqueued || !t->started || t->exited) return;
+    for (int i = 0; i < NCORE; i++) if (core_allowed(t, i) && !g_core_owner[i]) return;   /* a free core: core_take takes it */
+    t->cseq = ++g_wseq; t->cnext = g_core_wait; g_core_wait = t; t->cqueued = 1;
+    if (dm_wait_stats_enabled()) t->core_stats_since = now_ns();
+    totk_kick(t);
 }
 #endif
 static void core_take(thr_t *t) {   // holding G; waits until a core in t's mask is handed over
@@ -509,22 +707,26 @@ static void core_take(thr_t *t) {   // holding G; waits until a core in t's mask
     if (tlc) totk_tl(TLK_CW_IN, 0, 0);
     while (t->cur_core < 0) {   // kicked owners are signalled again every millisecond; otherwise look again every 20 ms (starvation, inheritance)
         struct timespec again = {0, core_kick(t) ? 1000000 : 20000000};
-        pthread_cond_timedwait_relative_np(&t->cv, &G, &again);
+        tev_wait(t, NULL, again.tv_sec * 1000000000ll + again.tv_nsec);
         if (!reported && t->cur_core < 0 && t->cwait_ns && now_ns() - t->cwait_ns >= STARVE_NS) { if (core_diag_on()) core_wait_report(t, t->cwait_ns); reported = 1; }
     }
     t->cwait_ns = 0;
     if (tlc) totk_tl(TLK_CW_OUT, (uint64_t)t->cur_core, 0);
 #else
-    if (c >= 0) { t->cur_core = c; t->core_since = now_ns(); g_core_owner[c] = t; return; }
-    t->cseq = ++g_wseq; t->cnext = g_core_wait; g_core_wait = t;
+    if (c >= 0) { totk_core_unqueue(t); t->cur_core = c; t->core_since = now_ns(); g_core_owner[c] = t; return; }
+    if (!t->cqueued) { t->cseq = ++g_wseq; t->cnext = g_core_wait; g_core_wait = t; t->cqueued = 1; }
     int reported = 0;
+    uint64_t ws = runtime_svc_stats_on() ? now_ns() : 0;
+    uint64_t spin_t0 = sync_spin_ns() > 0 ? now_ns() : 0;
     while (t->cur_core < 0) {   // the owners it beats are marked (and, with the asynchronous preemption, signalled again every millisecond)
+        if (sync_spin(t, 1)) continue;
         int kick = totk_kick(t) && totk_ap_on();
-        if (!kick && (reported || !core_diag_on())) { pthread_cond_wait(&t->cv, &G); continue; }
-        struct timespec again = {0, kick ? 1000000 : CORE_DIAG_NS};   // TOTK_CORE_DIAG: one look at the owners once a wait gets long
-        pthread_cond_timedwait_relative_np(&t->cv, &G, &again);
+        if (!kick && (reported || !core_diag_on())) { tev_wait(t, NULL, 0); continue; }
+        tev_wait(t, NULL, kick ? 1000000 : CORE_DIAG_NS);   // TOTK_CORE_DIAG: one look at the owners once a wait gets long
         if (!reported && core_diag_on() && t->cur_core < 0 && now_ns() - w0 >= CORE_DIAG_NS) { core_wait_report(t, w0); reported = 1; }
     }
+    if (ws) { g_core_wait_n++; g_core_wait_ns += now_ns() - ws; }
+    if (spin_t0) { uint64_t d = now_ns() - spin_t0; t->spin_short = (int64_t)d <= 2 * sync_spin_ns(); site_note(t, 1, d); }   /* a short wait: spin next time too */
 #endif
 }
 static thr_t *me_or_null(void) { return g_keythr ? pthread_getspecific(g_keythr) : NULL; }
@@ -535,11 +737,11 @@ static void preempt_signal(int sig, siginfo_t *si, void *context) {
     (void)sig; (void)si;
     thr_t *t = me_or_null();
     if (!t || !__atomic_load_n(&t->preempt, __ATOMIC_ACQUIRE) || t->cur_core < 0) return;
-    uint64_t pc = (uint64_t)((ucontext_t *)context)->uc_mcontext->__ss.__pc;
-    uintptr_t tp; __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(tp));
+    uint64_t pc = (uint64_t)UC_PC(((ucontext_t *)context));
+    uintptr_t tp = runtime_host_tsd();
     if (!runtime_hle_tsd_off || !*(volatile uintptr_t *)(tp + runtime_hle_tsd_off) || !runtime_guest_code_pc(pc)) return;
     int saved = errno;
-    pthread_mutex_lock(&G);
+    g_lock();
     if (t->cur_core >= 0 && core_should_yield(t)) { core_put(t); core_take(t); g_preempt_async++; }
     else t->preempt = 0;
     pthread_mutex_unlock(&G);
@@ -551,11 +753,11 @@ uint32_t runtime_thread_current_handle(void) { thr_t *t = me_or_null(); return t
 // Host services that wait for other threads or the GPU give the core up around the wait (no host locks held).
 int runtime_core_away(void) {
     thr_t *t = me_or_null(); if (!t || t->cur_core < 0) return 0;
-    pthread_mutex_lock(&G); core_put(t); pthread_mutex_unlock(&G); return 1;
+    g_lock(); core_put(t); pthread_mutex_unlock(&G); return 1;
 }
 void runtime_core_back(int *away) {
     thr_t *t = me_or_null(); if (!*away || !t) return;
-    pthread_mutex_lock(&G); core_take(t); pthread_mutex_unlock(&G);
+    g_lock(); core_take(t); pthread_mutex_unlock(&G);
 }
 /* A pass of a gated spin wait (patch_nso.py "Spin waits", registered builds only): a guest loop that polls memory until
    another thread changes it. On the Switch it fills only its own core; here it holds a virtual core that the thread it
@@ -594,7 +796,7 @@ void runtime_core_checkpoint(void) {
        change while it waits; so at every SVC a core owner also looks at the queue itself (core_should_yield: Horizon's
        rule, see core_beats). */
     if (!t || t->cur_core < 0 || (!t->preempt && !__atomic_load_n(&g_core_wait, __ATOMIC_RELAXED))) return;
-    pthread_mutex_lock(&G);
+    g_lock();
     if (t->cur_core >= 0 && core_should_yield(t)) { core_put(t); core_take(t); }
     else t->preempt = 0;
     pthread_mutex_unlock(&G);
@@ -603,7 +805,7 @@ void runtime_core_checkpoint(void) {
     if (t && !t->hle_slot) totk_note_self(t);   // once, at its first SVC (its slots are set by then)
 #endif
     if (!t || !t->preempt) return;
-    pthread_mutex_lock(&G); t->preempt = 0; core_put(t); core_take(t); pthread_mutex_unlock(&G);
+    g_lock(); t->preempt = 0; core_put(t); core_take(t); pthread_mutex_unlock(&G);
 }
 int runtime_current_core(void) { thr_t *t = me_or_null(); return t ? (t->cur_core >= 0 ? t->cur_core : t->core) : -1; }
 
@@ -623,16 +825,19 @@ static int64_t block_inner(thr_t *t, int kind, int64_t ns) {
     uint64_t guest_deadline = det_wait ? guest_ns() + (uint64_t)ns : 0;
     if (ns > 0 && !det_wait) { clock_gettime(CLOCK_REALTIME, &dl); dl.tv_sec += ns / 1000000000; dl.tv_nsec += ns % 1000000000;
                   if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; } }
+    uint64_t spin_t0 = sync_spin_ns() > 0 ? now_ns() : 0;
     while (!t->woke) {
+        if (sync_spin(t, 0)) continue;
         int rc;
         if (det_wait) {
             uint64_t now = guest_ns();
             if (now >= guest_deadline) { wait_unlink(t); t->wkind = 0; return R_TIMEOUT; }
             (void)(guest_deadline - now);
-            rc = pthread_cond_wait(&t->cv, &G);
-        } else rc = ns > 0 ? pthread_cond_timedwait(&t->cv, &G, &dl) : pthread_cond_wait(&t->cv, &G);
+            rc = tev_wait(t, NULL, 0);
+        } else rc = tev_wait(t, ns > 0 ? &dl : NULL, 0);
         if (rc == ETIMEDOUT && !t->woke && (!det_wait || guest_ns() >= guest_deadline)) { wait_unlink(t); t->wkind = 0; return R_TIMEOUT; }
     }
+    if (spin_t0) { uint64_t d = now_ns() - spin_t0; t->spin_short = (int64_t)d <= 2 * sync_spin_ns(); site_note(t, 0, d); }
     return t->wres;
 }
 
@@ -680,8 +885,40 @@ uint32_t (*dm_thread_tick_fn)(void);   // 取当前游戏拍；diag.c 初始化�
 void crash_thread_init(void);
 void guest_thread_init(void);   // thread.c：每线程 TSD 槽（门、x18、TLS、TLR）唯一设置点 | thread.c: the single place that sets the per-thread TSD slots (gate, x18, TLS, TLR)
 __attribute__((weak)) void runtime_hle_stack_set(uintptr_t top) { (void)top; }   // standalone thread probe: no host-stack switch
+#ifdef __ANDROID__
+#include "totk_affinity.h"   /* TOTK_GAME_CPUS: host cores of every guest thread (A/B knob; every core by default) */
+#include <sys/resource.h>
+/* TOTK_GAME_CPUS (default "slow:4": the four highest-numbered cores outside the prime pair -- the Odin 3's cpu 2-5 --
+   or every core on an SoC with fewer performance cores) and TOTK_GAME_NICE (default 0): a positive nice lets the
+   game's threads use the prime cores when the translation and recording threads pinned there are idle, and lose to
+   them when they are not. Why four cores (2026-11-02, full route): a woken game thread lands on a core that is still
+   warm, and when the thread that woke it blocks right after, the kernel switches to it on the same core instead of
+   sending it to an idle one: 45.8 vs 44.3 fps, 1% lows up in every scene (Kakariko 23.5 vs 22.0, Korok 29.5 vs 26.9),
+   fewer frames over 33 ms in five of six, 171 vs 195 hitches; Zora Domain alone 1% lows 29.2 vs 27.0-27.4 and half
+   the slow frames; the cold start's loading screen 6.4-6.7 s vs 7.0-7.2. Three cores lose (the loading screen's
+   three spinners crowd them: 8.9-9.4 s); all six without spinning was +9% still but -8% towns on 2026-10-31. */
+/* Breath of the Wild defaults to every core: four cores starve it (2026-11-02, East Necluda at night, the player's
+   save, two pairs: 71.0-71.5 fps with 1% lows 20.5-21.8 on four cores vs 88.8-89.7 fps and 52.0-54.3 on all; 247 frames
+   over 25 ms against none, the slow frames' time spent waiting, not working: CPU 4.9 vs 5.9 ms a frame). Six cores
+   without the prime pair (0-5) lose as much (67.2-69.2 fps, 1% lows 16.8-17.4, all default 88.8-90.1 / 52.8-54.0): it is
+   the prime cores BotW's threads need, not a seventh core (why is open: the translation and recording threads are
+   pinned there). */
+#ifdef GAME_BOTW
+#define GAME_CPUS_DEFAULT "all"
+#else
+#define GAME_CPUS_DEFAULT "slow:4"
+#endif
+static void game_pin_self(void) {
+    totk_pin_self("TOTK_GAME_CPUS", GAME_CPUS_DEFAULT);
+    const char *n = getenv("TOTK_GAME_NICE"); if (n && atoi(n)) setpriority(PRIO_PROCESS, 0, atoi(n));   /* 0: the calling thread on Linux */
+}
+#define game_pin() game_pin_self()
+#else
+#define game_pin() 0
+#endif
 static void *thread_main(void *p) {
     thr_t *t = p;
+    game_pin();
     pthread_setspecific(g_keythr, t);
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     qos_class_t qc = QOS_CLASS_UNSPECIFIED; int rp = 0;
@@ -689,13 +926,14 @@ static void *thread_main(void *p) {
     t->mport = pthread_mach_thread_np(pthread_self());
 
     guest_thread_init();
-    pthread_mutex_lock(&G); while (!t->started) pthread_cond_wait(&t->cv, &G); core_take(t); pthread_mutex_unlock(&G);
+    g_lock(); while (!t->started) tev_wait(t, NULL, 0); core_take(t); pthread_mutex_unlock(&G);
     { volatile char marker = 0; runtime_hle_stack_set((uintptr_t)&marker - 1024); }   // host services of this thread run below this frame
     dm_thread_enter(t->entry, t->arg, t->stack_top,t->host_context);   // 不返回：客体须经 ExitThread 退出 | Does not return: the guest must exit through ExitThread
     die("客体线程入口返回");
 }
 static void thr_free(thr_t *t) {   // 持 G；从全部线程链摘下并释放 | Holding G; unlink from the all-threads chain and free
     for (thr_t **p = &g_all; *p; p = &(*p)->all) if (*p == t) { *p = t->all; break; }
+    if (defer_on()) return;   // a wake sent after G is released may still name t->cv: the record is kept (a few hundred bytes a thread exit)
     pthread_cond_destroy(&t->cv); free(t);
 }
 
@@ -704,7 +942,7 @@ static _Noreturn void thread_exit_on_host(void *argument) {
     t->exit_ns = now_ns(); t->exit_tick = dm_thread_tick_fn ? dm_thread_tick_fn() : 0;
     // 这里不打日志：退出发生在客体线程自己的栈上（有的只有十几 KiB），带浮点的 printf 会把栈撑爆（真机冒烟：LibcurlResolver 退出时 SIGBUS，回溯 fprintf → __dtoa）。时刻只记下来，现场导出时再打
     // No logging here: the exit happens on the guest thread's own stack (some are only a dozen or so KiB), and a printf with floating point would blow the stack (real-device smoke test: SIGBUS when LibcurlResolver exits, backtrace fprintf → __dtoa). Only the time is recorded, and it is printed later in the state dump
-    pthread_mutex_lock(&G);
+    g_lock();
     core_put(t);
     t->exited = 1;
     for (thr_t *w = g_wait; w; ) { thr_t *n = w->next; if (w->wkind == 4) wake(w, -1); w = n; }   // 同步等待者重查 | Synchronization waiters re-check
@@ -721,9 +959,27 @@ void dm_thread_returned(void) { die("客体线程入口函数返回（Horizon �
 
 // 主线程登记，返回其句柄（交给 nnosInitialize 作主线程句柄）
 // Register the main thread and return its handle (passed to nnosInitialize as the main thread handle)
+/* TOTK_THREAD_DUMP_S=<s> (diagnostics): that many seconds after start, a host thread prints every guest thread's state
+   (handle, priority, started, virtual core, wait kind, woke, last SVC) and whether G is free, then every 10 s: for a
+   stall at start that leaves no frames and no SVC statistics. */
+static void *thread_dump_main(void *arg) {
+    int secs = (int)(intptr_t)arg;
+    for (int round = 0;; round++) {
+        sleep(round ? 10 : secs);
+        int g_free = !pthread_mutex_trylock(&G); if (g_free) pthread_mutex_unlock(&G);
+        fprintf(stderr, "[thread-dump] G %s, spinners %d, core owners %#x %#x %#x\n", g_free ? "free" : "HELD", atomic_load(&g_spinners),
+                g_core_owner[0] ? g_core_owner[0]->handle : 0, g_core_owner[1] ? g_core_owner[1]->handle : 0, g_core_owner[2] ? g_core_owner[2]->handle : 0);
+        for (thr_t *t = g_all; t; t = t->all)
+            fprintf(stderr, "[thread-dump]   %#x prio %d started %d exited %d core %d wkind %d woke %d waddr %#llx last svc %#x nsvc %llu spin_short %d\n", t->handle, t->prio, t->started, t->exited, t->cur_core, t->wkind, t->woke,
+                    (unsigned long long)t->waddr, t->last_svc, (unsigned long long)t->nsvc, t->spin_short);
+    }
+    return NULL;
+}
 uint32_t svc_thread_main_init(void) {
     pthread_key_create(&g_keythr, NULL);
-    thr_t *t = calloc(1, sizeof *t);
+    game_pin();
+    { const char *e = getenv("TOTK_THREAD_DUMP_S"); if (e && atoi(e) > 0) { pthread_t th; pthread_create(&th, NULL, thread_dump_main, (void *)(intptr_t)atoi(e)); pthread_detach(th); } }
+    thr_t *t = calloc(1, sizeof *t); t->spin_short = 1;
     pthread_cond_init(&t->cv, NULL);
 #ifdef GAME_BOTW
     t->started = 1; t->prio = 44; t->core = PROCESS_IDEAL_CORE; t->mask = 1u << PROCESS_IDEAL_CORE; t->pt = pthread_self(); t->mport = pthread_mach_thread_np(t->pt);
@@ -731,7 +987,7 @@ uint32_t svc_thread_main_init(void) {
     t->started = 1; t->prio = 44; t->core = 0; t->mask = 7; t->pt = pthread_self(); t->mport = pthread_mach_thread_np(t->pt);
 #endif
     t->cur_core = -1;
-    pthread_mutex_lock(&G); t->handle = h_new(O_THREAD, t); t->id = g_next_id++; t->all = g_all; g_all = t; core_take(t); pthread_mutex_unlock(&G);
+    g_lock(); t->handle = h_new(O_THREAD, t); t->id = g_next_id++; t->all = g_all; g_all = t; core_take(t); pthread_mutex_unlock(&G);
 #ifdef GAME_BOTW
     g_main_handle = t->handle;
 #endif
@@ -781,6 +1037,7 @@ static void core_table(void) {
                        "%llu deferred to SVC 0x36; not signalled: %llu in a host function, %llu with preemption disabled, %llu signalled < 2 ms ago\n",
                        (unsigned long long)ap[0],(unsigned long long)ap[1],(unsigned long long)ap[2],(unsigned long long)ap[3],
                        (unsigned long long)ap[4],(unsigned long long)ap[5],(unsigned long long)ap[6]);
+    if (ap_on) ap_print_pcs();
 #endif
     for (int i=0;i<n;i++) { const row *r=&rows[i];
         fprintf(stderr,"[core-table]   thread %#x priority %d mask %#llx ideal %d: held %.0f ms (%.0f%%), cpu %.0f ms (%.0f%% of held), waited %.1f ms in %llu waits, last svc %#x%s\n",
@@ -803,7 +1060,7 @@ void dm_core_wait_stats(uint64_t *self_ns, uint64_t *all_ns, uint64_t *all_n) {
 }
 uint32_t dm_guest_work_qos(unsigned *count) {
     uint32_t qos = QOS_CLASS_UNSPECIFIED; unsigned n = 0;
-    pthread_mutex_lock(&G);
+    g_lock();
     for (thr_t *t = g_all; t; t = t->all) {
 #ifdef GAME_BOTW
         if (t->handle == g_main_handle) continue;
@@ -855,8 +1112,8 @@ static void wake_sync_waiters(void) {
 static int64_t now_mono_ns(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec * 1000000000ll + ts.tv_nsec; }
 void dm_guest_clock_advanced(void) {
     if (!dm_detclock_enabled()) return;
-    pthread_mutex_lock(&G);
-    for (thr_t *t = g_wait; t; t = t->next) if (t->wkind) pthread_cond_signal(&t->cv);
+    g_lock();
+    for (thr_t *t = g_wait; t; t = t->next) if (t->wkind) tev_signal(t);
     pthread_mutex_unlock(&G);
 }
 
@@ -894,6 +1151,11 @@ static void se_unbind(uint32_t wh) {   // 调用方持 G | Caller holds G
    Off by default: on the Mac at about 100 fps (1.2.1 field save, 300 s each) it saved 3% CPU (708 -> 685 s) but frames
    dropped steadily, 10-15 per 300 instead of 0-3. TOTK_YIELD_BACKOFF=on turns it on (250:2000); =<cap µs>[:<start µs>]
    sets the cap and the start. Returns the sleep for a yield whose run started run_ns ago, 0 for a plain yield. */
+/* A guest yield that hands no core over (no waiter it has to give way to) used to make a host sched_yield as well:
+   40,000 a second in the still scene (svc-stats, 2026-10-31), one syscall each, for nothing: Horizon's yield with no
+   eligible waiter is a no-op, and the host has more physical cores than the three virtual ones plus our two threads, so
+   no runnable host thread is waiting for this core. TOTK_YIELD_HOST=1 restores the syscall (A/B). */
+static int yield_host_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_YIELD_HOST"); v = e && atoi(e) > 0; } return v; }
 static uint64_t yield_backoff_ns(uint64_t run_ns) {
     static int64_t cap = -1, start = 2000000;
     if (cap < 0) {
@@ -908,13 +1170,36 @@ static uint64_t yield_backoff_ns(uint64_t run_ns) {
     return s < (uint64_t)cap ? s : (uint64_t)cap;
 }
 
+/* TOTK_SLEEP_LOG=1 (diagnostics): SleepThread calls of 20 ms and more, by caller and thread, printed every 5 s with the
+   caller as a module offset -- to name the threads that poll in 100 ms sleeps through the boot (2026-11-02 trace: three
+   of them, 3.1-3.6 s each in the first 12 s). */
+static void sleep_log(uint64_t lr, int64_t ns) {
+    static int on = -1; if (on < 0) { const char *e = getenv("TOTK_SLEEP_LOG"); on = e && atoi(e) > 0; }
+    if (!on) return;
+    static struct { uint64_t lr; uint32_t handle; uint32_t n; uint64_t ns; } tab[64]; static int used; static uint64_t last;
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    thr_t *me = g_keythr ? pthread_getspecific(g_keythr) : NULL; uint32_t h = me ? me->handle : 0;
+    pthread_mutex_lock(&mu);
+    int i = 0; while (i < used && (tab[i].lr != lr || tab[i].handle != h)) i++;
+    if (i == used && used < 64) { tab[used].lr = lr; tab[used].handle = h; tab[used].n = 0; tab[used].ns = 0; used++; }
+    if (i < used) { tab[i].n++; tab[i].ns += (uint64_t)ns; }
+    uint64_t now = now_ns();
+    if (now - last >= 5000000000ull) {
+        last = now; fprintf(stderr, "[sleep-log] long SleepThread calls so far (thread, caller, calls, requested s):\n");
+        for (int j = 0; j < used; j++) { char d[96]; runtime_describe_address(tab[j].lr, d, sizeof d); if (tab[j].n >= 5) fprintf(stderr, "[sleep-log]   %#x %s %u calls %.1f s\n", tab[j].handle, d, tab[j].n, tab[j].ns / 1e9); }
+    }
+    pthread_mutex_unlock(&mu);
+}
 int svc_thread(int num, uint64_t *regs) {
-    { thr_t *me = (g_keythr ? pthread_getspecific(g_keythr) : NULL); if (me) { me->last_svc = num; me->last_lr = regs[30]; me->last_fp = regs[29]; me->nsvc++; } }
+    { thr_t *me = (g_keythr ? pthread_getspecific(g_keythr) : NULL); if (me) { me->last_svc = num; me->last_lr = regs[30]; me->last_fp = regs[29]; me->nsvc++; }
+      /* TOTK_SVC_TRACE=<n> (diagnostics): the first n SVCs of the process, one line each with the thread and its caller (a boot that dies) */
+      static int trace_left = -1; if (trace_left < 0) { const char *e = getenv("TOTK_SVC_TRACE"); trace_left = e ? atoi(e) : 0; }
+      if (trace_left > 0) { trace_left--; char d[96]; runtime_describe_address(regs[30], d, sizeof d); fprintf(stderr, "[svc-trace] thread %#x svc %#x x0=%#llx x1=%#llx x2=%#llx from %s\n", me ? me->handle : 0, num, (unsigned long long)regs[0], (unsigned long long)regs[1], (unsigned long long)regs[2], d); } }
 
     switch (num) {
     case 0x08: {  // CreateThread(→w1 句柄; x1 入口, x2 参数, x3 栈顶, w4 优先级, w5 核) | CreateThread(→w1 handle; x1 entry, x2 argument, x3 stack top, w4 priority, w5 core)
         if(!regs[1]||!regs[3]||(regs[3]&15)||(int)regs[4]<28||(int)regs[4]>59||(int)regs[5]<-3||(int)regs[5]>2){regs[0]=R_BAD_STATE;return 1;}
-        thr_t *t = calloc(1, sizeof *t);
+        thr_t *t = calloc(1, sizeof *t); t->spin_short = 1;
         if(!t)die("thread allocation");
         t->cur_core = -1;
         pthread_cond_init(&t->cv, NULL);
@@ -927,7 +1212,7 @@ int svc_thread(int num, uint64_t *regs) {
         t->prio = (int)regs[4]; t->core = (int)regs[5]; t->mask = t->core >= 0 ? 1ull << t->core : 7;
 #endif
         t->born_ns = now_ns(); t->born_tick = dm_thread_tick_fn ? dm_thread_tick_fn() : 0;
-        pthread_mutex_lock(&G); t->handle = h_new(O_THREAD, t); t->id = g_next_id++; t->all = g_all; g_all = t; pthread_mutex_unlock(&G);
+        g_lock(); t->handle = h_new(O_THREAD, t); t->id = g_next_id++; t->all = g_all; g_all = t; pthread_mutex_unlock(&G);
         pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setstacksize(&a, 8 << 20);   // also the host-service stack of this guest thread
         pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);   // 退出即回收宿主资源（客体经句柄等待，不 join） | Host resources are reclaimed on exit (the guest waits through the handle, no join)
         if (pthread_create(&t->pt, &a, thread_main, t)) die("pthread_create");
@@ -936,18 +1221,19 @@ int svc_thread(int num, uint64_t *regs) {
         regs[0] = 0; regs[1] = t->handle; return 1;
     }
     case 0x09: {  // StartThread(w0)
-        pthread_mutex_lock(&G);
+        g_lock();
         thr_t *t = h_get((uint32_t)regs[0], O_THREAD);
-        if (t) { t->started = 1; pthread_cond_signal(&t->cv); }
+        if (t) { t->started = 1; tev_signal(t); }
         pthread_mutex_unlock(&G);
         regs[0] = t ? 0 : R_BAD_HANDLE; return 1;
     }
     case 0x0A: thread_exit(cur()); return 1;
     case 0x0B: {  // SleepThread(x0 ns)；0/-1/-2 = 各类让出 | SleepThread(x0 ns); 0/-1/-2 = the various kinds of yield
         int64_t ns = (int64_t)regs[0];
+        if (ns >= 20000000) { uint64_t fp = regs[29], lr2 = 0; if (fp && fp >= 0x300000000ull && fp < 0x800000000ull && !(fp & 7)) lr2 = ((const uint64_t *)(uintptr_t)fp)[1]; sleep_log(lr2 ? lr2 : regs[30], ns); }   /* TOTK_SLEEP_LOG=1: who polls with long sleeps, by the caller of the SDK's SleepThread */
 
         thr_t *self = cur();
-        if (ns > 0) { pthread_mutex_lock(&G); core_put(self); pthread_mutex_unlock(&G); }
+        if (ns > 0) { g_lock(); core_put(self); pthread_mutex_unlock(&G); }
         if (ns > 0 && dm_detclock_enabled()) {
             uint64_t deadline = guest_ns() + (uint64_t)ns;
             while (guest_ns() < deadline) { struct timespec ts = {0, 1000000}; nanosleep(&ts, 0); }
@@ -957,32 +1243,35 @@ int svc_thread(int num, uint64_t *regs) {
             uint64_t y0 = now_ns();
             if (me && me->nsvc != me->yrun_svc + 1) me->yrun_ns = y0;   // another SVC since the last yield: a new run
             if (me) me->yrun_svc = me->nsvc;
-            pthread_mutex_lock(&G);   // Horizon yield: hand the core to a waiting thread of equal or higher priority
-            int give = 0; for (thr_t *w = g_core_wait; w && !give; w = w->cnext) give = me->cur_core >= 0 && core_allowed(w, me->cur_core) && w->prio <= me->prio;
-            if (give) { core_put(me); core_take(me); }
-            pthread_mutex_unlock(&G);
+            int give = 0;   // Horizon yield: hand the core to a waiting thread of equal or higher priority (none waiting: no G)
+            if (__atomic_load_n(&g_core_wait, __ATOMIC_ACQUIRE)) {
+                g_lock();
+                for (thr_t *w = g_core_wait; w && !give; w = w->cnext) give = me->cur_core >= 0 && core_allowed(w, me->cur_core) && w->prio <= me->prio;
+                if (give) { core_put(me); core_take(me); }
+                pthread_mutex_unlock(&G);
+            }
             uint64_t backoff = !give && me ? yield_backoff_ns(y0 - me->yrun_ns) : 0;
             if (backoff) {   // a long poll: sleep with the core given up, as SleepThread(ns) does
-                pthread_mutex_lock(&G); core_put(me); pthread_mutex_unlock(&G);
+                g_lock(); core_put(me); pthread_mutex_unlock(&G);
                 struct timespec ts = {0, (long)backoff}; nanosleep(&ts, 0);
-                pthread_mutex_lock(&G); core_take(me); pthread_mutex_unlock(&G);
-            } else if (!give) sched_yield();
+                g_lock(); core_take(me); pthread_mutex_unlock(&G);
+            } else if (!give && yield_host_on()) sched_yield();
 #ifdef GAME_BOTW
             if (me && me->handle == g_main_handle) { g_main_yield_ns += now_ns() - y0; g_main_yield_n++; }
 #else
             if (me && me->handle == 0x1001) { g_main_yield_ns += now_ns() - y0; g_main_yield_n++; }
 #endif
         }
-        if (ns > 0) { pthread_mutex_lock(&G); core_take(self); pthread_mutex_unlock(&G); }
+        if (ns > 0) { g_lock(); core_take(self); pthread_mutex_unlock(&G); }
 
         return 1;
     }
-    case 0x0C: { pthread_mutex_lock(&G);thr_t *t = h_get((uint32_t)regs[1], O_THREAD); regs[0] = t ? 0 : R_BAD_HANDLE; regs[1] = t ? (uint64_t)t->prio : 0; pthread_mutex_unlock(&G);return 1; }
-    case 0x0D: { if(regs[1]<28||regs[1]>59){regs[0]=R_BAD_STATE;return 1;}pthread_mutex_lock(&G);thr_t *t = h_get((uint32_t)regs[0], O_THREAD); if (t) t->prio = (int)regs[1]; regs[0] = t ? 0 : R_BAD_HANDLE;pthread_mutex_unlock(&G); return 1; }
-    case 0x0E: { pthread_mutex_lock(&G);thr_t *t = h_get((uint32_t)regs[2], O_THREAD);
+    case 0x0C: { g_lock();thr_t *t = h_get((uint32_t)regs[1], O_THREAD); regs[0] = t ? 0 : R_BAD_HANDLE; regs[1] = t ? (uint64_t)t->prio : 0; pthread_mutex_unlock(&G);return 1; }
+    case 0x0D: { if(regs[1]<28||regs[1]>59){regs[0]=R_BAD_STATE;return 1;}g_lock();thr_t *t = h_get((uint32_t)regs[0], O_THREAD); if (t) t->prio = (int)regs[1]; regs[0] = t ? 0 : R_BAD_HANDLE;pthread_mutex_unlock(&G); return 1; }
+    case 0x0E: { g_lock();thr_t *t = h_get((uint32_t)regs[2], O_THREAD);
                  regs[0] = t ? 0 : R_BAD_HANDLE; regs[1] = t ? (uint64_t)(uint32_t)t->core : 0; regs[2] = t ? t->mask : 0;pthread_mutex_unlock(&G); return 1; }
     case 0x0F: {  // SetThreadCoreMask(w0, w1 理想核, x2 掩码)：-1 = 用进程缺省、-2/-3 = 不改理想核；宿主只记账 | SetThreadCoreMask(w0, w1 ideal core, x2 mask): -1 = use the process default, -2/-3 = leave the ideal core unchanged; the host only keeps the bookkeeping
-        pthread_mutex_lock(&G);thr_t *t = h_get((uint32_t)regs[0], O_THREAD);
+        g_lock();thr_t *t = h_get((uint32_t)regs[0], O_THREAD);
 #ifdef GAME_BOTW
         if (t) { int c = (int)regs[1]; uint64_t m = regs[2]; uint32_t r = 0;
                  if (c == -2) { c = PROCESS_IDEAL_CORE; m = 1ull << c; }
@@ -1001,27 +1290,27 @@ int svc_thread(int num, uint64_t *regs) {
         regs[0] = t ? 0 : R_BAD_HANDLE;pthread_mutex_unlock(&G); return 1;
     }
     case 0x10: { thr_t *t = cur(); regs[0] = (uint64_t)(uint32_t)(t->cur_core >= 0 ? t->cur_core : t->core); return 1; }   // GetCurrentProcessorNumber
-    case 0x25: { pthread_mutex_lock(&G);thr_t *t = h_get((uint32_t)regs[1], O_THREAD); regs[0] = t ? 0 : R_BAD_HANDLE; regs[1] = t ? t->id : 0;pthread_mutex_unlock(&G); return 1; }
+    case 0x25: { g_lock();thr_t *t = h_get((uint32_t)regs[1], O_THREAD); regs[0] = t ? 0 : R_BAD_HANDLE; regs[1] = t ? t->id : 0;pthread_mutex_unlock(&G); return 1; }
 
     case 0x1A: {  // ArbitrateLock(w0 持有者句柄, x1 地址, w2 本线程标签) | ArbitrateLock(w0 owner handle, x1 address, w2 this thread's tag)
         thr_t *t = cur(); uint64_t addr = regs[1];
-        pthread_mutex_lock(&G);
+        g_lock();
 #ifdef GAME_BOTW
         tag_check(t, (uint32_t)regs[2], "ArbitrateLock", addr);
 #endif
         int64_t r = 0;
         if (ld32(addr) == ((uint32_t)regs[0] | WAITERS_BIT)) { t->waddr = addr; t->wtag = (uint32_t)regs[2];
 #ifdef GAME_BOTW
-            for (thr_t *o = g_core_wait; o; o = o->cnext) if (o->handle == (uint32_t)regs[0]) { pthread_cond_signal(&o->cv); break; }   // an owner waiting for a core looks again (eff_prio)
+            for (thr_t *o = g_core_wait; o; o = o->cnext) if (o->handle == (uint32_t)regs[0]) { tev_signal(o); break; }   // an owner waiting for a core looks again (eff_prio)
 #endif
             r = block(t, 1, -1); }
         pthread_mutex_unlock(&G);
         regs[0] = (uint64_t)r; return 1;
     }
-    case 0x1B: pthread_mutex_lock(&G); lock_handoff(regs[0]); pthread_mutex_unlock(&G); regs[0] = 0; return 1;
+    case 0x1B: g_lock(); lock_handoff(regs[0]); pthread_mutex_unlock(&G); regs[0] = 0; return 1;
     case 0x1C: {  // WaitProcessWideKeyAtomic(x0 锁地址, x1 条件键, w2 标签, x3 超时) | WaitProcessWideKeyAtomic(x0 lock address, x1 condition key, w2 tag, x3 timeout)
         thr_t *t = cur(); uint64_t addr = regs[0], key = regs[1];
-        pthread_mutex_lock(&G);
+        g_lock();
 #ifdef GAME_BOTW
         tag_check(t, (uint32_t)regs[2], "WaitProcessWideKeyAtomic", addr);
 #endif
@@ -1053,7 +1342,7 @@ int svc_thread(int num, uint64_t *regs) {
     }
     case 0x1D: {  // SignalProcessWideKey(x0 条件键, w1 个数，<=0 全部) | SignalProcessWideKey(x0 condition key, w1 count, <=0 all)
         uint64_t key = regs[0]; int cnt = (int)regs[1], n = 0;
-        pthread_mutex_lock(&G);
+        g_lock();
         for (thr_t *w; (cnt <= 0 || n < cnt) && (w = pick(2, key)); n++) lock_acquire_for(w, w->waddr, w->wtag);   // 按内核顺序；转为锁等待或被唤醒后不再是 kind 2 | In kernel order; once turned into a lock wait or woken it is no longer kind 2
         int left = 0; for (thr_t *w = g_wait; w; w = w->next) if (w->wkind == 2 && w->wkey == key) { left = 1; break; }
         if (!left) st32(key, 0);
@@ -1063,7 +1352,7 @@ int svc_thread(int num, uint64_t *regs) {
 
     case 0x34: {  // WaitForAddress(x0 地址, w1 类型, w2 值, x3 超时)：0 小于则等、1 小于则减一再等、2 相等则等 | WaitForAddress(x0 address, w1 type, w2 value, x3 timeout): 0 wait if less than, 1 decrement if less than then wait, 2 wait if equal
         thr_t *t = cur(); uint64_t addr = regs[0]; int type = (int)regs[1]; int32_t val = (int32_t)regs[2];
-        pthread_mutex_lock(&G);
+        g_lock();
         int64_t r; uint32_t v = ld32(addr);
         int ok = type == 2 ? (int32_t)v == val : (int32_t)v < val;
         if (ok && type == 1) { while (!cas32(addr, &v, v - 1)) if (!((int32_t)v < val)) { ok = 0; break; } }
@@ -1074,7 +1363,7 @@ int svc_thread(int num, uint64_t *regs) {
     }
     case 0x35: {  // SignalToAddress(x0 地址, w1 类型, w2 值, w3 个数)：0 唤醒、1 相等则加一并唤醒、2 相等则按等待数改值并唤醒 | SignalToAddress(x0 address, w1 type, w2 value, w3 count): 0 wake, 1 increment if equal and wake, 2 if equal modify the value by waiter count and wake
         uint64_t addr = regs[0]; int type = (int)regs[1]; int32_t val = (int32_t)regs[2]; int cnt = (int)regs[3];
-        pthread_mutex_lock(&G);
+        g_lock();
         int nw = 0; for (thr_t *w = g_wait; w; w = w->next) if (w->wkind == 3 && w->waddr == addr) nw++;
         int64_t r = 0;
         if (type != 0) {
@@ -1096,11 +1385,11 @@ int svc_thread(int num, uint64_t *regs) {
 
     case 0x45: {  // CreateEvent(→w1 写端, w2 读端) | CreateEvent(→w1 write end, w2 read end)
         event_t *e = calloc(1, sizeof *e); e->refs = 2;
-        pthread_mutex_lock(&G); uint32_t hw = h_new(O_EVENT_W, e), hr = h_new(O_EVENT_R, e); pthread_mutex_unlock(&G);
+        g_lock(); uint32_t hw = h_new(O_EVENT_W, e), hr = h_new(O_EVENT_R, e); pthread_mutex_unlock(&G);
         regs[0] = 0; regs[1] = hw; regs[2] = hr; return 1;
     }
     case 0x11: case 0x12: case 0x17: {  // SignalEvent(写端) / ClearEvent(任一端) / ResetSignal(读端，未触发报错) | SignalEvent(write end) / ClearEvent(either end) / ResetSignal(read end, error if not signaled)
-        pthread_mutex_lock(&G);
+        g_lock();
         // SignalEvent 只认写端；ClearEvent 两端都认；ResetSignal 只认读端
         // SignalEvent accepts only the write end; ClearEvent accepts both ends; ResetSignal accepts only the read end
         uint32_t h = (uint32_t)regs[0];
@@ -1119,7 +1408,7 @@ int svc_thread(int num, uint64_t *regs) {
         thr_t *t = cur(); const uint32_t *hs = (const uint32_t *)regs[1]; int n = (int)regs[2]; int64_t ns = (int64_t)regs[3];
         if(n<0||n>64||(!hs&&n)){regs[0]=R_BAD_STATE;return 1;}
         int64_t deadline = ns > 0 ? (dm_detclock_enabled() ? (int64_t)guest_ns() : now_mono_ns()) + ns : 0;
-        pthread_mutex_lock(&G);
+        g_lock();
         t->nwh = n; for (int i = 0; i < n && i < 4; i++) t->wh[i] = hs[i];
         int64_t r; int idx = -1;
         for (;;) {
@@ -1136,14 +1425,14 @@ int svc_thread(int num, uint64_t *regs) {
         regs[0] = (uint64_t)r; regs[1] = idx >= 0 ? (uint64_t)idx : 0; return 1;
     }
     case 0x19: {  // CancelSynchronization(w0 线程) | CancelSynchronization(w0 thread)
-        pthread_mutex_lock(&G);
+        g_lock();
         thr_t *t = h_get((uint32_t)regs[0], O_THREAD);
         if (t) { t->cancel = 1; if (t->wkind == 4) wake(t, -1); }
         pthread_mutex_unlock(&G);
         regs[0] = t ? 0 : R_BAD_HANDLE; return 1;
     }
     case 0x16: {  // CloseHandle(w0)：事件两端都关才释放；线程句柄关闭后槽位回收，对象在线程也退出后释放 | CloseHandle(w0): an event is freed only when both ends are closed; after a thread handle is closed the slot is recycled, and the object is freed once the thread has also exited
-        pthread_mutex_lock(&G);
+        g_lock();
 #ifdef GAME_BOTW
         unsigned i = h_index((uint32_t)regs[0]);int valid=0;
 #else
@@ -1158,7 +1447,7 @@ int svc_thread(int num, uint64_t *regs) {
             g_h[i].type = O_FREE; g_h[i].obj = NULL;
             pthread_mutex_unlock(&G);
             if (session) runtime_ipc_session_closed(o); else runtime_ipc_tmem_closed(o);
-            pthread_mutex_lock(&G);
+            g_lock();
         } else if (i > 0 && i < MAX_H && g_h[i].type == O_THREAD) {
             valid=1;thr_t *t = g_h[i].obj;
             g_h[i].type = O_FREE; g_h[i].obj = NULL;
@@ -1202,7 +1491,7 @@ void hle_bind_system_event(void *ev, int autoclear) {      // 必须在客体线
 static uint64_t g_se_skipped;
 void hle_signal_system_event(void *ev) {
     for (int bound = 0; ; bound = 1) {
-        pthread_mutex_lock(&G);
+        g_lock();
         pthread_mutex_lock(&g_se_lock); uint32_t wh = se_find(ev); pthread_mutex_unlock(&g_se_lock);
         if (wh) {
             event_t *e = h_get(wh, O_EVENT_W);
@@ -1224,20 +1513,20 @@ void hle_signal_system_event(void *ev) {
 // Weak fallbacks keep standalone thread tests linkable; the runtime links the real ipc.c versions.
 __attribute__((weak)) void runtime_ipc_session_closed(void *s) { (void)s; die("IPC session closed without ipc.c"); }
 __attribute__((weak)) void runtime_ipc_tmem_closed(void *t) { (void)t; die("transfer memory closed without ipc.c"); }
-uint32_t runtime_handle_new(int session, void *obj) { pthread_mutex_lock(&G); uint32_t h = h_new(session ? O_SESSION : O_TMEM, obj); pthread_mutex_unlock(&G); return h; }
-void *runtime_handle_get(uint32_t h, int session) { pthread_mutex_lock(&G); void *o = h_peek(h, session ? O_SESSION : O_TMEM); pthread_mutex_unlock(&G); return o; }
+uint32_t runtime_handle_new(int session, void *obj) { g_lock(); uint32_t h = h_new(session ? O_SESSION : O_TMEM, obj); pthread_mutex_unlock(&G); return h; }
+void *runtime_handle_get(uint32_t h, int session) { g_lock(); void *o = h_peek(h, session ? O_SESSION : O_TMEM); pthread_mutex_unlock(&G); return o; }
 // Service-side event: returns the writable handle kept by the service.
 uint32_t runtime_event_new(void) {
     event_t *e = calloc(1, sizeof *e); if (!e) die("event allocation"); e->refs = 1;
-    pthread_mutex_lock(&G); uint32_t hw = h_new(O_EVENT_W, e); pthread_mutex_unlock(&G); return hw;
+    g_lock(); uint32_t hw = h_new(O_EVENT_W, e); pthread_mutex_unlock(&G); return hw;
 }
 // Copy-handle transfer of the readable end: each call gives the client its own handle to the same event.
 uint32_t runtime_event_readable(uint32_t hw) {
-    pthread_mutex_lock(&G); event_t *e = h_get(hw, O_EVENT_W); if (!e) die("service event handle %#x", hw);
+    g_lock(); event_t *e = h_get(hw, O_EVENT_W); if (!e) die("service event handle %#x", hw);
     e->refs++; uint32_t hr = h_new(O_EVENT_R, e); pthread_mutex_unlock(&G); return hr;
 }
 void runtime_event_signal(uint32_t hw) {
-    pthread_mutex_lock(&G); event_t *e = h_get(hw, O_EVENT_W); if (!e) die("service event handle %#x", hw);
+    g_lock(); event_t *e = h_get(hw, O_EVENT_W); if (!e) die("service event handle %#x", hw);
     e->signaled = 1; wake_sync_waiters(); pthread_mutex_unlock(&G);
 }
 
@@ -1356,4 +1645,29 @@ __attribute__((constructor)) static void dump_init(void) {
     if (c) { pthread_t th; pthread_create(&th, NULL, list_check, (void *)(uintptr_t)strtoull(c, NULL, 0)); pthread_detach(th); }
     const char *e = getenv("TOTK_DUMP_AFTER"); if (!e) return;
     pthread_t th; pthread_create(&th, NULL, dump_after, (void *)(uintptr_t)strtoul(e, NULL, 10)); pthread_detach(th);
+}
+
+static _Atomic uint64_t g_svc_n[256], g_svc_ns[256], g_stats_last;
+void runtime_svc_stats_add(unsigned num, uint64_t ns) {
+    num &= 255; g_svc_n[num]++; g_svc_ns[num] += ns;
+    uint64_t now = now_ns(), last = atomic_load(&g_stats_last);
+    if (!last) { atomic_compare_exchange_strong(&g_stats_last, &last, now); return; }
+    if (now - last < 5000000000ull || !atomic_compare_exchange_strong(&g_stats_last, &last, now)) return;
+    static uint64_t pn[256], pns[256], pl[5];   /* only the thread that won the exchange gets here */
+    double s = (now - last) / 1e9; uint64_t n[256], t[256]; int order[256];
+    for (int i = 0; i < 256; i++) { n[i] = g_svc_n[i] - pn[i]; t[i] = g_svc_ns[i] - pns[i]; pn[i] += n[i]; pns[i] += t[i]; order[i] = i; }
+    for (int i = 0; i < 256; i++) for (int j = i + 1; j < 256; j++) if (t[order[j]] > t[order[i]]) { int x = order[i]; order[i] = order[j]; order[j] = x; }
+    uint64_t l[5] = {g_lock_n, g_lock_contended, g_lock_wait_ns, g_core_wait_n, g_core_wait_ns}, d[5];
+    for (int i = 0; i < 5; i++) { d[i] = l[i] - pl[i]; pl[i] = l[i]; }
+    static uint64_t psw, psh; uint64_t sw = g_spin_waits - psw, sh = g_spin_hits - psh; psw += sw; psh += sh;
+    static uint64_t pss; uint64_t ss = atomic_load_explicit(&g_spin_wakes_skipped, memory_order_relaxed) - pss; pss += ss;
+    char line[1024]; int k = snprintf(line, sizeof line, "[svc-stats] %.1f s: G %.0f/s, %.0f/s waited %.1f ms/s; core waits %.0f/s %.1f ms/s; spins %.0f/s, %.0f%% hit, %.0f wakes/s without a syscall; svc calls/s wall ms/s:",
+        s, d[0] / s, d[1] / s, d[2] / 1e6 / s, d[3] / s, d[4] / 1e6 / s, sw / s, sw ? 100.0 * sh / sw : 0.0, ss / s);
+    for (int i = 0; i < 12 && n[order[i]] && k < (int)sizeof line - 40; i++) k += snprintf(line + k, sizeof line - k, " %#x %.0f/%.1f", order[i], n[order[i]] / s, t[order[i]] / 1e6 / s);
+    { static uint64_t phn[4096]; int top[6] = {0}; uint64_t dh[4096];
+      for (int i = 0; i < 4096; i++) { dh[i] = g_hold_ns[i] - phn[i]; phn[i] = g_hold_ns[i];
+          for (int j = 0; j < 6; j++) if (dh[i] > dh[top[j]] || !top[j]) { for (int q = 5; q > j; q--) top[q] = top[q - 1]; top[j] = i; break; } }
+      k += snprintf(line + k, sizeof line - k, "; G held, by taking line ms/s:");
+      for (int j = 0; j < 6 && top[j] && dh[top[j]] && k < (int)sizeof line - 24; j++) k += snprintf(line + k, sizeof line - k, " %c%d %.1f", top[j] >= 2048 ? 'W' : 'L', top[j] & 2047, dh[top[j]] / 1e6 / s); }
+    fprintf(stderr, "%s\n", line);
 }

@@ -69,8 +69,8 @@ def extract_one(game, record, index, hactool, keys_path, output, dest=None):
             code = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT).returncode
         text = (result / 'extract.log').read_text()
         # As for the update: NCAs converted into a cartridge image lose their RSA signatures; the hash tree still verifies.
-        unsigned = re.findall(r'^\s*(Fixed-Key Signature|NPDM Signature) \(FAIL\)', text, re.M)
-        bad = re.search(r'\(FAIL\)|\(INVALID\)|Failed to|Error:', re.sub(r'^\s*(Fixed-Key Signature|NPDM Signature) \(FAIL\).*$', '', text, flags=re.M))
+        unsigned = re.findall(r'^\s*(Fixed-Key Signature|NPDM Signature|Signature) \(FAIL\)', text, re.M)
+        bad = re.search(r'\(FAIL\)|\(INVALID\)|Failed to|Error:', re.sub(r'^\s*(Fixed-Key Signature|NPDM Signature|Signature) \(FAIL\).*$', '', text, flags=re.M))
         if code or bad:
             (output / f'{index}-failure.log').write_text(re.sub(r'[0-9A-Fa-f]{32,}', '<hex removed>', text))
         require(code == 0 and not bad, f'add-on content {index}: hactool reported a failure')

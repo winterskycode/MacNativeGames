@@ -111,7 +111,9 @@ def merge(base, update, keys_path, hactool, output, *, base_romfs=None):
         # hactool also verifies the NCA's fixed-key and NPDM signatures, which need Nintendo's public keys:
         # without them it always prints those two lines as (FAIL). They are not data failures; the six IVFC
         # levels and the image SHA-256 recorded below decide whether the merge worked.
-        unsigned = re.compile(r'\s*(?:Fixed-Key Signature|NPDM Signature) \(FAIL\)')
+        # A dump tool can sign the update's ACID again (build_app.npdm_kind 'resigned'); that ACID line then fails as well.
+        # The data check is unchanged: the merged image must still match the pinned RomFS SHA-256.
+        unsigned = re.compile(r'\s*(?:Fixed-Key Signature|NPDM Signature|Signature) \(FAIL\)')
         checked = '\n'.join(line for line in log.splitlines() if not unsigned.match(line))
         if code or re.search(r'\(FAIL\)|\(INVALID\)|Failed to|Error:', checked):
             # hactool repeats a key it cannot parse ("Key (<value>) must be 32 hex digits!"): keep no long hex in the log

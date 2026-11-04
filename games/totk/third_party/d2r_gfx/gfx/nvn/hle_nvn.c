@@ -1,4 +1,5 @@
 #include <malloc/malloc.h>
+#include "../../host/section_compat.h"
 // NVN 接口层：接管 main 导入的 nvnBootstrapLoader，sdk 里的 NVN 驱动整块不执行。
 // 523 个 NVN 名字一律返回计数跳板（nvn_thunks.S），跳板再转到这里的实现：
 //   · 有语义的（设备 / 内存池 / 贴图与采样器 / 队列 / 窗口 / 同步 / 事件 / 命令缓冲内存）按 NVN 语义实现，对象是真的；
@@ -82,7 +83,7 @@ static void nvn_init_slots(void) {
     static int done; if (done) return; done = 1;
     g_log = getenv("DM_NVN_LOG") != NULL;
     unsigned long sz;
-    const nvn_impl *im = (const nvn_impl *)getsectiondata(&_mh_execute_header, "__DATA", "swnvn", &sz);
+    const nvn_impl *im = (const nvn_impl *)TOTK_SECTION_DATA(swnvn, &sz);
     unsigned nim = im ? (unsigned)(sz / sizeof *im) : 0, hit = 0;
     for (unsigned i = 0; i < NVN_NFUNC; i++) nvn_slot[i].fn = (void *)nvn_unimpl_entry;
     for (unsigned k = 0; k < nim; k++) {
@@ -107,7 +108,7 @@ static void *nvn_lookup(const char *name) {
     for (unsigned i = 0; i < NVN_NFUNC; i++)
         if (!strcmp(nvn_names[i], name)) return nvn_thunk[i];
     unsigned long sz = 0;
-    const nvn_impl *ex = (const nvn_impl *)getsectiondata(&_mh_execute_header, "__DATA", "totknvnx", &sz);
+    const nvn_impl *ex = (const nvn_impl *)TOTK_SECTION_DATA(totknvnx, &sz);
     for (unsigned k = 0; ex && name && k < sz / sizeof *ex; k++) if (!strcmp(ex[k].name, name)) return ex[k].fn;
     LOG("【红】NVN 取址未知名字：%s（未实现：若被调用会跳到空地址）", name ? name : "(null)");
     return NULL;
@@ -894,6 +895,7 @@ static int reclog_limit(void) { static int v = -1; if (v < 0) { const char *e = 
 extern void runtime_frametrace_event(int kind) __attribute__((weak_import));   // "frametrace" diagnostic (Mac runtime)
 NVN(nvnCommandBufferBeginRecording, void, NVNcommandBuffer *c) {
     if (runtime_frametrace_event) runtime_frametrace_event(10);
+    totk_tl(TL_REC_BEGIN, (uint64_t)(uintptr_t)c, 0);   /* TOTK_TIMELINE: recording spans per thread */
     cmd_t *o = CB(c);
     if (o->recording) LOG("【红】BeginRecording 重入");
     o->recording = 1; o->cur = o->seg;   /* the previous recording was copied at EndRecording */
@@ -937,87 +939,112 @@ static copy_bucket *cbk_get(uintptr_t page, int create) {   // g_copy_mu held
 static pthread_mutex_t g_copy_mu = PTHREAD_MUTEX_INITIALIZER;
 /* The opaque handle points past this host-only validation and accounting prefix. */
 #define COPY_MAGIC 0x59504f43444d43ull   /* "CMDCOPY" */
-#ifdef GAME_BOTW
-typedef struct { uint64_t magic; _Atomic uint64_t used_at; uint64_t made_at; uint32_t body_bytes, last_size; _Atomic uint32_t used; uint32_t pad_; } copy_prefix;   // used: called or submitted at least once (NVN 53 lifetime, release_copies)
-#else
-typedef struct { uint64_t magic; _Atomic uint64_t used_at; uint64_t made_at; uint32_t body_bytes, last_size; uint64_t keep_until, rec_cb, eyes, tdraws; } copy_prefix;   // keep_until, rec_cb (the command buffer that recorded it), eyes (OP_EYE marks in the body): zeldaVR stereo B2 (below)
-#endif
+/* One layout for both games (the Android port's fields -- the UBO index, the piece markers, serial / pinned / cb for the
+   predecode -- are set for every copy by flatten_recording; `used` is Breath of the Wild's NVN 53 lifetime mark). */
+typedef struct { uint64_t magic; _Atomic uint64_t used_at; uint64_t made_at; uint32_t body_bytes, last_size, idx_off, nidx, ubo_off, nubo, ncall, nmark;   /* nmark: piece markers inside (copies of other recordings) */
+                 uint64_t serial; _Atomic uint32_t pinned; uint32_t pad2_; uint64_t cb;   /* cb: the command buffer object it was recorded on */   /* serial: unique per copy (plan key); pinned: the translation thread's predecode reads the body (nvn_vulkan_plan.inc) */
+                 _Atomic uint32_t used; uint32_t pad3_;   // used: called or submitted at least once (NVN 53 lifetime, release_copies; Breath of the Wild)
+                 uint64_t keep_until, rec_cb, eyes, tdraws; } copy_prefix;   // zeldaVR stereo B2 (below): keep_until, rec_cb (the command buffer that recorded it), eyes (OP_EYE marks in the body), tdraws
 /* zeldaVR stereo B2 (game_patches_v143.c): the first run's recordings are inlined into the frame's final assembly after the
    second run (the left eye's twins), but command buffers both runs use add their control memory again in the second run,
    which releases the first run's copies. A copy made in the first run while stereo is on is kept until two submits on
    (keep_until): release_copies and the mark sweep pass it over until then; the sweep releases it afterwards, its mark gone. */
 static int copy_kept(const cmd_copy *c);
-#ifdef GAME_BOTW
-#define COPY_KEEP_INIT(c) ((void)(c))
-#else
 #define COPY_KEEP_INIT(c) ((c)->keep_until = 0, (c)->rec_cb = 0, (c)->eyes = 0, (c)->tdraws = 0)
-#endif
+static _Atomic uint64_t g_copy_serial;
+static void plan_offer(uint8_t *copy);   /* below, with the translation thread */
 static _Atomic uint64_t g_copy_bytes;   /* live recording-copy bytes (logged with the copy count) */
 static copy_prefix *copy_of(NVNcommandHandle h) { copy_prefix *c = (copy_prefix *)(uintptr_t)h - 1; return c; }
-static uint8_t *flatten_recording_ops(const uint8_t *p);
-/* TOTK_FLATTEN_FAST (default on; =0 the op-by-op copy, =2 both and compare), 2026-10-24: a recording sits contiguous in
-   the recorder's one buffer (cmd_reserve reallocs it whole), so the copy is one exact-size allocation and one memcpy after
-   a header walk that checks the ops and works out what the op-by-op copy derives. The op-by-op copy grew its buffer from
-   4 KiB by doubling (realloc moved the bytes each time) and called memcpy per op: ~0.5 ms per frame on the game's main
-   thread at Kakariko (tl-dghot: memmove 51 + realloc 32 samples of 965 busy). A recording with a jump goes the old way. */
-static int flatten_fast_mode(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_FLATTEN_FAST"); v = e ? atoi(e) : 1; } return v; }
-static uint8_t *flatten_recording(const uint8_t *p) {
-    int mode = flatten_fast_mode();
-    if (!mode) return flatten_recording_ops(p);
-    const uint8_t *q = p; int bulk_ok = 1, first = 1; uint32_t last_size = 0, end_size = 0;
-    for (;;) {
-        op_hdr h; memcpy(&h, q, sizeof h);
-        if (h.size < 8 || (h.size & 7)) die("corrupt recording at %p (op %u size %u)", (const void *)q, h.op, h.size);
-        if (h.op == OP_JUMP) return flatten_recording_ops(p);
-        if (h.op >= OP_COUNT_ || h.size > (64u << 20)) bulk_ok = 0;
-        if (first) { if (h.op != OP_BEGIN || h.size != 8) bulk_ok = 0; first = 0; }
-        else if (h.op == OP_BEGIN) bulk_ok = 0;
-        else if (h.op != OP_END) last_size = h.size;
-        q += h.size;
-        if (h.op == OP_END) { end_size = h.size; break; }
-    }
-    size_t len = (size_t)(q - p), n = sizeof(copy_prefix) + len;
-    uint8_t *out = malloc(n); if (!out) die("command copy allocation");
-    memcpy(out + sizeof(copy_prefix), p, len);
-    copy_prefix *c = (copy_prefix *)out; c->magic = COPY_MAGIC; c->used_at = 0; c->made_at = g_submits; COPY_KEEP_INIT(c);
-#ifdef GAME_BOTW
-    c->used = 0;
-#endif
-    size_t body = n >= sizeof(copy_prefix) + 16 ? n - sizeof(copy_prefix) - 16 : 0;
-    c->body_bytes = bulk_ok && end_size == 8 && body <= UINT32_MAX ? (uint32_t)body : 0;
-    c->last_size = c->body_bytes ? last_size : 0;
-    g_copy_bytes += malloc_size(out);
-    if (mode == 2) {   /* self-check: the op-by-op copy must be byte-identical, prefix fields included */
-        uint8_t *ref = flatten_recording_ops(p); copy_prefix *r = (copy_prefix *)ref - 1;
-        static _Atomic uint64_t checked;
-        if (malloc_size(r) < n || memcmp(out + sizeof(copy_prefix), ref, len) || r->body_bytes != c->body_bytes || r->last_size != c->last_size)
-            die("TOTK_FLATTEN_FAST=2: fast copy differs (len %zu, body %u/%u, last %u/%u)", len, c->body_bytes, r->body_bytes, c->last_size, r->last_size);
-        g_copy_bytes -= malloc_size(r); free(r);
-        if (!(atomic_fetch_add(&checked, 1) % 20000)) LOG("[flatten] TOTK_FLATTEN_FAST=2: %llu recordings identical", (unsigned long long)checked + 1);
-    }
-    return out + sizeof(copy_prefix);
+/* The copy also carries an index of the ops the submit call has to visit (uniform binds for the uniform capture, texture /
+   image / sampler binds for the deferred binds, calls), appended after OP_END: the submit call, on the frame's critical
+   path, read the whole recording twice to find them (TOTK, 2026-10-23: ~0.3 ms of a 0.8 ms submit). Offsets are from
+   the handle. */
+static __thread uint32_t *t_idx; static __thread uint32_t t_idx_cap;
+/* TOTK: the recording's distinct uniform ranges {lo, hi}, sorted by lo, appended after the op index (ubo_off, nubo) so the
+   submit call's uniform capture (mtl_sub_capture_ubos) takes a list per recording instead of walking every uniform bind
+   (13,800 a frame, 0.2 ms on the frame's critical path, 2026-10-31). Deduplicated here with a small open-addressing set. */
+typedef struct { uint64_t lo, hi; } ubo_range_t;
+static __thread ubo_range_t *t_ubo; static __thread uint32_t t_ubo_cap, t_ubo_n;
+static __thread ubo_range_t *t_ubo_set; static __thread uint32_t t_ubo_set_mask;
+static void ubo_range_note(uint64_t lo, uint64_t hi) {
+    if (!t_ubo_set || t_ubo_n * 2 >= t_ubo_set_mask) {   /* grow (or first use), then re-insert the list so far */
+        uint32_t size = t_ubo_set ? (t_ubo_set_mask + 1) * 2 : 4096; free(t_ubo_set); t_ubo_set = calloc(size, sizeof *t_ubo_set); if (!t_ubo_set) die("uniform range set"); t_ubo_set_mask = size - 1;
+        for (uint32_t i = 0; i < t_ubo_n; i++) { uint32_t k = (uint32_t)((t_ubo[i].lo ^ t_ubo[i].hi * 0x9E3779B97F4A7C15ull) * 0xBF58476D1CE4E5B9ull >> 40) & t_ubo_set_mask;
+            while (t_ubo_set[k].hi) k = (k + 1) & t_ubo_set_mask; t_ubo_set[k] = t_ubo[i]; } }
+    uint32_t k = (uint32_t)((lo ^ hi * 0x9E3779B97F4A7C15ull) * 0xBF58476D1CE4E5B9ull >> 40) & t_ubo_set_mask;
+    for (;; k = (k + 1) & t_ubo_set_mask) { if (!t_ubo_set[k].hi) break; if (t_ubo_set[k].lo == lo && t_ubo_set[k].hi == hi) return; }
+    t_ubo_set[k] = (ubo_range_t){lo, hi};
+    if (t_ubo_n == t_ubo_cap) { t_ubo_cap = t_ubo_cap ? t_ubo_cap * 2 : 2048; t_ubo = realloc(t_ubo, t_ubo_cap * sizeof *t_ubo); if (!t_ubo) die("uniform range list"); }
+    t_ubo[t_ubo_n++] = (ubo_range_t){lo, hi};
 }
-static uint8_t *flatten_recording_ops(const uint8_t *p) {
-    size_t n = sizeof(copy_prefix), cap = 4096; uint8_t *out = malloc(cap);
-    int bulk_ok = 1; uint32_t last_size = 0;
+static void ubo_ranges_sort(ubo_range_t *r, uint32_t n) {   /* LSD radix on lo, 8 bits a pass */
+    static __thread ubo_range_t *tmp; static __thread uint32_t tmp_cap;
+    if (n < 2) return;
+    if (n > tmp_cap) { free(tmp); tmp_cap = n + n / 2; tmp = malloc((size_t)tmp_cap * sizeof *tmp); if (!tmp) die("uniform range sort"); }
+    uint64_t high = 0; for (uint32_t i = 0; i < n; i++) high |= r[i].lo;
+    ubo_range_t *from = r, *to = tmp;
+    for (unsigned shift = 0; shift < 64 && (high >> shift); shift += 8) {
+        uint32_t count[256] = {0};
+        for (uint32_t i = 0; i < n; i++) count[(from[i].lo >> shift) & 255]++;
+        uint32_t sum = 0; for (unsigned k = 0; k < 256; k++) { uint32_t c = count[k]; count[k] = sum; sum += c; }
+        for (uint32_t i = 0; i < n; i++) to[count[(from[i].lo >> shift) & 255]++] = from[i];
+        ubo_range_t *t = from; from = to; to = t;
+    }
+    if (from != r) memcpy(r, from, (size_t)n * sizeof *r);
+}
+const ubo_range_t *nvn_copy_ubo_ranges(uint64_t handle, uint32_t *n, uint32_t *calls) {
+    const copy_prefix *c = (const copy_prefix *)(uintptr_t)handle - 1;
+    if (c->magic != COPY_MAGIC || !c->ubo_off) return NULL;
+    *n = c->nubo; *calls = c->ncall; return (const ubo_range_t *)(uintptr_t)(handle + c->ubo_off);
+}
+static int op_indexed(uint32_t op) { return op == OP_BIND_UBO || op == OP_BIND_TEX || op == OP_BIND_IMG || op == OP_BIND_SAMP || op == OP_CALL; }
+const uint32_t *nvn_copy_op_index(uint64_t handle, uint32_t *n) {
+    const copy_prefix *c = (const copy_prefix *)(uintptr_t)handle - 1;
+    if (c->magic != COPY_MAGIC || !c->idx_off) return NULL;
+    *n = c->nidx; return (const uint32_t *)(uintptr_t)(handle + c->idx_off);
+}
+/* hint: the recorded bytes (cmd_used - rec_start). The copy is allocated once at that size plus room for the op index (one
+   4-byte entry per op of at least 16 bytes) and not trimmed: growing from 4 KiB by realloc, then trimming, copied the
+   bigger recordings several times over on the game's threads (~1/4 of the main thread's memcpy). */
+static uint8_t *flatten_recording(const uint8_t *p, size_t hint) {
+    size_t n = sizeof(copy_prefix), cap = sizeof(copy_prefix) + hint + hint / 4 + 64; uint8_t *out = malloc(cap);
+    int bulk_ok = 1; uint32_t last_size = 0, nidx = 0, ncall = 0, nmark = 0; int idx_ok = 1;
     if (!out) die("command copy allocation");
+    t_ubo_n = 0; if (t_ubo_set) memset(t_ubo_set, 0, (size_t)(t_ubo_set_mask + 1) * sizeof *t_ubo_set);
+    const uint8_t *run = p; size_t run_n = n;   /* ops are copied one contiguous segment run at a time */
     for (;;) {
         op_hdr h; memcpy(&h, p, sizeof h);
         if (h.size < 8 || (h.size & 7)) die("corrupt recording at %p (op %u size %u)", (const void *)p, h.op, h.size);
-        if (h.op == OP_JUMP) { memcpy(&p, p + 8, 8); continue; }
+        if (h.op == OP_JUMP) { memcpy(out + run_n, run, n - run_n); memcpy(&p, p + 8, 8); run = p; run_n = n; continue; }
         if (h.op >= OP_COUNT_ || h.size > (64u << 20)) bulk_ok = 0;
         if (n == sizeof(copy_prefix)) { if (h.op != OP_BEGIN || h.size != 8) bulk_ok = 0; }
-        else if (h.op == OP_BEGIN) bulk_ok = 0;
-        else if (h.op != OP_END) last_size = h.size;
+        else if (h.op == OP_BEGIN && h.size == 8) bulk_ok = 0;   /* a piece marker (size 16 / 32, inline_recording) may sit in a bulk body */
+        else if (h.op == OP_BEGIN && h.size >= 32) nmark++;
+        else if (h.op != OP_END && h.op != OP_BEGIN) last_size = h.size;
         if (n + h.size > cap) { while (n + h.size > cap) cap *= 2; out = realloc(out, cap); if (!out) die("command copy allocation"); }
-        memcpy(out + n, p, h.size); n += h.size;
+        if (h.op == OP_BIND_UBO) { p_bind_buf b; memcpy(&b, p + 8, sizeof b); if (b.addr && b.size && b.size <= 65536) ubo_range_note(b.addr, b.addr + b.size); }
+        if (h.op == OP_CALL) ncall++;
+        if (op_indexed(h.op) && idx_ok) {
+            if (n - sizeof(copy_prefix) > UINT32_MAX) idx_ok = 0;
+            else { if (nidx == t_idx_cap) { t_idx_cap = t_idx_cap ? t_idx_cap * 2 : 4096; t_idx = realloc(t_idx, t_idx_cap * sizeof *t_idx); if (!t_idx) die("command op index"); }
+                   t_idx[nidx++] = (uint32_t)(n - sizeof(copy_prefix)); }
+        }
+        n += h.size;
         if (h.op == OP_END) {
-            uint8_t *trimmed = realloc(out, n); if (trimmed) out = trimmed;
-            copy_prefix *c = (copy_prefix *)out; c->magic = COPY_MAGIC; c->used_at = 0; c->made_at = g_submits; COPY_KEEP_INIT(c);
-#ifdef GAME_BOTW
-            c->used = 0;
-#endif
-            size_t body = n >= sizeof(copy_prefix) + 16 ? n - sizeof(copy_prefix) - 16 : 0;
+            memcpy(out + run_n, run, n - run_n);
+            size_t ops_end = n, idx_bytes = idx_ok ? (size_t)nidx * sizeof *t_idx : 0;
+            if (n + idx_bytes > cap) { cap = n + idx_bytes; out = realloc(out, cap); if (!out) die("command copy allocation"); }
+            if (idx_bytes) memcpy(out + n, t_idx, idx_bytes);
+            n += idx_bytes;
+            size_t ubo_at = n, ubo_bytes = (size_t)t_ubo_n * sizeof *t_ubo;
+            if (n + ubo_bytes > cap) { cap = n + ubo_bytes; out = realloc(out, cap); if (!out) die("command copy allocation"); }
+            if (ubo_bytes) { ubo_ranges_sort(t_ubo, t_ubo_n); memcpy(out + n, t_ubo, ubo_bytes); }
+            n += ubo_bytes;
+            copy_prefix *c = (copy_prefix *)out; c->magic = COPY_MAGIC; c->used_at = 0; c->made_at = g_submits; c->used = 0; c->pad3_ = 0; COPY_KEEP_INIT(c);
+            c->idx_off = idx_ok && ops_end - sizeof(copy_prefix) <= UINT32_MAX ? (uint32_t)(ops_end - sizeof(copy_prefix)) : 0; c->nidx = c->idx_off ? nidx : 0;
+            c->ubo_off = ubo_at - sizeof(copy_prefix) <= UINT32_MAX ? (uint32_t)(ubo_at - sizeof(copy_prefix)) : 0; c->nubo = c->ubo_off ? t_ubo_n : 0; c->ncall = ncall; c->nmark = nmark;
+            c->serial = atomic_fetch_add(&g_copy_serial, 1) + 1; atomic_store(&c->pinned, 0); c->pad2_ = 0; c->cb = 0;
+            size_t body = ops_end >= sizeof(copy_prefix) + 16 ? ops_end - sizeof(copy_prefix) - 16 : 0;
             c->body_bytes = bulk_ok && h.size == 8 && body <= UINT32_MAX ? (uint32_t)body : 0;
             c->last_size = c->body_bytes ? last_size : 0;
             g_copy_bytes += malloc_size(out); return out + sizeof(copy_prefix);
@@ -1043,13 +1070,23 @@ static void copy_touch(NVNcommandHandle h, uint64_t now) {
 
 static uint64_t g_copy_drop_readd, g_copy_drop_token, g_copy_mark_faults;   /* why copies were released: their control memory was added again / their mark there is gone (of those: unmapped) */
 static uint64_t g_copy_mark_late;   /* Breath of the Wild: handles called after their mark was found gone (botw_handle_copy; the copy was kept) */
+/* Copies a predecode on the translation thread is reading (copy_prefix.pinned) are not freed under it: they wait here
+   until it is done (drained at the next drop, and by the predecode itself when it unpins). */
+static copy_prefix *g_copy_deferred[1024]; static unsigned g_copy_ndeferred;   /* at most PQ are pinned at once */
+static void copy_drain_deferred(void) {   /* g_copy_mu held */
+    for (unsigned i = 0; i < g_copy_ndeferred;) { if (atomic_load(&g_copy_deferred[i]->pinned)) { i++; continue; } free(g_copy_deferred[i]); g_copy_deferred[i] = g_copy_deferred[--g_copy_ndeferred]; }
+}
 static void copy_drop(copy_bucket *b, uint32_t i, int by_token) {   /* g_copy_mu held: release copy i of bucket b */
+    copy_drain_deferred();
     cmd_copy *c = &b->v[i];
     c->stale_at = g_submits + 1;
     copy_prefix *pf = (copy_prefix *)(c->copy - sizeof(copy_prefix));
     if (cmdlog_env()) LOG("[cmd] free copy=%p%s", (void *)c->copy, by_token ? " (its mark in the control memory is gone)" : "");
     g_freed[g_nfreed++ % FREED_RING] = (typeof(g_freed[0])){(uintptr_t)c->copy, g_submits, c->stale_at, pf->used_at, pf->made_at, c->ctl_lo};
-    pf->magic = 0; g_copy_bytes -= malloc_size(pf); free(pf); b->v[i] = b->v[--b->n]; g_ncopies--;
+    pf->magic = 0; g_copy_bytes -= malloc_size(pf);
+    if (atomic_load(&pf->pinned)) { if (g_copy_ndeferred == sizeof g_copy_deferred / sizeof *g_copy_deferred) { while (atomic_load(&pf->pinned)) sched_yield(); free(pf); } else g_copy_deferred[g_copy_ndeferred++] = pf; }
+    else free(pf);
+    b->v[i] = b->v[--b->n]; g_ncopies--;
     if (by_token) g_copy_drop_token++; else g_copy_drop_readd++;
     if (!b->n && !b->empty) { b->empty = 1; g_cbk_empty++; }
 }
@@ -1123,6 +1160,8 @@ static void cbk_compact(void) {
     }
     free(ob); g_cbk_used = live; g_cbk_empty = 0; g_cbk_compactions++;
 }
+/* TOTK_CHAIN_LOG (diagnostic), read once: getenv on every EndRecording was ~2.6% of the game main thread's CPU */
+static int chain_log_on(void) { static int v = -1; if (v < 0) v = getenv("TOTK_CHAIN_LOG") != NULL; return v; }
 NVN(nvnCommandBufferEndRecording, NVNcommandHandle, NVNcommandBuffer *c) {
     if (runtime_frametrace_event) runtime_frametrace_event(11);
     cmd_t *o = CB(c);
@@ -1132,7 +1171,11 @@ NVN(nvnCommandBufferEndRecording, NVNcommandHandle, NVNcommandBuffer *c) {
         for (unsigned i = 1; i < OP_COUNT_ && n < sizeof line - 24; i++) if (t_rec_hist[i]) n += snprintf(line + n, sizeof line - n, " op%u×%u", i, t_rec_hist[i]);
         LOG("[rec] #%u cb=%p ours=%zu hw=%zu%s", t_rec_n, (void *)c, o->cmd_used - o->rec_start - 16, hw_before - o->hw_start, line); }
     const uint32_t rec_draws = t_rec_hist[OP_DRAW] + t_rec_hist[OP_DRAW_IDX];
-    uint8_t *copy = flatten_recording(o->seg);
+    uint64_t flat_t0 = now_ns();
+    uint8_t *copy = flatten_recording(o->seg, o->cmd_used - o->rec_start);
+    totk_tl(TL_REC_END, (uint64_t)(o->cmd_used - o->rec_start), (uint64_t)(uintptr_t)copy);   /* when, on which thread, and which handle (TOTK_TIMELINE) */
+    { static _Atomic uint64_t n, ns, bytes; uint64_t k = atomic_fetch_add(&n, 1) + 1; atomic_fetch_add(&ns, now_ns() - flat_t0); atomic_fetch_add(&bytes, o->cmd_used - o->rec_start);
+      if (k % 3000 == 0) { LOG("[nvn] EndRecording: flatten %.3f ms a call, %.1f KiB recorded a call (%llu calls)", atomic_load(&ns) / 3000e6, atomic_load(&bytes) / 3000.0 / 1024, (unsigned long long)k); atomic_store(&ns, 0); atomic_store(&bytes, 0); } }
     { extern void runtime_b2_rec(uint32_t draws, uint64_t handle); runtime_b2_rec(rec_draws, (uint64_t)(uintptr_t)copy); }
 #ifndef GAME_BOTW
     { extern int runtime_b2_keep(void); copy_prefix *cp = (copy_prefix *)(uintptr_t)copy - 1; cp->keep_until = runtime_b2_keep() ? g_submits + 2 : 0; cp->rec_cb = (uint64_t)(uintptr_t)c; cp->eyes = t_rec_eyes + t_rec_hist[OP_EYE]; cp->tdraws = t_rec_tdraws + rec_draws; }   // stereo B2: a first-run copy stays for its twin's use; which command buffer made it (b2_top_note)
@@ -1173,6 +1216,8 @@ NVN(nvnCommandBufferEndRecording, NVNcommandHandle, NVNcommandBuffer *c) {
         LOG("[cmd] recording copies: %llu made, %zu live, %.1f MiB, submit %llu; released %llu at a re-added control memory, %llu whose mark there was gone (%llu unmapped, %llu called after it was gone and kept); index %zu buckets (%zu empty) of %zu, compacted %llu times",
             (unsigned long long)made, g_ncopies, g_copy_bytes / 1048576.0, (unsigned long long)g_submits, (unsigned long long)g_copy_drop_readd, (unsigned long long)g_copy_drop_token, (unsigned long long)g_copy_mark_faults,
             (unsigned long long)g_copy_mark_late, g_cbk_used, g_cbk_empty, g_cbk_cap, (unsigned long long)g_cbk_compactions); }
+    copy_of((NVNcommandHandle)(uintptr_t)copy)->cb = (uint64_t)(uintptr_t)c;
+    plan_offer(copy);   /* g_copy_mu held: pins the copy for the predecode */
     pthread_mutex_unlock(&g_copy_mu);
     if (cmdlog_env()) LOG("[cmd] EndRecording cb=%p recorded=%p copy=%p ctl=%p", (void *)c, (void *)o->seg, (void *)copy, o->ctl);
     if (totk_life_on() && totk_life_cb_take(c)) { totk_life_log("end cb=%p handle=%p", (void *)c, (void *)copy); totk_life_handle_add((uint64_t)(uintptr_t)copy); }
@@ -1258,11 +1303,21 @@ void dm_nvn_inline_bulk_set(int v) {
     atomic_store_explicit(&g_inline_bulk_on, v != 0, memory_order_relaxed);
     LOG("[flag] inline_bulk = %d", v != 0);
 }
+static void inline_recording_body(NVNcommandBuffer *c, NVNcommandHandle hd);
 static void inline_recording(NVNcommandBuffer *c, NVNcommandHandle hd) {
+    inline_recording_body(c, hd);
+    { cmd_t *o = CB(c); uint8_t *m = cmd_alloc(o, 16); put_hdr(m, OP_BEGIN, 16); uint64_t w = 2; memcpy(m + 8, &w, 8); o->hw_used -= 16; }   /* piece marker: the copied recording ends here (no hardware equivalent) */
+}
+static void inline_recording_body(NVNcommandBuffer *c, NVNcommandHandle hd) {
     const uint8_t *p = (const uint8_t *)(uintptr_t)hd;
     if (!p) die("CallCommands/CopyCommands with a null handle");
     copy_touch(hd, g_submits);
     if (call_stats_on()) call_stats_note(c, hd, p);
+    /* Piece marker: where a copied / called recording begins inside the caller, with the copy it came from (pointer and
+       serial), so the replay can tell the pieces apart: the plan made for the recording when it completed
+       (nvn_vulkan_plan.inc), the TOTK_VK_STATELEAK census. An OP_BEGIN mid-stream is otherwise a no-op for the replay. */
+    { cmd_t *o = CB(c); uint8_t *m = cmd_alloc(o, 32); put_hdr(m, OP_BEGIN, 32); uint64_t w[3] = {1, (uint64_t)hd, copy_of(hd)->serial}; memcpy(m + 8, w, 24); o->hw_used -= 32; }
+    totk_tl(TL_REC_COPY, (uint64_t)hd, (uint64_t)(uintptr_t)c);
     /* EndRecording already flattened and checked this contiguous body. Copy
        its bytes now, at exactly the original call position. Deferred bindings
        remain deferred; source handle retirement cannot affect the caller.
@@ -1283,7 +1338,7 @@ static void inline_recording(NVNcommandBuffer *c, NVNcommandHandle hd) {
         op_hdr h; memcpy(&h, p, sizeof h);
         if (h.size < 8 || (h.size & 7) || h.size > (64u << 20) || h.op >= OP_COUNT_) die("corrupt recording in called handle %#llx (op %u size %u)", (unsigned long long)hd, h.op, h.size);
         if (h.op == OP_END) return;
-        if (h.op != OP_BEGIN) { uint8_t *d = cmd_alloc(CB(c), h.size); memcpy(d, p, h.size); }
+        if (h.op != OP_BEGIN || h.size >= 16) { uint8_t *d = cmd_alloc(CB(c), h.size); memcpy(d, p, h.size); }   /* piece markers are copied along */
         p += h.size;
     }
 }
@@ -2006,24 +2061,34 @@ void nvn_bind_handles_deferred(NVNcommandBuffer *c, int op, int st, int first, i
 static _Atomic int g_def_on = -1;                   // TOTK_DEFERRED_BINDS=0 / runtime flag "deferred 0": keep the record-time handles (A/B)
 static uint64_t g_def_n, g_def_changed, g_def_logged, g_def_ns;
 void nvn_set_deferred_binds(int on) { atomic_store(&g_def_on, on); LOG("[flag] deferred = %d", on); }
+static void resolve_one(p_bind_handles *b);
 static void resolve_deferred(const uint8_t *p, int depth) {   // read the handles of every deferred bind in a submitted recording
+    uint32_t nx; const uint32_t *ix = nvn_copy_op_index((uint64_t)(uintptr_t)p, &nx);
+    if (ix) {   /* a copy made by EndRecording: only the indexed ops */
+        for (uint32_t i = 0; i < nx; i++) {
+            const uint8_t *q = p + ix[i]; op_hdr h; memcpy(&h, q, sizeof h);
+            if (h.op == OP_CALL) { uint64_t t; memcpy(&t, q + 8, 8); if (depth >= 16) die("deferred bind resolution: call depth over 16"); resolve_deferred((const uint8_t *)(uintptr_t)t, depth + 1); }
+            else if (h.op == OP_BIND_TEX || h.op == OP_BIND_IMG || h.op == OP_BIND_SAMP) resolve_one((p_bind_handles *)(uintptr_t)(q + 8));
+        }
+        return;
+    }
     for (;;) {
         op_hdr h; memcpy(&h, p, sizeof h);
         if (h.size < 8 || (h.size & 7) || h.op >= OP_COUNT_) die("corrupt recording at %p while resolving deferred binds (op %u size %u)", (const void *)p, h.op, h.size);
         if (h.op == OP_END) return;
         if (h.op == OP_JUMP) { memcpy(&p, p + 8, 8); continue; }
         if (h.op == OP_CALL) { uint64_t t; memcpy(&t, p + 8, 8); if (depth >= 16) die("deferred bind resolution: call depth over 16"); resolve_deferred((const uint8_t *)(uintptr_t)t, depth + 1); }
-        else if (h.op == OP_BIND_TEX || h.op == OP_BIND_IMG || h.op == OP_BIND_SAMP) {
-            p_bind_handles *b = (p_bind_handles *)(uintptr_t)(p + 8);
-            if (b->src && b->n > 0 && b->n <= 32) {
-                uint64_t cur[32]; memcpy(cur, (const void *)(uintptr_t)b->src, 8 * (size_t)b->n); g_def_n++;
-                if (memcmp(cur, b->h, 8 * (size_t)b->n)) {
-                    if (g_def_logged++ < 6) LOG("[nvn] 延迟绑定在提交时读到新句柄：阶段 %d 槽 %d 起，录制时 %#llx → 提交时 %#llx", b->stage, b->first, (unsigned long long)b->h[0], (unsigned long long)cur[0]);
-                    g_def_changed++; memcpy(b->h, cur, 8 * (size_t)b->n);
-                }
-            }
-        }
+        else if (h.op == OP_BIND_TEX || h.op == OP_BIND_IMG || h.op == OP_BIND_SAMP) resolve_one((p_bind_handles *)(uintptr_t)(p + 8));
         p += h.size;
+    }
+}
+static void resolve_one(p_bind_handles *b) {
+    if (b->src && b->n > 0 && b->n <= 32) {
+        uint64_t cur[32]; memcpy(cur, (const void *)(uintptr_t)b->src, 8 * (size_t)b->n); g_def_n++;
+        if (memcmp(cur, b->h, 8 * (size_t)b->n)) {
+            if (g_def_logged++ < 6) LOG("[nvn] 延迟绑定在提交时读到新句柄：阶段 %d 槽 %d 起，录制时 %#llx → 提交时 %#llx | deferred bind read a new handle at submit: stage %d from slot %d, recorded %#llx -> submitted %#llx", b->stage, b->first, (unsigned long long)b->h[0], (unsigned long long)cur[0], b->stage, b->first, (unsigned long long)b->h[0], (unsigned long long)cur[0]);
+            g_def_changed++; memcpy(b->h, cur, 8 * (size_t)b->n);
+        }
     }
 }
 // 图像（可写贴图）：句柄 = 贴图池号（GetImageHandle 原样返回；游戏不调 RegisterImage，图像与贴图共用登记）
@@ -2230,6 +2295,11 @@ static pthread_cond_t g_susp_cv = PTHREAD_COND_INITIALIZER;
 static int g_susp, g_inflight_api;
 static void gfx_enter(void) { pthread_mutex_lock(&g_susp_mu); while (g_susp) pthread_cond_wait(&g_susp_cv, &g_susp_mu); g_inflight_api++; pthread_mutex_unlock(&g_susp_mu); }
 static void gfx_leave(void) { pthread_mutex_lock(&g_susp_mu); g_inflight_api--; pthread_cond_broadcast(&g_susp_cv); pthread_mutex_unlock(&g_susp_mu); }
+/* TOTK: the gate is at the guest's submit / present calls, never where the translation thread runs a job. Suspending drains
+   the queue (x_drain below), so a translation thread held at the gate would never finish the jobs it waits for: switching
+   apps hung the UI thread there until the system killed the app. Freeze replay presents on the translation thread with
+   nothing queued; it only runs when the gate is open (0 = suspended, skip). */
+static int gfx_try_enter(void) { pthread_mutex_lock(&g_susp_mu); int open = !g_susp; if (open) g_inflight_api++; pthread_mutex_unlock(&g_susp_mu); return open; }
 void dm_gfx_suspend(int on) {
     pthread_mutex_lock(&g_susp_mu);
     g_susp = on != 0;
@@ -2255,13 +2325,42 @@ _Atomic int dm_submit_busy;   // TOTK diagnostic: submissions being replayed (ru
 // 94-frame picture comparison with citron showed no difference from the synchronous replay. On the Mac only: the iPhone
 // and iPad keep the synchronous replay unless TOTK_ASYNC_REPLAY=1 (not measured there).
 enum { XJ_SUBMIT = 1, XJ_PRESENT, XJ_TEXREL };
-typedef struct { int kind, n; uint64_t *h; void *ucap; win_t *win; int idx; double period; int crop[4]; uint64_t frame, sub; tex_t tex; } xjob;   // tex: copy of a finalized texture (XJ_TEXREL); ucap: uniforms captured at the submit call
+typedef struct { int kind, n; uint64_t *h; void *ucap; win_t *win; int idx; double period; int crop[4]; uint64_t frame, sub; tex_t tex; uint64_t ns; } xjob;   /* ns: when the game made the call (TOTK_VK_FRAMEPROF: the game's gap and the queue wait) */   // tex: copy of a finalized texture (XJ_TEXREL); ucap: uniforms captured at the submit call
 #define XQ 64
 #define XF 4096
 static xjob g_xq[XQ];
 static uint64_t g_xq_in, g_xq_done, g_xsub_in, g_xsub_done, g_xsub_fence[XF];
 static pthread_mutex_t g_xq_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_xq_cv = PTHREAD_COND_INITIALIZER;
+/* Predecode (nvn_vulkan_plan.inc): a recording that just completed is offered to the translation thread, which, when it has
+   no submit to translate, walks the recording's copy and plans its draws (shader variants, pipeline keys, vertex input) so
+   that the translation at the submit finds them ready. The copy stays pinned while it is read. */
+void mtl_sub_job_time(uint64_t ns) __attribute__((weak));   /* nvn_vulkan.c: the submit call's time, for the frame profile */
+int mtl_plan_on(void) __attribute__((weak)); void mtl_plan_predecode(const uint8_t *body, uint32_t body_bytes, uint64_t copy, uint64_t serial, uint64_t cb) __attribute__((weak));
+static uint64_t g_root_cb;   /* the command buffer object of the last submitted recording */
+typedef struct { uint64_t copy, serial; } plan_job;
+#define PQ 256
+static plan_job g_pq[PQ]; static unsigned g_pq_in, g_pq_out;   /* under g_xq_mu */
+static uint64_t g_pq_dropped;
+static void plan_offer(uint8_t *copy) {   /* g_copy_mu held (EndRecording) */
+    if (!mtl_plan_on || !mtl_plan_predecode || !mtl_plan_on()) return;
+    /* leaf recordings only (no copies of other recordings inside): a parent's draws are its children's, and the replay
+       finds each child's plan through the markers; the root and the world piece are parents */
+    copy_prefix *c = copy_of((NVNcommandHandle)(uintptr_t)copy); if (c->body_bytes < 8192) return;
+    if (c->cb == __atomic_load_n(&g_root_cb, __ATOMIC_RELAXED)) return;   /* the frame's root (the command buffer last submitted): its draws are its pieces', and the submit follows its EndRecording at once */
+    pthread_mutex_lock(&g_xq_mu);
+    /* pinned from here until plan_run is done with it: a dropped copy (copy_drop) then waits in the deferred list instead
+       of being freed, so the body can be read without the copy lock (a large copy is a mapping of its own; its free unmaps it) */
+    if (g_pq_in - g_pq_out < PQ) { atomic_store(&c->pinned, 1); g_pq[g_pq_in++ % PQ] = (plan_job){(uint64_t)(uintptr_t)copy, c->serial}; pthread_cond_broadcast(&g_xq_cv); } else g_pq_dropped++;
+    pthread_mutex_unlock(&g_xq_mu);
+}
+int nvn_plan_yield(void) { return __atomic_load_n(&g_xq_in, __ATOMIC_RELAXED) != __atomic_load_n(&g_xq_done, __ATOMIC_RELAXED); }   /* a submit is waiting for the translation thread: the predecode stops */
+static void plan_run(const plan_job *j) {   /* translation thread; the copy is pinned (alive), possibly dropped (magic 0) */
+    copy_prefix *pf = copy_of((NVNcommandHandle)(uintptr_t)j->copy); int ok;
+    pthread_mutex_lock(&g_copy_mu); ok = pf->magic == COPY_MAGIC && pf->serial == j->serial; pthread_mutex_unlock(&g_copy_mu);
+    if (ok) mtl_plan_predecode((const uint8_t *)(uintptr_t)j->copy, pf->body_bytes, j->copy, j->serial, pf->cb);   /* else released already: never submitted, or its control memory was reused */
+    pthread_mutex_lock(&g_copy_mu); atomic_store(&pf->pinned, 0); copy_drain_deferred(); pthread_mutex_unlock(&g_copy_mu);
+}
 static win_t *g_xp_win; static uint64_t g_xp_job[4];   // job number of each swapchain image's last present (TOTK has one window)
 static _Atomic uint64_t g_x_drains, g_x_drain_ns;
 static int async_replay(void) {
@@ -2271,15 +2370,106 @@ static int async_replay(void) {
 }
 static void submit_exec(int n, const uint64_t *h, void *ucap);
 static void present_exec(win_t *o, int idx, double period, const int crop[4], uint64_t frame);
+#ifdef __ANDROID__
+#include <sched.h>
+/* TOTK: pin the translation thread to a fast core (highest cpuinfo_max_freq). It roamed over all eight cores, and every ninth
+   frame (when a heavy game job runs) its work took ~3x the CPU time. It gets one prime core of its own and the Vulkan
+   recording worker the other (fast:0 / fast:1): versus sharing both, still scene -0.4..0.7 ms. TOTK_TRANSLATE_CPUS: "fast:0"
+   (default), "fast", "slow", "all" (every core) or a list like "7" or "0-5" (totk_affinity.h). */
+#include "totk_affinity.h"
+extern void dm_android_perf_hint_thread(void) __attribute__((weak));   /* port/android/vk/performance_hint.c (ADPF) */
+static void x_thread_pin(void) {
+    if (dm_android_perf_hint_thread) dm_android_perf_hint_thread();
+    int n = totk_pin_self("TOTK_TRANSLATE_CPUS", "fast:0");
+    if (n) LOG("[nvn] translation thread pinned to %d core(s)", n);
+}
+#else
+static void x_thread_pin(void) {}
+#endif
+/* TOTK debug: freeze-frame. While <files>/freeze exists, one frame is recorded (every submit and the present that ends it,
+   with copies of the handle lists and uniform captures), the game is held at its next acquire, and the translation thread
+   replays that frame in a loop from the same GPU state (the backend snapshots every image before the frame and restores
+   it before each replay: nvn_vulkan_freeze.inc). Live debug switches (magenta.txt, probes, shader overrides) then act on
+   an identical frame each time. Deleting the file resumes the game. */
+enum { FRZ_OFF, FRZ_ARMED, FRZ_REC, FRZ_REPLAY };
+static struct { int state; xjob *jobs; int n, cap; uint64_t replays; } g_frz;
+static _Atomic int g_frz_hold;   // the game waits at nvnWindowAcquireTexture
+void mtl_freeze_snapshot(void) __attribute__((weak)); void mtl_freeze_frozen(void) __attribute__((weak)); void mtl_freeze_restore(void) __attribute__((weak)); void mtl_freeze_release(void) __attribute__((weak));
+void *mtl_sub_ucap_clone(const void *) __attribute__((weak)); void mtl_sub_ucap_free(void *) __attribute__((weak));   /* Vulkan backend; absent in the null backend (freeze stays off) */
+static int frz_requested(void) {
+    static char path[600]; static uint64_t next; static int last;
+    if (!mtl_freeze_snapshot) return 0;
+    if (!path[0]) { const char *d = getenv("TOTK_FILES_DIR"); if (!d) return 0; snprintf(path, sizeof path, "%s/freeze", d); }
+    uint64_t t = now_ns(); if (t < next) return last; next = t + 200000000ull;   // a stat every 200 ms
+    return last = access(path, F_OK) == 0;
+}
+/* The game reuses its command memory for the next frame before it reaches the acquire where it is held, so a recorded
+   submit owns a copy of its command streams: jumps are followed into one linear copy, calls are copied recursively and
+   the call pointer rewritten. Each copy is one malloc block (freed with the recording). */
+static void **g_frz_blocks; static int g_frz_nblocks, g_frz_capblocks;
+static uint8_t *frz_copy_stream(const uint8_t *p, int depth) {
+    if (depth > 32) die("freeze: command call recursion");
+    size_t cap = 4096, len = 0; uint8_t *out = malloc(cap); if (!out) die("freeze stream");
+    for (uint64_t count = 0;; count++) {
+        op_hdr h; memcpy(&h, p, sizeof h);
+        if (h.size < 8 || (h.size & 7) || count > 10000000) die("freeze: malformed packet op=%u size=%u while copying", h.op, h.size);
+        if (h.op == OP_JUMP) { memcpy(&p, p + 8, 8); continue; }
+        if (len + h.size > cap) { while (len + h.size > cap) cap *= 2; out = realloc(out, cap); if (!out) die("freeze stream"); }
+        memcpy(out + len, p, h.size);
+        if (h.op == OP_CALL) { const uint8_t *target; memcpy(&target, p + 8, 8); uint8_t *copy = frz_copy_stream(target, depth + 1); memcpy(out + len + 8, &copy, 8); }
+        len += h.size;
+        if (h.op == OP_END) break;
+        p += h.size;
+    }
+    if (g_frz_nblocks == g_frz_capblocks) { g_frz_capblocks = g_frz_capblocks ? g_frz_capblocks * 2 : 256; g_frz_blocks = realloc(g_frz_blocks, sizeof *g_frz_blocks * (size_t)g_frz_capblocks); if (!g_frz_blocks) die("freeze blocks"); }
+    g_frz_blocks[g_frz_nblocks++] = out;
+    return out;
+}
+static void frz_record(const xjob *j) {
+    if (g_frz.n == g_frz.cap) { g_frz.cap = g_frz.cap ? g_frz.cap * 2 : 64; g_frz.jobs = realloc(g_frz.jobs, sizeof *g_frz.jobs * (size_t)g_frz.cap); if (!g_frz.jobs) die("freeze jobs"); }
+    xjob c = *j;
+    if (j->kind == XJ_SUBMIT) { c.h = malloc(sizeof(uint64_t) * (size_t)(j->n > 0 ? j->n : 1)); if (!c.h) die("freeze handles"); for (int i = 0; i < j->n; i++) c.h[i] = (uint64_t)(uintptr_t)frz_copy_stream((const uint8_t *)(uintptr_t)j->h[i], 0); c.ucap = mtl_sub_ucap_clone(j->ucap); }
+    g_frz.jobs[g_frz.n++] = c;
+}
+static void frz_clear(void) {
+    for (int i = 0; i < g_frz.n; i++) if (g_frz.jobs[i].kind == XJ_SUBMIT) { free(g_frz.jobs[i].h); mtl_sub_ucap_free(g_frz.jobs[i].ucap); }
+    free(g_frz.jobs); g_frz.jobs = NULL; g_frz.n = g_frz.cap = 0;
+    for (int i = 0; i < g_frz_nblocks; i++) free(g_frz_blocks[i]); free(g_frz_blocks); g_frz_blocks = NULL; g_frz_nblocks = g_frz_capblocks = 0;
+}
+static void frz_after_present(void) {
+    if (g_frz.state == FRZ_OFF && frz_requested()) { g_frz.state = FRZ_ARMED; LOG("[freeze] armed: recording the next frame"); }
+    else if (g_frz.state == FRZ_REC) { g_frz.state = FRZ_REPLAY; atomic_store(&g_frz_hold, 1); g_frz.replays = 0; mtl_freeze_frozen();
+        int subs = 0; for (int i = 0; i < g_frz.n; i++) subs += g_frz.jobs[i].kind == XJ_SUBMIT;
+        LOG("[freeze] frozen: %d jobs (%d submits); the game is held, the frame replays until files/freeze is deleted", g_frz.n, subs); }
+}
+static void frz_replay(void) {
+    if (!frz_requested()) {
+        mtl_freeze_release(); frz_clear(); g_frz.state = FRZ_OFF; atomic_store(&g_frz_hold, 0);
+        LOG("[freeze] resumed after %llu replays", (unsigned long long)g_frz.replays); return; }
+    mtl_freeze_restore();
+    for (int i = 0; i < g_frz.n; i++) {
+        xjob *j = &g_frz.jobs[i];
+        if (j->kind == XJ_SUBMIT) submit_exec(j->n, j->h, mtl_sub_ucap_clone(j->ucap));
+        else if (j->kind == XJ_PRESENT) present_exec(j->win, j->idx, j->period, j->crop, j->frame);
+    }
+    if (!(++g_frz.replays % 120)) LOG("[freeze] %llu replays", (unsigned long long)g_frz.replays);
+}
 static _Thread_local int t_on_x_thread;   // set on the translation thread: x_drain there would wait for itself
 static void *x_thread(void *unused) {
-    (void)unused; pthread_setname_np("totk-translate"); t_on_x_thread = 1;
+    (void)unused; pthread_setname_np("totk-translate"); t_on_x_thread = 1; x_thread_pin();
     for (;;) {
         pthread_mutex_lock(&g_xq_mu);
-        while (g_xq_done == g_xq_in) pthread_cond_wait(&g_xq_cv, &g_xq_mu);
+        while (g_xq_done == g_xq_in && g_pq_in == g_pq_out && g_frz.state != FRZ_REPLAY) pthread_cond_wait(&g_xq_cv, &g_xq_mu);
+        if (g_xq_done == g_xq_in && g_pq_in != g_pq_out) { plan_job pj = g_pq[g_pq_out++ % PQ]; pthread_mutex_unlock(&g_xq_mu); plan_run(&pj); continue; }   /* idle: plan a finished recording */
+        if (g_xq_done == g_xq_in) {   // frozen and nothing queued
+            pthread_mutex_unlock(&g_xq_mu);
+            if (gfx_try_enter()) { frz_replay(); gfx_leave(); } else { struct timespec ts = {0, 16000000}; nanosleep(&ts, NULL); }
+            continue; }
         xjob j = g_xq[g_xq_done % XQ];
         pthread_mutex_unlock(&g_xq_mu);
-        if (j.kind == XJ_SUBMIT) { submit_exec(j.n, j.h, j.ucap); free(j.h); }
+        if (g_frz.state == FRZ_ARMED && j.kind != XJ_TEXREL) { mtl_freeze_snapshot(); g_frz.state = FRZ_REC; }
+        if (g_frz.state == FRZ_REC && j.kind != XJ_TEXREL) frz_record(&j);
+        if (j.kind == XJ_SUBMIT) { if (mtl_sub_job_time) mtl_sub_job_time(j.ns); submit_exec(j.n, j.h, j.ucap); free(j.h); }
         else if (j.kind == XJ_TEXREL) { void live_del_x(const tex_t *o); live_del_x(&j.tex); mtl_tex_release(&j.tex); }
         else {
             // Real-time like the game's render thread that used to replay (set at acquire): otherwise the game's ~50
@@ -2287,6 +2477,7 @@ static void *x_thread(void *unused) {
             static uint64_t rt; uint64_t per = (uint64_t)(j.period * 1e9);
             if (per && rt != per) { rt = per; void set_time_constraint_comp_x(uint64_t, uint64_t); set_time_constraint_comp_x(per, per / 2); }
             present_exec(j.win, j.idx, j.period, j.crop, j.frame);
+            frz_after_present();
         }
         pthread_mutex_lock(&g_xq_mu);
         if (j.kind == XJ_SUBMIT) { g_xsub_fence[j.sub % XF] = mtl_last_fence(); g_xsub_done = j.sub; }
@@ -2378,15 +2569,21 @@ NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h)
     if (atomic_load(&g_def_on)) {
         uint64_t r0 = now_ns();
         for (int i = 0; i < n; i++) resolve_deferred((const uint8_t *)h[i], 0);
+        if (n > 0 && copy_of(h[n - 1])->magic == COPY_MAGIC) __atomic_store_n(&g_root_cb, copy_of(h[n - 1])->cb, __ATOMIC_RELAXED);
         g_def_ns += now_ns() - r0;
         if (((queue_t *)q)->submits % 600 == 0) LOG("[nvn] 延迟绑定 至提交 %llu：提交时读句柄 %llu 次，其中与录制时不同 %llu 次；每次提交读句柄平均 %.3f ms", (unsigned long long)((queue_t *)q)->submits, (unsigned long long)g_def_n, (unsigned long long)g_def_changed, g_def_ns / 1e6 / (double)((queue_t *)q)->submits);
     }
+    gfx_enter();
     if (async_replay()) {
-        xjob j = {.kind = XJ_SUBMIT, .n = n, .h = malloc(sizeof(uint64_t) * (n > 0 ? n : 1))};
+        xjob j = {.kind = XJ_SUBMIT, .n = n, .h = malloc(sizeof(uint64_t) * (n > 0 ? n : 1)), .ns = now_ns()};
         if (!j.h) die("submit job");
         memcpy(j.h, h, sizeof(uint64_t) * (size_t)n);
-        j.ucap = mtl_sub_capture_ubos((const uint64_t *)h, n);
+        j.ucap = mtl_sub_capture_ubos((const uint64_t *)h, n);   /* the ranges and their buffer */
+        static int early = -1; if (early < 0) { const char *e = getenv("TOTK_VK_UCAP_EARLY"); early = e && atoi(e); }   /* =1: the bytes before the hand-off (the old order, for an A/B) */
+        void *ucap = j.ucap; if (early) mtl_sub_capture_copy(ucap);
         x_push(&j);
+        mtl_sub_capture_copy(ucap);   /* the bytes, while the translation thread starts on the handles; the call returns only once they are in */
+        gfx_leave();
         totk_tl(TL_SUB_OUT, 1, 0);
 #ifdef GAME_BOTW
         free(heap);
@@ -2395,20 +2592,20 @@ NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h)
     }
     submit_exec(n, (const uint64_t *)h, NULL);
     atomic_store(&g_sub_fence_prev, atomic_load(&g_sub_fence_last)); atomic_store(&g_sub_fence_last, mtl_last_fence());
+    gfx_leave();
     totk_tl(TL_SUB_OUT, 0, 0);
 #ifdef GAME_BOTW
     free(heap);
 #endif
 }
 static void submit_exec(int n, const uint64_t *h, void *ucap) {
-    gfx_enter();
     totk_tl(TL_REP_BEGIN, 0, 0);
     pin_step(__atomic_load_n(&g_submits, __ATOMIC_RELAXED));   /* TOTK: free texture copies no recording refers to any more */
     if (cmdlog_env()) for (int i = 0; i < n; i++) {
         unsigned ops = 0, draws = 0, calls = 0; const uint8_t *p = (const uint8_t *)h[i];
         for (;;) { op_hdr hh; memcpy(&hh, p, sizeof hh); ops++; if (hh.op == OP_DRAW || hh.op == OP_DRAW_IDX) draws++; if (hh.op == OP_CALL) calls++; if (hh.op == OP_END || hh.size < 8 || ops > 1000000) break; p += hh.size; }
         LOG("[cmd] Submit %d/%d handle=%#llx ops=%u draws=%u calls=%u", i, n, (unsigned long long)h[i], ops, draws, calls); }
-    if (getenv("TOTK_CHAIN_LOG")) { static int k; if (k++ < 20) guest_chain("Submit"); }
+    if (chain_log_on()) { static int k; if (k++ < 20) guest_chain("Submit"); }
     uint64_t t0 = now_ns(), c0 = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID), i0, y0, s0 = thr_sys_ns(); thr_counts(&i0, &y0);
     /* TOTK diagnostic (TOTK_WATCH_ADDR): submissions in progress, and their start / end times, to line up guest writes with replay */
     atomic_fetch_add(&dm_submit_busy, 1);
@@ -2458,7 +2655,6 @@ static void submit_exec(int n, const uint64_t *h, void *ucap) {
     atomic_fetch_add(&g_sub_cpu_ns, dc); atomic_fetch_add(&g_cum_sub_cpu_ns, dc);
     atomic_fetch_add(&g_sub_instr, di); atomic_fetch_add(&g_cum_sub_instr, di);
     totk_tl(TL_REP_END, 0, 0);
-    gfx_leave();
 }
 
 // 只影响 GPU 状态 / 只在 GPU 上执行的命令：空设备只计数（跳板已计）
@@ -2646,8 +2842,11 @@ uint64_t g_frame_pub;
 static uint64_t g_acq_wait_ns, g_pq_wait_ns;   // 取图里节拍等待 / 等出图队列归还的累计，出图时按帧记（一帧内可有多次取图） | Accumulated display-link wait / wait for the present queue to return inside acquire, recorded per frame at present (there can be several acquires within one frame)
 uint64_t dm_nvn_frame_count(void) { return g_frame; }
 extern uint64_t g_t0_ns;   // 宿主进程起点（main.c；UIMSG 时间戳同基） | Host process start point (main.c; same base as the UIMSG timestamps)
+int overlay_open(void) __attribute__((weak));   /* Android in-game overlay: the game waits here while its menu is open */
 NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsync *s, int *idx) {
     NVN_BLOCKING();
+    while (overlay_open && overlay_open()) usleep(5000);   /* paused: the frame step discards the long frame that follows */
+    while (atomic_load(&g_frz_hold)) usleep(5000);          /* freeze-frame (debug): the translation thread replays one frame */
     totk_tl(TL_ACQ_IN, 0, 0);
     win_t *o = (win_t *)w;
     *idx = o->active ? o->next++ % o->active : 0;
@@ -2670,9 +2869,13 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
     g_acq_wait_ns += wait; trow(g_frame, "@late_ms", wait ? (now_ns() - at) / 1e6 : 0);
     // 该张上一次出图还没被出图线程处理完（显示跟不上、落后一整轮交换链）：等它归还，再交给游戏画
     // The previous present of this texture has not yet been processed by the present thread (display cannot keep up, a whole swapchain round behind): wait for it to be returned, then hand it to the game to draw
+    static uint64_t acq_pace_ns, acq_job_ns, acq_pq_ns, acq_n; uint64_t acq_t0 = now_ns(); acq_pace_ns += wait;
     if (async_replay() && *idx < 4 && g_xp_win == o) x_wait_job(g_xp_job[*idx]);   // TOTK: that image's last present has run (its ticket is set)
+    uint64_t acq_t1 = now_ns(); acq_job_ns += acq_t1 - acq_t0;
     uint64_t tk = *idx < 4 ? o->ticket[*idx] : 0;
-    if (tk) { uint64_t w0 = now_ns(); mtl_present_wait(tk); g_pq_wait_ns += now_ns() - w0; }
+    if (tk) { uint64_t w0 = now_ns(); mtl_present_wait(tk); g_pq_wait_ns += now_ns() - w0; acq_pq_ns += now_ns() - w0; }
+    if (++acq_n == 240) { LOG("[acquire] images=%d interval=%d ticks=%u period=%.2f ms uncapped=%d per acquire: pacing=%.2f ms present_job=%.2f ms present_gpu=%.2f ms", o->active, o->interval, present_ticks(o), present_period(o) / 1e6, uncapped_now(),
+        acq_pace_ns / 240e6, acq_job_ns / 240e6, acq_pq_ns / 240e6); acq_n = acq_pace_ns = acq_job_ns = acq_pq_ns = 0; }
     /* TOTK: the acquire sync means "this swapchain texture is no longer read by the display path". mtl_present_wait above
        already waited until the GPU finished the present copy that last read this texture, and every later use of it is
        ordered after that copy on the one Metal queue. Fencing the sync to the newest submission instead (the D2R behaviour,
@@ -2977,6 +3180,9 @@ static int uncapped_cap(int scr) {
     return v < 30 ? 30 : v > UNCAPPED_HZ ? UNCAPPED_HZ : v;
 }
 void nvn_present_config(int hz, int display_mode) { g_hz = g_paced_hz = hz; g_display_mode = display_mode; g_cfg_scr = -1; }
+/* Android in-game overlay (port/android/vk/overlay.h): the frame-rate cap is the uncapped clock's ceiling, changed live. */
+int nvn_frame_cap_get(void) { return g_uncapped && g_hz > 0 ? g_hz : 60; }
+void nvn_frame_cap_set(int hz) { if (!g_uncapped) return; g_hz = hz < 30 ? 30 : hz > UNCAPPED_HZ ? UNCAPPED_HZ : hz; LOG("[nvn] frame-rate cap %d (overlay)", g_hz); }
 static void present_cfg(const win_t *o) {
     /* again when the window moved to a display with another refresh rate (mtl_display_hz follows the window) */
     if (g_hz >= 0 && (g_cfg_scr < 0 || mtl_display_hz() == g_cfg_scr)) return;
@@ -3124,11 +3330,9 @@ int (*g_nvn_loadscreen_up)(void);   // 宿主登记：读取画面此刻是否�
 // The present itself: screenshot hook, then the present queue (returns at once). frame != 0 (translation thread): also the
 // replay frame number, which the synchronous path sets at the end of nvnQueuePresentTexture.
 static void present_exec(win_t *o, int idx, double period, const int crop[4], uint64_t frame) {
-    gfx_enter();
     { void mtl_shot_at_present(const tex_t *t); if (idx >= 0 && idx < o->ntex && idx < 4) mtl_shot_at_present(CTX(o->tex[idx])); }
     if (idx >= 0 && idx < o->ntex && idx < 4) o->ticket[idx] = mtl_present(CTX(o->tex[idx]), period, (int *)crop);   // 只入队，立即返回 | enqueue only, return immediately
     if (frame) mtl_set_frame(frame);
-    gfx_leave();
 }
 NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     NVN_BLOCKING();
@@ -3163,6 +3367,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
       } }
     present_cfg(o);
     uint64_t t0 = now_ns();
+    gfx_enter();
     if (async_replay()) {   // TOTK: the present (and the replay frame number below) run on the translation thread, after this frame's submits
         xjob j = {.kind = XJ_PRESENT, .win = o, .idx = idx, .period = present_period(o) / 1e9};
         memcpy(j.crop, o->crop, sizeof j.crop);
@@ -3170,6 +3375,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         uint64_t no = x_push(&j);
         if (idx >= 0 && idx < 4) { g_xp_win = o; g_xp_job[idx] = no; }
     } else present_exec(o, idx, present_period(o) / 1e9, o->crop, 0);
+    gfx_leave();
     atomic_fetch_add(&g_nvn_ns, now_ns() - t0);
     uint64_t f = g_frame, ps, dr; mtl_stats(&ps, &dr);
     trow(f, "@present_guest_ticks", o->interval);

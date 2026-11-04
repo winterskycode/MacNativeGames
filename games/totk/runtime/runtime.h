@@ -13,6 +13,23 @@ typedef struct {
  uint8_t *base; unsigned relative, symbolic, cross, weak;
 } Module;
 extern pthread_key_t runtime_keys[8];
+/* The calling thread's slot block (the rewritten code's K18/KTLS/KTLR/KGATE slots and the host-stack slot): Darwin's
+   pthread TSD at tpidrro_el0; on Android a block the loader installs in bionic's TLS_SLOT_APP (runtime_keys[i] = i). */
+static inline uintptr_t runtime_host_tsd(void) {
+    uintptr_t tp;
+#ifdef __ANDROID__
+    __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp)); return ((uintptr_t *)tp)[2];
+#else
+    __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(tp)); return tp;
+#endif
+}
+static inline void *runtime_tsd_get(unsigned key) {
+#ifdef __ANDROID__
+    return (void *)((uintptr_t *)runtime_host_tsd())[runtime_keys[key]];
+#else
+    return pthread_getspecific(runtime_keys[key]);
+#endif
+}
 _Noreturn void runtime_fail(const char *message);
 void *runtime_symbol(const char *name);
 void *runtime_override(const char *name);
@@ -239,6 +256,13 @@ void runtime_motion_live(int on);   /* a controller with motion attached (1) / d
 void runtime_motion_phone(int on);  /* the iPhone's own sensor feeds the six-axis device (1) / stops (0) */
 void runtime_motion_mouse(int on);  /* mouse mode (key 7) takes the sensor over (1) / gives it back to the controller (0) */
 void runtime_motion_feed_mouse(const double acc_g[3], const double gyro_rad_s[3], uint64_t now_ns);   /* already in the reference frame */
+void runtime_actions_set(const uint64_t *table);   /* field controls by action (game_actions.h tables), NULL = the game's own */
+void runtime_prompts_set(const uint8_t *field, int swap_faces, const uint16_t *text);   /* the button prompts: field glyph map, printed face letters, text icon characters (game_actions.h); NULL = the game's own */
+/* RomFS files the host rewrites when the game opens them (runtime/romfs.c): called with data NULL to ask whether path is
+   one (nonzero = yes), then with the original bytes; returns 1 with *out (malloc'd, kept) and *out_size, else the original */
+typedef int (*RomfsGenerator)(const char *path, const uint8_t *data, uint64_t size, uint8_t **out, uint64_t *out_size);
+extern RomfsGenerator runtime_romfs_generator;
+int runtime_romfs_load(const char *path, uint8_t **out, uint64_t *size);   /* a RomFS file's bytes (malloc'd), 0 on success */
 void runtime_feedback_quiet(void);   /* focus lost: stop rumbling */
 #ifdef __OBJC__
 @class GCController;

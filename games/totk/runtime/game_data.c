@@ -8,6 +8,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __ANDROID__
+#include "player_files.h"
+#endif
 typedef struct Config { struct Config *next; char *file; const char **keys, **values; size_t count; } Config;
 static Config *configs;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
@@ -19,7 +22,13 @@ void runtime_game_data_path(const char *name, char *out, size_t cap) {
 }
 static Config *config_load(const char *file) {
     char path[4096]; runtime_game_data_path(file, path, sizeof path);
-    FILE *f = fopen(path, "rb");
+    FILE *f = NULL;
+#ifdef __ANDROID__
+    /* From the player's own files: what ships with the app, not a file the PC made (host/player_files.c) */
+    const char *own = player_on && player_on() ? player_game_file(file) : NULL;
+    if (own) f = fmemopen((void *)own, strlen(own), "r");
+#endif
+    if (!f) f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "[totk] %s: %s\n", path, strerror(errno)); runtime_fail("game data missing (build_app.py writes it into the app; update_runtime.py --work adds it to an older app)"); }
     char *text = malloc((1u << 20) + 1); need(text != NULL, "game data memory");
     size_t n = fread(text, 1, 1u << 20, f); need(!ferror(f) && fgetc(f) == EOF, "game data file too large"); fclose(f); text[n] = 0;

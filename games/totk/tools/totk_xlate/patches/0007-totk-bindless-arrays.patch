@@ -1,0 +1,355 @@
+diff --git a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Declarations.cs b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Declarations.cs
+index 26d0a5b..8e81796 100644
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Declarations.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Declarations.cs
+@@ -197,6 +197,10 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
+ 
+                 if (sampler.ArrayLength == 0)
+                 {
++                    // TOTK: the global (bindless) arrays are unsized: their length is the host's.
++                    context.AddExtension("SPV_EXT_descriptor_indexing");
++                    context.AddCapability(Capability.RuntimeDescriptorArray);
++
+                     SpvInstruction sampledImageArrayType = context.TypeRuntimeArray(sampledOrSeparateImageType);
+                     sampledImageArrayPointerType = context.TypePointer(StorageClass.UniformConstant, sampledImageArrayType);
+                 }
+diff --git a/src/Ryujinx.Graphics.Shader/IGpuAccessor.cs b/src/Ryujinx.Graphics.Shader/IGpuAccessor.cs
+index 77953df..2390c49 100644
+--- a/src/Ryujinx.Graphics.Shader/IGpuAccessor.cs
++++ b/src/Ryujinx.Graphics.Shader/IGpuAccessor.cs
+@@ -336,6 +336,48 @@ namespace Ryujinx.Graphics.Shader
+         {
+             return true;
+         }
++        /// <summary>
++        /// TOTK: the descriptor set of the support buffer (binding 0): the stage's own set when set 0 holds the global arrays.
++        /// </summary>
++        int QueryTotkSupportBufferSet()
++        {
++            return 0;
++        }
++
++        /// <summary>
++        /// TOTK: sampled textures whose handle is in the texture constant buffer are read through global descriptor arrays,
++        /// indexed by slots the host writes into a per-draw slot block (see Optimizations/TotkBindless).
++        /// </summary>
++        bool QueryTotkBindless()
++        {
++            return false;
++        }
++
++        /// <summary>
++        /// TOTK: the fixed set and binding of the global array for a sampled texture type (SamplerType.None: the samplers).
++        /// </summary>
++        SetBindingPair QueryTotkBindlessBinding(SamplerType type)
++        {
++            return new SetBindingPair(-1, -1);
++        }
++
++        /// <summary>
++        /// TOTK: the constant buffer slot of the per-draw slot block (word k: the slots of the shader's k-th bindless texture).
++        /// </summary>
++        int QueryTotkSlotBuffer()
++        {
++            return -1;
++        }
++
++        /// <summary>
++        /// TOTK: a texture handle the shader now reads through the global arrays (the host resolves it per draw); returns
++        /// its index in the shader's list, the word of its slots in the slot block.
++        /// </summary>
++        int RegisterTotkBindless(int handle, int cbufSlot, SamplerType type)
++        {
++            return 0;
++        }
++
+         bool QueryHostSupportsShaderNonUniformIndexing()
+         {
+             return false;
+diff --git a/src/Ryujinx.Graphics.Shader/StructuredIr/ShaderProperties.cs b/src/Ryujinx.Graphics.Shader/StructuredIr/ShaderProperties.cs
+index f0f22c0..334db94 100644
+--- a/src/Ryujinx.Graphics.Shader/StructuredIr/ShaderProperties.cs
++++ b/src/Ryujinx.Graphics.Shader/StructuredIr/ShaderProperties.cs
+@@ -38,6 +38,14 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
+             _storageBuffers[definition.Binding] = definition;
+         }
+ 
++        /// <summary>
++        /// TOTK: drop the declaration of a texture no operation uses any more (ResourceManager.PruneTotkTextures).
++        /// </summary>
++        public void RemoveTexture(SetBindingPair setAndBinding)
++        {
++            _textures.Remove(setAndBinding);
++        }
++
+         public void AddOrUpdateTexture(TextureDefinition definition)
+         {
+             _textures[new(definition.Set, definition.Binding)] = definition;
+diff --git a/src/Ryujinx.Graphics.Shader/Translation/Optimizations/Optimizer.cs b/src/Ryujinx.Graphics.Shader/Translation/Optimizations/Optimizer.cs
+index 96a235d..47a6217 100644
+--- a/src/Ryujinx.Graphics.Shader/Translation/Optimizations/Optimizer.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/Optimizations/Optimizer.cs
+@@ -53,6 +53,14 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
+             RunOptimizationPasses(context.Blocks, context.ResourceManager);
+         }
+ 
++        /// <summary>
++        /// TOTK: the optimization passes once more over what TotkBindless inserted.
++        /// </summary>
++        public static void RunTotkCleanup(BasicBlock[] blocks, ResourceManager resourceManager)
++        {
++            RunOptimizationPasses(blocks, resourceManager);
++        }
++
+         private static void RunOptimizationPasses(BasicBlock[] blocks, ResourceManager resourceManager)
+         {
+             bool modified;
+diff --git a/src/Ryujinx.Graphics.Shader/Translation/Optimizations/TotkBindless.cs b/src/Ryujinx.Graphics.Shader/Translation/Optimizations/TotkBindless.cs
+new file mode 100644
+index 0000000..d22869f
+--- /dev/null
++++ b/src/Ryujinx.Graphics.Shader/Translation/Optimizations/TotkBindless.cs
+@@ -0,0 +1,110 @@
++using Ryujinx.Graphics.Shader.IntermediateRepresentation;
++using System.Collections.Generic;
++
++using static Ryujinx.Graphics.Shader.IntermediateRepresentation.OperandHelper;
++
++namespace Ryujinx.Graphics.Shader.Translation.Optimizations
++{
++    /// <summary>
++    /// TOTK: sampled textures bound through the texture constant buffer are read from global descriptor arrays
++    /// instead of a binding of their own. For the shader's k-th such texture the host writes, at word k of a per-draw
++    /// slot block (constant buffer QueryTotkSlotBuffer), the array slot of the view it resolved for the draw in the low
++    /// 20 bits and the sampler's slot above them; the shader indexes the arrays with those. Buffer and multisample textures,
++    /// images and handles from other constant buffers keep their own bindings.
++    /// </summary>
++    static class TotkBindless
++    {
++        private const int NvnTextureBufferIndex = 2;
++
++        /// <summary>
++        /// Converts one function's texture operations; true when the host asked for it. The single textures still in use
++        /// are noted in the resource manager, which drops the others once every function is done (PruneTotkTextures).
++        /// </summary>
++        public static bool RunPass(BasicBlock[] blocks, ResourceManager resourceManager, IGpuAccessor gpuAccessor)
++        {
++            if (!gpuAccessor.QueryTotkBindless())
++            {
++                return false;
++            }
++
++            int slotBuffer = gpuAccessor.QueryTotkSlotBuffer();
++            HashSet<(int, int)> used = resourceManager.TotkUsedTextures;
++
++            foreach (BasicBlock block in blocks)
++            {
++                for (LinkedListNode<INode> node = block.Operations.First; node != null; node = node.Next)
++                {
++                    if (node.Value is TextureOperation texOp && !TryConvert(block, node, texOp, resourceManager, gpuAccessor, slotBuffer))
++                    {
++                        used.Add((texOp.Set, texOp.Binding));
++                    }
++                }
++            }
++
++            return true;
++        }
++
++        private static bool TryConvert(
++            BasicBlock block,
++            LinkedListNode<INode> node,
++            TextureOperation texOp,
++            ResourceManager resourceManager,
++            IGpuAccessor gpuAccessor,
++            int slotBuffer)
++        {
++            SamplerType type = texOp.Type;
++
++            if ((texOp.Flags & TextureFlags.Bindless) != 0 ||
++                texOp.Inst.IsImage() ||
++                texOp.SamplerSet >= 0 ||
++                type == SamplerType.None ||
++                (type & SamplerType.Mask) == SamplerType.TextureBuffer ||
++                (type & SamplerType.Multisample) != 0 ||
++                !resourceManager.TryGetTotkBoundTexture(texOp.Set, texOp.Binding, out int cbufSlot, out int handle, out _) ||
++                (cbufSlot >= 0 && cbufSlot != NvnTextureBufferIndex))
++            {
++                return false;
++            }
++
++            int index = gpuAccessor.RegisterTotkBindless(handle, cbufSlot, type);
++
++            Operand slots = Local();
++            Operand textureIndex = Local();
++
++            block.Operations.AddBefore(node, new Operation(Instruction.Copy, slots, Cbuf(slotBuffer, index)));
++            block.Operations.AddBefore(node, new Operation(Instruction.BitwiseAnd, textureIndex, slots, Const(0xfffff)));
++
++            texOp.InsertSource(0, textureIndex);
++
++            // Array length 0: an unsized (runtime) array, as long as the host's array.
++            SetBindingPair textureSetAndBinding = resourceManager.GetTextureOrImageBinding(
++                texOp.Inst,
++                type,
++                texOp.Format,
++                texOp.Flags,
++                0,
++                TextureHandle.PackOffsets(0, 0, TextureHandleType.Direct),
++                0,
++                true);
++
++            Operand samplerIndex = Local();
++
++            block.Operations.AddBefore(node, new Operation(Instruction.ShiftRightU32, samplerIndex, slots, Const(20)));
++
++            texOp.InsertSource(1, samplerIndex);
++
++            SetBindingPair samplerSetAndBinding = resourceManager.GetTextureOrImageBinding(
++                texOp.Inst,
++                SamplerType.None,
++                texOp.Format,
++                TextureFlags.None,
++                0,
++                TextureHandle.PackOffsets(0, 0, TextureHandleType.Direct),
++                0);
++
++            texOp.TurnIntoArray(textureSetAndBinding, samplerSetAndBinding);
++
++            return true;
++        }
++    }
++}
+diff --git a/src/Ryujinx.Graphics.Shader/Translation/ResourceManager.cs b/src/Ryujinx.Graphics.Shader/Translation/ResourceManager.cs
+index 2fc1534..de9ce80 100644
+--- a/src/Ryujinx.Graphics.Shader/Translation/ResourceManager.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/ResourceManager.cs
+@@ -65,7 +65,7 @@ namespace Ryujinx.Graphics.Shader.Translation
+             _stage = stage;
+             _stagePrefix = GetShaderStagePrefix(stage);
+ 
+-            _cbSlotToBindingMap = new SetBindingPair[18];
++            _cbSlotToBindingMap = new SetBindingPair[20];   // TOTK: slot 19 is the bindless slot block (TotkBindless)
+             _sbSlotToBindingMap = new SetBindingPair[16];
+             _cbSlotToBindingMap.AsSpan().Fill(new(-1, -1));
+             _sbSlotToBindingMap.AsSpan().Fill(new(-1, -1));
+@@ -78,7 +78,7 @@ namespace Ryujinx.Graphics.Shader.Translation
+             _usedTextures = new();
+             _usedImages = new();
+ 
+-            Properties.AddOrUpdateConstantBuffer(new(BufferLayout.Std140, 0, SupportBuffer.Binding, "support_buffer", SupportBuffer.GetStructureType()));
++            Properties.AddOrUpdateConstantBuffer(new(BufferLayout.Std140, _gpuAccessor.QueryTotkSupportBufferSet(), SupportBuffer.Binding, "support_buffer", SupportBuffer.GetStructureType()));
+ 
+             LocalMemoryId = -1;
+             SharedMemoryId = -1;
+@@ -220,6 +220,56 @@ namespace Ryujinx.Graphics.Shader.Translation
+             return false;
+         }
+ 
++        /// <summary>
++        /// TOTK: the constant buffer slot and handle of the bound (single) texture at a set and binding.
++        /// </summary>
++        public bool TryGetTotkBoundTexture(int set, int binding, out int cbufSlot, out int handle, out bool separate)
++        {
++            foreach ((TextureInfo info, TextureMeta meta) in _usedTextures)
++            {
++                if (meta.Set == set && meta.Binding == binding && info.ArrayLength == 1)
++                {
++                    cbufSlot = info.CbufSlot;
++                    handle = info.Handle;
++                    separate = info.Separate;
++                    return true;
++                }
++            }
++
++            cbufSlot = handle = 0;
++            separate = false;
++            return false;
++        }
++
++        /// <summary>
++        /// TOTK: forget the single textures no operation of any function uses any more (TotkBindless turned them into global
++        /// array accesses and noted the rest in TotkUsedTextures).
++        /// </summary>
++        public readonly HashSet<(int, int)> TotkUsedTextures = new();
++
++        public void PruneTotkTextures()
++        {
++            HashSet<(int, int)> used = TotkUsedTextures;
++
++            List<TextureInfo> unused = new();
++
++            foreach ((TextureInfo info, TextureMeta meta) in _usedTextures)
++            {
++                if (info.ArrayLength == 1 && !used.Contains((meta.Set, meta.Binding)))
++                {
++                    unused.Add(info);
++                }
++            }
++
++            foreach (TextureInfo info in unused)
++            {
++                TextureMeta meta = _usedTextures[info];
++
++                _usedTextures.Remove(info);
++                Properties.RemoveTexture(new SetBindingPair(meta.Set, meta.Binding));
++            }
++        }
++
+         public SetBindingPair GetTextureOrImageBinding(
+             Instruction inst,
+             SamplerType type,
+@@ -304,7 +354,7 @@ namespace Ryujinx.Graphics.Shader.Translation
+ 
+             // For array textures, we also want to use type as key,
+             // since we may have texture handles stores in the same buffer, but for textures with different types.
+-            SamplerType keyType = arrayLength > 1 ? type : SamplerType.None;
++            SamplerType keyType = arrayLength != 1 ? type : SamplerType.None;
+             TextureInfo info = new TextureInfo(cbufSlot, handle, arrayLength, separate, keyType, format);
+             TextureMeta meta = new TextureMeta()
+             {
+@@ -324,7 +374,15 @@ namespace Ryujinx.Graphics.Shader.Translation
+             }
+             else
+             {
+-                if (arrayLength > 1 && (setIndex = _gpuAccessor.CreateExtraSet()) >= 0)
++                SetBindingPair totkArray = arrayLength == 0 && _gpuAccessor.QueryTotkBindless() ? _gpuAccessor.QueryTotkBindlessBinding(type) : new SetBindingPair(-1, -1);
++
++                if (totkArray.SetIndex >= 0)
++                {
++                    // TOTK: the global (unsized) arrays have fixed bindings, shared by every shader.
++                    setIndex = totkArray.SetIndex;
++                    binding = totkArray.Binding;
++                }
++                else if (arrayLength > 1 && (setIndex = _gpuAccessor.CreateExtraSet()) >= 0)
+                 {
+                     // We reserved an "extra set" for the array.
+                     // In this case the binding is always the first one (0).
+diff --git a/src/Ryujinx.Graphics.Shader/Translation/TranslatorContext.cs b/src/Ryujinx.Graphics.Shader/Translation/TranslatorContext.cs
+index c7c5629..1ac7e70 100644
+--- a/src/Ryujinx.Graphics.Shader/Translation/TranslatorContext.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/TranslatorContext.cs
+@@ -301,11 +301,23 @@ namespace Ryujinx.Graphics.Shader.Translation
+ 
+                     Optimizer.RunPass(context);
+                     TransformPasses.RunPass(context);
++
++                    // TOTK: sampled textures through the global descriptor arrays (a no-op unless the host asks for it), after
++                    // the texture pass so the size queries it adds are converted too.
++                    if (TotkBindless.RunPass(cfg.Blocks, resourceManager, GpuAccessor))
++                    {
++                        Optimizer.RunTotkCleanup(cfg.Blocks, resourceManager);
++                    }
+                 }
+ 
+                 funcs[i] = new Function(cfg.Blocks, $"fun{i}", false, inArgumentsCount, outArgumentsCount);
+             }
+ 
++            if (GpuAccessor.QueryTotkBindless())
++            {
++                resourceManager.PruneTotkTextures();
++            }
++
+             return Generate(
+                 funcs,
+                 AttributeUsage,

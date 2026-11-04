@@ -3,6 +3,12 @@
    on the calling guest thread's stack, and TOTK creates threads with stacks as small as 4 KiB. Each guest thread
    has a host stack top in a Darwin TSD slot (offset _runtime_hle_tsd_off from TPIDRRO_EL0); the slot is cleared
    while that stack is in use, so nested guest->host calls made from it stay on it. */
+#ifdef __ANDROID__
+/* Android: this thread's slot block is in bionic's TLS_SLOT_APP (thread pointer + 16; free for apps since API 29). */
+#define HOST_TSD(reg) mrs reg, tpidr_el0 ; ldr reg, [reg, #16]
+#else
+#define HOST_TSD(reg) mrs reg, tpidrro_el0
+#endif
 .text
 
 /* x16 = host function, x17 = its wrapper index. Called at a guest call site: x0..x8 and v0..v7 carry arguments,
@@ -12,7 +18,7 @@
     .globl _runtime_hle_switch
     .p2align 2
 _runtime_hle_switch:
-    mrs x9, tpidrro_el0
+    HOST_TSD(x9)
     adrp x10, _runtime_hle_tsd_off@PAGE
     ldr x10, [x10, _runtime_hle_tsd_off@PAGEOFF]
     ldr x11, [x9, x10]
@@ -30,7 +36,7 @@ _runtime_hle_switch:
     ldp x12, x11, [sp, #16]
     ldp x29, x30, [sp]
     mov sp, x12
-    mrs x9, tpidrro_el0
+    HOST_TSD(x9)
     adrp x10, _runtime_hle_tsd_off@PAGE
     ldr x10, [x10, _runtime_hle_tsd_off@PAGEOFF]
     str x11, [x9, x10]

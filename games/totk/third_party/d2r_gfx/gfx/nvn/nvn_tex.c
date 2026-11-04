@@ -37,7 +37,17 @@ static fmt_t fmt_of(int f) {
     return (fmt_t){0, 1, 1};
 }
 
-int nvn_fmt_bpb(int f, int *bw, int *bh) { fmt_t t = fmt_of(f); if (bw) *bw = t.bw; if (bh) *bh = t.bh; return t.bpb; }
+/* TOTK: a table of fmt_of for formats below 256 (the range search ran for every attachment and attribute of every draw:
+   2% of the replay); filled on first use, the same bytes by any racing thread */
+int nvn_fmt_bpb(int f, int *bw, int *bh) {
+    static fmt_t table[256]; static _Atomic int ready;
+    fmt_t t;
+    if (f >= 0 && f < 256) {
+        if (!atomic_load_explicit(&ready, memory_order_acquire)) { for (int i = 0; i < 256; i++) table[i] = fmt_of(i); atomic_store_explicit(&ready, 1, memory_order_release); }
+        t = table[f];
+    } else t = fmt_of(f);
+    if (bw) *bw = t.bw; if (bh) *bh = t.bh; return t.bpb;
+}
 
 static uint32_t mip(uint32_t s, unsigned l) { s >>= l; return s ? s : 1; }
 static uint32_t blk(uint32_t s, uint32_t b) { return (s + b - 1) / b; }

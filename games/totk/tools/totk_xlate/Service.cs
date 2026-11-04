@@ -48,6 +48,7 @@ static class ShaderService
     static readonly Regex Fp64 = new(@"\bdouble\b|unsupported_GLSLstd450(?:Pack|Unpack)Double2x32");
 
     static string spirvCross, outDir, chain;
+    static bool spirvOnly;   // --spirv-only: Android / Vulkan (HandleSpirv)
     static int debugMode;
 
     // ---- small helpers with Python's meaning ----
@@ -421,6 +422,7 @@ static class ShaderService
         if (Truthy(Get(rq, "local"))) job["local"] = rq["local"].DeepClone();
         job["depth_minus_w"] = Truthy(Get(rq, "depth_minus_w"));   // nvnDeviceSetDepthMode(NEAR_IS_MINUS_W): clip z converted to Metal's 0..w
         job["early_fragment_tests"] = Truthy(Get(rq, "early_fragment_tests"));   // fragment shaders: NVN control +0x718 (Program.cs QueryGraphicsState)
+        if (spirvOnly) { HandleSpirv(rq, job, variant, stage); return; }
         Translate(job);
         JsonObject res = ReadRes(variant);
         string spv = Path.Combine(outDir, variant + ".spv"), msl = Path.Combine(outDir, variant + "_b.metal");
@@ -504,6 +506,107 @@ static class ShaderService
         File.Move(tmp, Path.Combine(outDir, variant + "_b.json"), true);
     }
 
+    /* --spirv-only (Android / Vulkan): the SPIR-V is the result, no SPIRV-Cross. Each stage gets its own descriptor set
+       (vs 0, ps 1, cs 0; one higher with "bindless", whose global texture arrays are set 0), the host subgroup width comes from the request, and FP64 is always lowered (Adreno has none).
+       The answers the variant depends on: queried texture / image slots, the vertex inputs the SPIR-V reads, the colour
+       targets the fragment shader writes. Writes <variant>.spv, <variant>.res.json and <variant>_v.json {deps, ...}. */
+    static void HandleSpirv(JsonObject rq, JsonObject job, string variant, string stage)
+    {
+        bool bindless = Truthy(Get(rq, "bindless"));
+        job["set"] = (stage == "ps" ? 1 : 0) + (bindless ? 1 : 0);   // bindless: set 0 holds the global texture arrays
+        job["host_subgroup_size"] = Truthy(Get(rq, "host_subgroup_size")) ? rq["host_subgroup_size"].DeepClone() : 32;
+        job["softfloat64"] = true;
+        job["vs_subgroups"] = Truthy(Get(rq, "vs_subgroups"));
+        job["bindless"] = bindless;   // sampled textures through the global arrays (Program.cs QueryTotkBindless)
+        Translate(job);
+        JsonObject res = ReadRes(variant);
+        JsonObject tex = GetObj(rq, "tex"), img = GetObj(rq, "img"), attr = GetObj(rq, "attr"), fout = GetObj(rq, "fout");
+        var deps = new JsonObject { ["tex"] = new JsonObject(), ["img"] = new JsonObject(), ["attr"] = new JsonObject(), ["fout"] = new JsonObject() };
+        IEnumerable<long> Ints(string key) => res.TryGetPropertyValue(key, out JsonNode a) && a is JsonArray arr ? arr.Select(Long) : Enumerable.Empty<long>();
+        foreach (long t in new SortedSet<long>(Ints("tex_queried")))
+            deps["tex"][t.ToString(CultureInfo.InvariantCulture)] = GetOr(tex, t.ToString(CultureInfo.InvariantCulture), "2d");
+        foreach (long t in new SortedSet<long>(Ints("img_queried")))
+            deps["img"][t.ToString(CultureInfo.InvariantCulture)] = GetOr(img, t.ToString(CultureInfo.InvariantCulture), new JsonObject());
+        var inputs = new JsonArray();
+        if (stage == "vs")
+            foreach (long loc in SpirvInputLocations(File.ReadAllBytes(Path.Combine(outDir, variant + ".spv"))))
+            {
+                string k = loc.ToString(CultureInfo.InvariantCulture); deps["attr"][k] = GetOr(attr, k, "float");
+                inputs.Add((JsonNode)new JsonObject { ["location"] = loc });
+            }
+        if (stage == "ps" && res["frag_out_map"] is JsonNode fm)
+            for (int target = 0; target < 8; target++)
+                if (((Long(fm) >> (target * 4)) & 0xf) != 0) { string k = target.ToString(CultureInfo.InvariantCulture); deps["fout"][k] = GetOr(fout, k, "float"); }
+        var refl = new JsonObject
+        {
+            ["key"] = variant, ["chain"] = chain, ["stage"] = stage, ["set"] = (int)job["set"], ["c1"] = GetStr(rq, "c1", ""),
+            ["threadgroup_size"] = GetOr(rq, "local", null), ["notes"] = res["notes"].DeepClone(), ["vertex_inputs"] = inputs, ["deps"] = deps,
+        };
+        string tmp = Path.Combine(outDir, variant + "_v.json.tmp");
+        File.WriteAllText(tmp, PyJson(refl, 1, false));
+        File.Move(tmp, Path.Combine(outDir, variant + "_v.json"), true);
+        WriteMeta(variant, stage, (int)job["set"], res, Convert.FromHexString(GetStr(rq, "c1", "")), attr, inputs);
+        // the answers this variant depends on, one per line ("tex 3 2d", "img 1 2d R8G8B8A8Unorm", "attr 0 float", "fout 0 sint"),
+        // for the C host's variant lookup; written last, so a variant with a .deps file is complete
+        var lines = new StringBuilder();
+        foreach (var kv in deps["tex"].AsObject()) lines.Append($"tex {kv.Key} {(string)kv.Value}\n");
+        foreach (var kv in deps["img"].AsObject())
+        {
+            var o = kv.Value.AsObject();
+            lines.Append($"img {kv.Key} {(o["type"] is JsonNode ty ? (string)ty : "-")} {(o["fmt"] is JsonNode imgFmt ? (string)imgFmt : "-")}\n");
+        }
+        foreach (var kv in deps["attr"].AsObject()) lines.Append($"attr {kv.Key} {(string)kv.Value}\n");
+        foreach (var kv in deps["fout"].AsObject()) lines.Append($"fout {kv.Key} {(string)kv.Value}\n");
+        File.WriteAllText(tmp, lines.ToString());
+        File.Move(tmp, Path.Combine(outDir, variant + ".deps"), true);
+    }
+    /* <variant>.meta in the D2R Android backend's compact format (dm/android/tools/build_shaders.py): "DMVK", version 1,
+       stage, set, entry count, c1 length, 32; then 10 words per binding (kind, binding, slot, cb_slot, cb_offset, handle,
+       type, array, flags, separate; kind 0 = the support block at binding 0, 1 cbuf, 2 sbuf, 3 texture, 4 image); the
+       c1 bytes; 32 words of vertex input classes (0 unused, 1 float, 2 sint, 3 uint). */
+    static void WriteMeta(string variant, string stage, int set, JsonObject res, byte[] c1, JsonObject attr, JsonArray inputs)
+    {
+        var entries = new List<uint[]> { new uint[] { 0, 0, 0, 0, 0, 0, 0, 1, 0, 0 } };
+        uint U(JsonNode o, string k, long d = 0) => (uint)(o[k] is JsonNode n ? Long(n) : d);
+        foreach (var (kind, label) in new[] { (1u, "cbufs"), (2u, "sbufs"), (3u, "textures"), (4u, "images") })
+            foreach (JsonNode b in res[label].AsArray())
+                entries.Add(new uint[] { kind, U(b, "binding"), U(b, "slot"), b["cb_slot"] is JsonNode ? U(b, "cb_slot") : U(b, "cbuf_slot"), U(b, "cb_offset"),
+                                         U(b, "handle"), U(b, "type"), U(b, "array", 1), U(b, "flags"), b["separate"] is JsonNode sp && sp.GetValueKind() == JsonValueKind.True ? 1u : 0u });
+        // kind 5: a texture handle the shader reads through the bindless arrays (no binding of its own; the backend resolves it
+        // per draw and writes its slots into c[2])
+        if (res["bindless"] is JsonArray bl)
+            foreach (JsonNode b in bl) entries.Add(new uint[] { 5, 0, 0, U(b, "cbuf_slot"), 0, U(b, "handle"), U(b, "type"), 1, 0, 1 });
+        int stageId = stage == "vs" ? 0 : stage == "ps" ? 1 : 5;
+        var attrs = new uint[32];
+        foreach (JsonNode v in inputs)
+        {
+            long loc = Long(v["location"]); if (loc < 0 || loc >= 32) continue;
+            string cls = GetOr(attr, loc.ToString(CultureInfo.InvariantCulture), "float") is JsonNode c ? (string)c : "float";
+            attrs[loc] = cls == "sint" ? 2u : cls == "uint" ? 3u : 1u;
+        }
+        using var ms = new MemoryStream(); using var w = new BinaryWriter(ms);
+        w.Write(System.Text.Encoding.ASCII.GetBytes("DMVK")); foreach (uint x in new uint[] { 1, (uint)stageId, (uint)set, (uint)entries.Count, (uint)c1.Length, 32 }) w.Write(x);
+        foreach (uint[] e in entries) foreach (uint x in e) w.Write(x);
+        w.Write(c1); foreach (uint x in attrs) w.Write(x);
+        string tmp = Path.Combine(outDir, variant + ".meta.tmp");
+        File.WriteAllBytes(tmp, ms.ToArray());
+        File.Move(tmp, Path.Combine(outDir, variant + ".meta"), true);
+    }
+    /* Locations of the Input-storage variables a SPIR-V module declares (OpDecorate Location on OpVariable StorageClass Input). */
+    static IEnumerable<long> SpirvInputLocations(byte[] code)
+    {
+        var locations = new Dictionary<uint, uint>(); var inputs = new HashSet<uint>();
+        for (int at = 5 * 4; at + 4 <= code.Length;)
+        {
+            uint head = BitConverter.ToUInt32(code, at); int words = (int)(head >> 16), op = (int)(head & 0xffff);
+            if (words == 0 || at + words * 4 > code.Length) throw new RuntimeError("invalid SPIR-V instruction stream");
+            uint W(int i) => BitConverter.ToUInt32(code, at + i * 4);
+            if (op == 71 && words >= 4 && W(2) == 30) locations[W(1)] = W(3);        // OpDecorate %id Location n
+            else if (op == 59 && words >= 4 && W(3) == 1) inputs.Add(W(2));           // OpVariable %type %id Input
+            at += words * 4;
+        }
+        return inputs.Where(locations.ContainsKey).Select(v => (long)locations[v]).OrderBy(x => x).ToList();
+    }
     // ---- JSON text as Python's json.dump writes it (indent >= 0: indented, < 0: one line; ascii: ensure_ascii) ----
     static string PyJson(JsonNode n, int indent, bool ascii) { var sb = new StringBuilder(); PyJson(sb, n, indent, ascii, 0); return sb.ToString(); }
     static void PyJson(StringBuilder sb, JsonNode n, int indent, bool ascii, int level)
@@ -584,13 +687,14 @@ static class ShaderService
             switch (args[i])
             {
                 case "--spirv-cross": spirvCross = v; i++; break;
+                case "--spirv-only": spirvOnly = true; break;
                 case "--out": outDir = v; i++; break;
                 case "--chain": chain = v; i++; break;
                 case "--debug-mode": debugMode = (int)ParseInt(v); i++; break;
                 default: Console.Error.WriteLine($"totk_xlate --service: unknown argument {args[i]}"); return 2;
             }
         }
-        if (spirvCross == null || outDir == null || chain == null)
+        if ((spirvCross == null && !spirvOnly) || outDir == null || chain == null)
         {
             Console.Error.WriteLine("usage: totk_xlate --service --spirv-cross <path> --out <dir> --chain <name> [--debug-mode 0|1]");
             return 2;

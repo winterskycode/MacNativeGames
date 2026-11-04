@@ -3,6 +3,7 @@
    until BotW's own sites are found. */
 #include <stdatomic.h>
 #include "world_survey.h"
+#include "uc_compat.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -802,7 +803,7 @@ static double jq_ms(uint64_t since) { static mach_timebase_info_data_t tb; if (!
    replaced, and one line per update while a stick or d-pad direction (bits 16..23) is or was held: time, thread, the
    controller, the tick the loop will read, new and previous hold, the previous update's repeat bits, counts 16..23. */
 static int botw_pad_hook(ucontext_t *u) {
-    uint64_t *x = u->uc_mcontext->__ss.__x, c = x[19]; uint32_t hold = (uint32_t)x[11];
+    uint64_t *x = UC_XS(u), c = x[19]; uint32_t hold = (uint32_t)x[11];
     x[8] = *(const uint32_t *)(uintptr_t)(c + 0x100);
     uint32_t old = *(const uint32_t *)(uintptr_t)(c + 0x114), rep = *(const uint32_t *)(uintptr_t)(c + 0x10);
     if ((hold | old) & 0xff0000u) {
@@ -816,15 +817,15 @@ static int botw_pad_hook(ucontext_t *u) {
                 n[16], n[17], n[18], n[19], n[20], n[21], n[22], n[23], dl[16], pu[16], dl[17], pu[17], dl[18], pu[18], dl[19], pu[19],
                 dl[20], pu[20], dl[21], pu[21], dl[22], pu[22], dl[23], pu[23]);
     }
-    u->uc_mcontext->__ss.__pc += 4; return 1;
+    UC_PC(u) += 4; return 1;
 }
 #endif
 int botw_jq_hook(void *context) {   /* SIGTRAP from loader.c crash(): 1 = it was one of ours, handled */
 #ifdef GAME_BOTW160
-    if (g_pad_log_on && ((ucontext_t *)context)->uc_mcontext->__ss.__pc == (uintptr_t)g_pad_main + PAD_LOOP) return botw_pad_hook(context);
+    if (g_pad_log_on && UC_PC(((ucontext_t *)context)) == (uintptr_t)g_pad_main + PAD_LOOP) return botw_pad_hook(context);
 #endif
     if (!g_jq_on) return 0;
-    ucontext_t *u = context; uint64_t pc = u->uc_mcontext->__ss.__pc, *x = u->uc_mcontext->__ss.__x;
+    ucontext_t *u = context; uint64_t pc = UC_PC(u), *x = UC_XS(u);
     int site = -1; for (int i = 0; i < JQ_SITES; i++) if (pc == (uintptr_t)g_jq_main + g_jq_site[i].off) site = i;
     if (site < 0) return 0;
     uint64_t th = 0; pthread_threadid_np(NULL, &th); uint32_t h = runtime_thread_current_handle();
@@ -888,7 +889,7 @@ int botw_jq_hook(void *context) {   /* SIGTRAP from loader.c crash(): 1 = it was
         }
         break; }
     }
-    u->uc_mcontext->__ss.__pc = next_pc; return 1;
+    UC_PC(u) = next_pc; return 1;
 }
 #undef U32
 #undef U64

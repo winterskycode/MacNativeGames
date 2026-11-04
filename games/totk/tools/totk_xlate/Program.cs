@@ -36,18 +36,18 @@ static class SwshXlate
 
     sealed class Accessor : IGpuAccessor
     {
-        readonly byte[] _code; readonly JsonObject _job; int _binding = 1; public readonly List<string> Notes = new(); public readonly SortedSet<int> TexQueried = new(), ImgQueried = new();
+        readonly byte[] _code; readonly JsonObject _job; int _binding = 1; readonly int _set; public readonly List<string> Notes = new(); public readonly SortedSet<int> TexQueried = new(), ImgQueried = new();
         readonly byte[] _c1;
-        public Accessor(byte[] code, JsonObject job) { _code = code; _job = job; _c1 = job["c1"] is JsonNode h ? Convert.FromHexString((string)h) : Array.Empty<byte>(); }
+        public Accessor(byte[] code, JsonObject job) { _code = code; _job = job; _set = job["set"] is JsonNode sn ? (int)sn : 0; _c1 = job["c1"] is JsonNode h ? Convert.FromHexString((string)h) : Array.Empty<byte>(); }
         // c1 常数段（着色器包控制段前 0x100 字节）：间接跳转 BRX 的跳转表在这里（LDC c[1]）；不提供时翻译器解不出跳转目标、控制流出错（粒子着色器死循环）
         // c1 constant segment (the 0x100 bytes before the control segment in the shader package): the jump table of indirect jump BRX lives here (LDC c[1]); without it the translator cannot resolve jump targets and control flow goes wrong (particle shaders loop forever)
         public uint ConstantBuffer1Read(int offset) { if (offset >= 0 && offset + 4 <= _c1.Length) return BitConverter.ToUInt32(_c1, offset); Notes.Add($"c1 读越界 +{offset:X}（c1 长 {_c1.Length}）"); return 0; }
         // 全部资源放进第 0 组，各占不同绑定号（spirv-cross 出成一个参数缓冲）；常量段号 index 的缓冲由翻译器给 binding = index+1 的惯例不依赖
         // All resources go into set 0, each with a distinct binding number (spirv-cross emits them as one argument buffer); the translator's convention of giving the buffer of constant segment number index binding = index+1 is not relied on
-        public SetBindingPair CreateConstantBufferBinding(int index) => new(0, _binding++);
-        public SetBindingPair CreateImageBinding(int count, bool isBuffer) { int b = _binding; _binding += count; return new(0, b); }
-        public SetBindingPair CreateStorageBufferBinding(int index) => new(0, _binding++);
-        public SetBindingPair CreateTextureBinding(int count, bool isBuffer) { int b = _binding; _binding += count; return new(0, b); }
+        public SetBindingPair CreateConstantBufferBinding(int index) => new(_set, _binding++);
+        public SetBindingPair CreateImageBinding(int count, bool isBuffer) { int b = _binding; _binding += count; return new(_set, b); }
+        public SetBindingPair CreateStorageBufferBinding(int index) => new(_set, _binding++);
+        public SetBindingPair CreateTextureBinding(int count, bool isBuffer) { int b = _binding; _binding += count; return new(_set, b); }
         public ReadOnlySpan<ulong> GetCode(ulong address, int minimumSize) => MemoryMarshal.Cast<byte, ulong>(new ReadOnlySpan<byte>(_code)[(int)address..]);
         public int QuerySamplerArrayLengthFromPool() => 32;
         public int QueryTextureArrayLengthFromBuffer(int slot) => 32;
@@ -89,7 +89,7 @@ static class SwshXlate
         public int QueryComputeLocalSizeY() => Local(1);
         public int QueryComputeLocalSizeZ() => Local(2);
         public int QueryComputeSharedMemorySize() => _job["shared"] is JsonNode n ? (int)n : 0;   // 配对 PC 的 groupshared 声明之和 | sum of the paired PC shader's groupshared declarations
-        static AttributeType Attr(string s) => s switch { "sint" => AttributeType.Sint, "uint" => AttributeType.Uint, _ => AttributeType.Float };
+        static AttributeType Attr(string s) => s switch { "sint" => AttributeType.Sint, "uint" => AttributeType.Uint, "sscaled" => AttributeType.Sscaled, "uscaled" => AttributeType.Uscaled, _ => AttributeType.Float };
         public GpuGraphicsState QueryGraphicsState()
         {
             Array32<AttributeType> attr = default; Array8<AttributeType> fout = default;
@@ -115,12 +115,61 @@ static class SwshXlate
         // helpers for Metal, which has no shader double type. Enabled only on
         // a retry for shaders that actually emit FP64 in the first pass.
         public bool QueryHostSupportsShaderFloat64() => _job["softfloat64"] is not JsonValue v || !(v.TryGetValue<bool>(out bool b) && b);
+        // Android/Vulkan (job "set", "host_subgroup_size"): a descriptor set per stage, the host's subgroup width (Adreno: 64);
+        // Mac jobs carry neither and translate as before. No fragment shader interlock on either target.
+        public int QueryHostSubgroupSize() => _job["host_subgroup_size"] is JsonNode hs ? (int)hs : 32;
+        public bool QueryHostSupportsFragmentShaderInterlock() => false;
+        // Android/Vulkan fetches *_UI2F / *_I2F vertex data as integers ("uscaled" / "sscaled" answers) and the shader converts
+        // it: Vulkan has no 32-bit scaled formats. Mac jobs never send those answers.
+        public bool QueryHostSupportsScaledVertexFormats() => _job["set"] is null;
         public bool QueryHostSupportsTextureShadowLod() => true;
+        // Android/Vulkan: Adreno picks a gather's 2x2 footprint differently from Maxwell when the coordinate sits on a texel
+        // center, so a gather there returned the row above. Ryujinx's gather bias (1/(size*2^9)) moves it to Maxwell's
+        // footprint, as Ryujinx does for AMD/Intel. Without it TOTK's quarter-res shadow pass rebuilt positions from the
+        // neighbouring depth row, lit ground failed its shadow test and whole 64x64 tiles went dark (2026-10-24).
+        public int QueryHostGatherBiasPrecision() => _job["set"] is null ? 0 : 8;
         // 作业 reduced = true：放宽精度——翻译器只给强制精确的运算打 NoContraction（缺省全部打：保持 Maxwell 分开舍入的逐位结果，代价是 MSL 里大量禁优化的 spvFMul 等）
         // Job reduced = true: relaxed precision - the translator marks NoContraction only on operations that must be exact (the default marks all: keeps the bit-exact results of Maxwell's separate rounding, at the cost of many optimization-disabled spvFMul etc. in the MSL)
         public bool QueryHostReducedPrecision() => _job["reduced"] is JsonNode n && (bool)n;
+        // TOTK bindless (job "bindless": true, Android/Vulkan): sampled textures bound through c[2] are read from global
+        // descriptor arrays in set 0 (TotkBindless pass; the shader's own set is then 1, or 2 for a fragment shader, so the
+        // global set stays bound across pipelines), indexed by the slot words the backend writes per draw into c[19], one per
+        // bindless texture in the order listed; one fixed binding per texture type, the shadow forms apart (two variables of different image
+        // types may not share a binding), the samplers at 15. The handles read that way are listed for the backend.
+        public const int BindlessSet = 0, SlotBuffer = 19;   // c[19]: the per-draw slot block (the game's buffers end at c[18])
+        public readonly List<(int handle, int cbufSlot, int type)> Bindless = new();
+        public bool QueryTotkBindless() => _job["bindless"] is JsonValue bl && bl.TryGetValue<bool>(out bool blb) && blb;
+        public int QueryTotkSlotBuffer() => SlotBuffer;
+        public int QueryTotkSupportBufferSet() => QueryTotkBindless() ? _set : 0;   // with the shader's other resources, out of set 0
+        public SetBindingPair QueryTotkBindlessBinding(SamplerType type)
+        {
+            if (type == SamplerType.None) return new(BindlessSet, 15);
+            int b = (type & SamplerType.Mask) switch { SamplerType.Texture2D => 0, SamplerType.Texture3D => 2, SamplerType.TextureCube => 3, SamplerType.Texture1D => 5, _ => -1 };
+            if (b < 0) return new(-1, -1);
+            if (type.HasFlag(SamplerType.Array)) b = b == 0 ? 1 : b == 3 ? 4 : b == 5 ? 6 : -1;
+            if (b < 0) return new(-1, -1);
+            if (type.HasFlag(SamplerType.Shadow)) b = b switch { 0 => 7, 1 => 8, 3 => 9, 4 => 10, 5 => 11, 6 => 12, _ => -1 };
+            return b < 0 ? new(-1, -1) : new(BindlessSet, b);
+        }
+        public int RegisterTotkBindless(int handle, int cbufSlot, SamplerType type)
+        {
+            var e = (handle, cbufSlot, (int)type); int i = Bindless.IndexOf(e); if (i < 0) { i = Bindless.Count; Bindless.Add(e); } return i;
+        }
     }
 
+
+    // OpExecutionMode <entry> DepthReplacing (opcode 16, mode 12)
+    static bool WritesFragDepth(byte[] spirv)
+    {
+        for (int i = 20; i + 12 <= spirv.Length;)
+        {
+            uint word = BitConverter.ToUInt32(spirv, i); int count = (int)(word >> 16);
+            if (count == 0) break;
+            if ((word & 0xffff) == 16 && count >= 3 && BitConverter.ToUInt32(spirv, i + 8) == 12) return true;
+            i += count * 4;
+        }
+        return false;
+    }
 
     internal static string Translate(JsonObject job, string outDir)   // also called by the --service mode (Service.cs)
     {
@@ -134,8 +183,21 @@ static class SwshXlate
                 var flags = (job["debug"] is JsonNode dbg && !(bool)dbg ? 0 : TranslationFlags.DebugMode) | ((string)job["stage"] == "cs" ? TranslationFlags.Compute : 0);
                 var ctx = Translator.CreateContext(0, acc, new TranslationOptions(TargetLanguage.Spirv, TargetApi.Vulkan, flags));
                 ShaderProgram p = ctx.Translate();
+                // TOTK: a fragment shader that writes gl_FragDepth is translated exact (every operation rounded separately,
+                // as Maxwell does) even when the job asks for reduced precision. The game stamps IDs into depth this way and
+                // selects them with depth test EQUAL against the same expression computed in another shader (the Room of
+                // Awakening's water); with contraction allowed, Turnip fused this one differently and was 1 ulp off, so the
+                // test failed everywhere and the water stayed black.
+                if ((string)job["stage"] == "ps" && acc.QueryHostReducedPrecision() && WritesFragDepth(p.BinaryCode))
+                {
+                    job["reduced"] = false;
+                    acc = new Accessor(code, job);
+                    ctx = Translator.CreateContext(0, acc, new TranslationOptions(TargetLanguage.Spirv, TargetApi.Vulkan, flags));
+                    p = ctx.Translate();
+                    acc.Notes.Add("exact precision: writes gl_FragDepth");
+                }
                 File.WriteAllBytes(Path.Combine(outDir, key + ".spv"),
-                    VertexCounterLowering.Apply(code, (string)job["stage"], p.BinaryCode, acc.Notes));
+                    VertexCounterLowering.Apply(code, (string)job["stage"], p.BinaryCode, acc.Notes, job["vs_subgroups"] is JsonValue vsg && vsg.TryGetValue<bool>(out bool vsgb) && vsgb));
                 var res = new JsonObject
                 {
                     ["key"] = key, ["stage"] = (string)job["stage"], ["notes"] = new JsonArray(acc.Notes.ConvertAll(n => (JsonNode)n).ToArray()),
@@ -146,7 +208,9 @@ static class SwshXlate
                 foreach (var b in p.Info.CBuffers) res["cbufs"].AsArray().Add((JsonNode)new JsonObject { ["binding"] = b.Binding, ["slot"] = b.Slot });
                 foreach (var b in p.Info.SBuffers) res["sbufs"].AsArray().Add((JsonNode)new JsonObject { ["binding"] = b.Binding, ["slot"] = b.Slot, ["cb_slot"] = b.SbCbSlot, ["cb_offset"] = b.SbCbOffset, ["flags"] = (int)b.Flags });
                 foreach (var (list, name) in new[] { (p.Info.Textures, "textures"), (p.Info.Images, "images") })
-                    foreach (var t in list) res[name].AsArray().Add((JsonNode)new JsonObject { ["binding"] = t.Binding, ["type"] = (int)t.Type, ["format"] = t.Format.ToString(), ["cbuf_slot"] = t.CbufSlot, ["handle"] = t.HandleIndex, ["array"] = t.ArrayLength, ["separate"] = t.Separate, ["flags"] = (int)t.Flags });
+                    foreach (var t in list) if (!(name == "textures" && t.Set == Accessor.BindlessSet && t.ArrayLength == 0 && acc.QueryTotkBindless())) res[name].AsArray().Add((JsonNode)new JsonObject { ["binding"] = t.Binding, ["type"] = (int)t.Type, ["format"] = t.Format.ToString(), ["cbuf_slot"] = t.CbufSlot, ["handle"] = t.HandleIndex, ["array"] = t.ArrayLength, ["separate"] = t.Separate, ["flags"] = (int)t.Flags });
+                if (acc.Bindless.Count > 0)
+                    res["bindless"] = new JsonArray(acc.Bindless.Select(b => (JsonNode)new JsonObject { ["handle"] = b.handle, ["cbuf_slot"] = b.cbufSlot, ["type"] = b.type }).ToArray());
                 File.WriteAllText(Path.Combine(outDir, key + ".res.json"), res.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
                 return null;
             }

@@ -1,9 +1,11 @@
 /* 1.4.3 has a new compiler and frame-controller layout. Every adapted game-code
    site below is checked before any write; older versions use game_patches.c. */
 #include "aspect_patch.h"
+#include "uc_compat.h"
 #include <time.h>
 #include "game_patches.h"
 #include "game_version.h"
+#include "game_actions.h"
 #include "world_survey.h"
 #include "../zeldaVR/runtime/vr_camera.h"   /* zeldaVR: the VR camera hook */
 #include <stddef.h>
@@ -20,6 +22,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <unistd.h>
+#include <sys/mman.h>
 #endif
 
 typedef struct { uint64_t off; uint32_t original, replacement; } Patch;
@@ -363,7 +366,13 @@ static void patch_lod_distance(Module *m){
                                    0x2870578,0x287200c,0x2872a30,0x2874924,0x2874cfc,0x287f53c};
     enum{N=sizeof sites/sizeof *sites,W=5};
     uint64_t data=(m->file_size+0x3fff)&~0x3fffULL,stub=((m->file_size+15)&~15ULL)+128;   /* after the benchmark camera */
-    if(stub+N*W*4>data||data+LOD_DATA_SLOT+4>m->size)runtime_fail("1.4.3 LOD distance layout");
+    if(stub+N*W*4>data||data+LOD_DATA_SLOT+4>m->size){
+#ifdef __ANDROID__   /* the Android rewrite of main leaves less tail room than the Mac's: the option is left out */
+        fprintf(stderr,"[totk] 1.4.3 LOD distance: no room for the stub after main (setting not available)\n");return;
+#else
+        runtime_fail("1.4.3 LOD distance layout");
+#endif
+    }
     for(unsigned i=0;i<N*W*4;i++)if(m->base[stub+i])runtime_fail("1.4.3 LOD distance padding not empty");
     for(unsigned i=0;i<N;i++){
         uint32_t add,next;memcpy(&add,m->base+sites[i],4);memcpy(&next,m->base+sites[i]+4,4);
@@ -404,7 +413,13 @@ static void patch_far_distance(Module *m){
     if(!live_tuned())return;
     double k=env_factor("TOTK_FAR_SCALE",0.001);if(k)far_k=k;else k=far_k;
     uint64_t data=(m->file_size+0x3fff)&~0x3fffULL,stub=((m->file_size+15)&~15ULL)+128+12*5*4;   /* after the LOD stubs */
-    if(stub+24>data||data+FAR_DATA_SLOT+8>m->size)runtime_fail("1.4.3 render distance layout");
+    if(stub+24>data||data+FAR_DATA_SLOT+8>m->size){
+#ifdef __ANDROID__   /* the Android rewrite of main leaves less tail room than the Mac's: the option is left out */
+        fprintf(stderr,"[totk] 1.4.3 render distance: no room for the stub after main (setting not available)\n");return;
+#else
+        runtime_fail("1.4.3 render distance layout");
+#endif
+    }
     for(unsigned i=0;i<24;i++)if(m->base[stub+i])runtime_fail("1.4.3 render distance padding not empty");
     static const Patch guards[]={{0x628c30,0xbd413a60,0},{0x628c38,0xbd009e80,0},{0x628c6c,0x91051268,0}};
     for(unsigned i=0;i<3;i++){uint32_t w;memcpy(&w,m->base+guards[i].off,4);if(w!=guards[i].original)runtime_fail("1.4.3 render distance: the camera code does not match");}
@@ -443,7 +458,13 @@ static void patch_fov(Module *m){
     double k=env_factor("TOTK_FOV_SCALE",0.5);if(k)fov_k=k;else k=fov_k;
     if(k>2)runtime_fail("TOTK_FOV_SCALE takes 0.5 to 2");
     uint64_t data=(m->file_size+0x3fff)&~0x3fffULL,stub=((m->file_size+15)&~15ULL)+128+12*5*4+24;   /* after the far stub */
-    if(stub+24>data||data+FOV_DATA_SLOT+8>m->size)runtime_fail("1.4.3 field of view layout");
+    if(stub+24>data||data+FOV_DATA_SLOT+8>m->size){
+#ifdef __ANDROID__   /* the Android rewrite of main leaves less tail room than the Mac's: the option is left out */
+        fprintf(stderr,"[totk] 1.4.3 field of view: no room for the stub after main (setting not available)\n");return;
+#else
+        runtime_fail("1.4.3 field of view layout");
+#endif
+    }
     for(unsigned i=0;i<24;i++)if(m->base[stub+i])runtime_fail("1.4.3 field of view padding not empty");
     uint32_t w;memcpy(&w,m->base+0x628c3c,4);
     if(w!=0xbd413e60){fov_taken=1;fprintf(stderr,"[totk] 1.4.3 field of view: the FOV load is taken (Vert+, TOTK_ASPECT_VERT=1); the game's FOV\n");return;}
@@ -483,7 +504,13 @@ static void patch_shadow_res(Module *m){
     static const Patch sites[]={{0xf5998,0x1e220801,0x1e230821},{0xf59b8,0x1e210800,0x1e230800}};   /* fmul s1,s0,s2 / s0,s0,s1; then x K in s3 */
     static const Patch next[]={{0xf599c,0x1e380029,0},{0xf59bc,0x1e38000a,0}};   /* fcvtzs w9,s1 / w10,s0 */
     uint64_t data=(m->file_size+0x3fff)&~0x3fffULL,stub=((m->file_size+15)&~15ULL)+128+12*5*4+24+24;   /* after the FOV stub */
-    if(stub+32>data||data+SHADOW_DATA_SLOT+4>m->size)runtime_fail("1.4.3 shadow resolution layout");
+    if(stub+32>data||data+SHADOW_DATA_SLOT+4>m->size){
+#ifdef __ANDROID__   /* the Android rewrite of main leaves less tail room than the Mac's: the option is left out */
+        fprintf(stderr,"[totk] 1.4.3 shadow resolution: no room for the stub after main (setting not available)\n");return;
+#else
+        runtime_fail("1.4.3 shadow resolution layout");
+#endif
+    }
     for(unsigned i=0;i<32;i++)if(m->base[stub+i])runtime_fail("1.4.3 shadow resolution padding not empty");
     for(unsigned i=0;i<2;i++){uint32_t w,n;memcpy(&w,m->base+sites[i].off,4);memcpy(&n,m->base+next[i].off,4);
         if(w!=sites[i].original||n!=next[i].original)runtime_fail("1.4.3 shadow resolution: the shadow setup does not match");}
@@ -517,7 +544,13 @@ static void patch_dof(Module *m){
     static const Patch sites[]={{0x1ec606c,0xb9400808,0},{0x1ec6180,0xa9ba7bfd,0}};   /* ldr w8,[x0,#8] / stp x29,x30,[sp,#-0x60]! */
     static const Patch next[]={{0x1ec6070,0x7100007f,0},{0x1ec6184,0xf9000bfb,0}};
     uint64_t data=(m->file_size+0x3fff)&~0x3fffULL,stub=((m->file_size+15)&~15ULL)+128+12*5*4+24+24+32;   /* after the shadow stubs */
-    if(stub+48>data||data+DOF_DATA_SLOT+4>m->size)runtime_fail("1.4.3 depth of field layout");
+    if(stub+48>data||data+DOF_DATA_SLOT+4>m->size){
+#ifdef __ANDROID__   /* the Android rewrite of main leaves less tail room than the Mac's: the option is left out */
+        fprintf(stderr,"[totk] 1.4.3 depth of field: no room for the stub after main (setting not available)\n");return;
+#else
+        runtime_fail("1.4.3 depth of field layout");
+#endif
+    }
     for(unsigned i=0;i<48;i++)if(m->base[stub+i])runtime_fail("1.4.3 depth of field padding not empty");
     for(unsigned i=0;i<2;i++){uint32_t w,n;memcpy(&w,m->base+sites[i].off,4);memcpy(&n,m->base+next[i].off,4);
         if(w!=sites[i].original||n!=next[i].original)runtime_fail("1.4.3 depth of field: the DOF requester does not match");}
@@ -626,21 +659,21 @@ static void watch_all(int on){
 static int ft_trap(ucontext_t *u,unsigned ec);   /* "frametrace" (below) */
 static int br_trap(ucontext_t *u,unsigned ec);   /* "bpregs" (below) */
 int runtime_diag_watch_trap(void *context){
-    ucontext_t *u=context;uint64_t pc=u->uc_mcontext->__ss.__pc,lr=u->uc_mcontext->__ss.__lr;
-    unsigned ec=(unsigned)(u->uc_mcontext->__es.__esr>>26);
+    ucontext_t *u=context;uint64_t pc=UC_PC(u),lr=UC_LR(u);
+    unsigned ec=(unsigned)(UC_ESR(u)>>26);
     if(ft_trap(u,ec))return 1;
     if(br_trap(u,ec))return 1;
     if(bp_addr&&(ec==0x30||ec==0x31)&&pc==bp_addr){   /* the VR camera search's breakpoint */
-        atomic_store(&bp_x1,u->uc_mcontext->__ss.__x[bp_reg]);atomic_fetch_add(&bp_n,1);
-        if(bp_collect){const uint64_t v=u->uc_mcontext->__ss.__x[bp_reg];   /* "camsrc": every distinct value, counted */
+        atomic_store(&bp_x1,UC_X(u,bp_reg));atomic_fetch_add(&bp_n,1);
+        if(bp_collect){const uint64_t v=UC_X(u,bp_reg);   /* "camsrc": every distinct value, counted */
             for(unsigned i=0;i<8;i++){uint64_t z=0;if(atomic_compare_exchange_strong(&bp_seen[i].v,&z,v)||z==v){atomic_fetch_add(&bp_seen[i].n,1);if(!bp_hooked(v))atomic_fetch_add(&bp_seen[i].raw,1);break;}}}
         thread_act_t self=mach_thread_self();bp_set(self,0);mach_port_deallocate(mach_task_self(),self);return 1;}
     if(!watch_addr||(ec!=0x34&&ec!=0x35))return 0;   /* watchpoint */
     for(unsigned i=(unsigned)(pc>>2)%WATCH_SLOTS,k=0;k<WATCH_SLOTS;k++,i=(i+1)%WATCH_SLOTS){
         uint64_t z=0;if(atomic_compare_exchange_strong(&watch_hits[i].pc,&z,pc)||z==pc){atomic_store(&watch_hits[i].lr,lr);
-            uint64_t fp=u->uc_mcontext->__ss.__fp;for(int d=0;d<3;d++){uint64_t fr[2]={0,0};if(!fp||(fp&15))break;memcpy(fr,(const void *)(uintptr_t)fp,16);atomic_store(&watch_hits[i].up[d],fr[1]);fp=fr[0];}
-            atomic_store(&watch_hits[i].x1,u->uc_mcontext->__ss.__x[1]);
-            {static const int rn[6]={0,19,20,21,22,8};for(int r=0;r<6;r++)atomic_store(&watch_hits[i].xr[r],u->uc_mcontext->__ss.__x[rn[r]]);}
+            uint64_t fp=UC_FP(u);for(int d=0;d<3;d++){uint64_t fr[2]={0,0};if(!fp||(fp&15))break;memcpy(fr,(const void *)(uintptr_t)fp,16);atomic_store(&watch_hits[i].up[d],fr[1]);fp=fr[0];}
+            atomic_store(&watch_hits[i].x1,UC_X(u,1));
+            {static const int rn[6]={0,19,20,21,22,8};for(int r=0;r<6;r++)atomic_store(&watch_hits[i].xr[r],UC_X(u,rn[r]));}
             atomic_fetch_add(&watch_hits[i].ph[b2_in_second_run()],1);
             atomic_fetch_add(&watch_hits[i].n,1);break;}
     }
@@ -889,10 +922,10 @@ static void ft_all(int on){
 }
 static int ft_trap(ucontext_t *u,unsigned ec){   /* from runtime_diag_watch_trap: 1 when the breakpoint was one of ours */
     if(!ft_nsite||(ec!=0x30&&ec!=0x31))return 0;   /* by address, not ft_on: a thread can hit a site while the end clears them */
-    const uint64_t pc=u->uc_mcontext->__ss.__pc;int k=0;while(k<ft_nsite&&ft_site[k]!=pc)k++;
+    const uint64_t pc=UC_PC(u);int k=0;while(k<ft_nsite&&ft_site[k]!=pc)k++;
     if(k==ft_nsite)return 0;
-    uint64_t ret[FT_DEPTH];int depth=0;ret[depth++]=u->uc_mcontext->__ss.__lr;
-    const uint64_t sp=u->uc_mcontext->__ss.__sp;uint64_t fp=u->uc_mcontext->__ss.__fp;
+    uint64_t ret[FT_DEPTH];int depth=0;ret[depth++]=UC_LR(u);
+    const uint64_t sp=UC_SP(u);uint64_t fp=UC_FP(u);
     while(depth<FT_DEPTH&&fp&&!(fp&15)&&fp>=sp&&fp<sp+(1u<<20)){uint64_t fr[2];memcpy(fr,(const void *)(uintptr_t)fp,16);
         ret[depth++]=fr[1];if(fr[0]<=fp)break;fp=fr[0];}   /* callers' frames sit higher on the stack */
     ft_record(k,ret,depth);
@@ -1057,13 +1090,13 @@ static void br_all(int on){
 static int bv_on,bv_reg;static struct{_Atomic uint64_t v;_Atomic uint32_t n[3];} bv_seen[32];
 static int b2_in_second_run(void);   /* below g_vr_b2: 0 the first run (or before stereo), 1 the second, 2 after it */
 static int br_trap(ucontext_t *u,unsigned ec){
-    if(!br_addr||(ec!=0x30&&ec!=0x31)||u->uc_mcontext->__ss.__pc!=br_addr)return 0;
-    if(bv_on){const uint64_t v=u->uc_mcontext->__ss.__x[bv_reg];const int ph=b2_in_second_run();
+    if(!br_addr||(ec!=0x30&&ec!=0x31)||UC_PC(u)!=br_addr)return 0;
+    if(bv_on){const uint64_t v=UC_X(u,bv_reg);const int ph=b2_in_second_run();
         for(unsigned i=0;i<32;i++){uint64_t z=0;if(atomic_compare_exchange_strong(&bv_seen[i].v,&z,v)||z==v){atomic_fetch_add(&bv_seen[i].n[ph],1);break;}}
         thread_act_t self=mach_thread_self();br_set(self,0);mach_port_deallocate(mach_task_self(),self);return 1;}
-    if(br_creg>=0){const uint64_t cv=u->uc_mcontext->__ss.__x[br_creg];if(cv<br_clo||cv>=br_chi){thread_act_t self=mach_thread_self();br_set(self,0);mach_port_deallocate(mach_task_self(),self);return 1;}}   /* condition not met: re-armed later */
-    int z=0;if(atomic_compare_exchange_strong(&br_hit,&z,1)){for(int i=0;i<29;i++)br_x[i]=u->uc_mcontext->__ss.__x[i];
-        br_x[29]=u->uc_mcontext->__ss.__fp;br_x[30]=u->uc_mcontext->__ss.__lr;br_x[31]=u->uc_mcontext->__ss.__sp;
+    if(br_creg>=0){const uint64_t cv=UC_X(u,br_creg);if(cv<br_clo||cv>=br_chi){thread_act_t self=mach_thread_self();br_set(self,0);mach_port_deallocate(mach_task_self(),self);return 1;}}   /* condition not met: re-armed later */
+    int z=0;if(atomic_compare_exchange_strong(&br_hit,&z,1)){for(int i=0;i<29;i++)br_x[i]=UC_X(u,i);
+        br_x[29]=UC_FP(u);br_x[30]=UC_LR(u);br_x[31]=UC_SP(u);
         uint64_t fp=br_x[29];for(int d=0;d<2;d++){uint64_t fr[2]={0,0};if(!fp||(fp&15)||!jd_read(fp,fr,16))break;br_x[32+d]=fr[1];fp=fr[0];}
         atomic_store(&br_hit,2);}
     thread_act_t self=mach_thread_self();br_set(self,0);mach_port_deallocate(mach_task_self(),self);return 1;
@@ -1264,7 +1297,7 @@ void runtime_diag_xpoke(unsigned off,float value){
      main camera and goes on to the callee. */
 /* Defined by the VR compositor (totk_vr.m); weak here so tests that build this file alone still link. */
 __attribute__((weak)) vr_cam_state *g_vr_headlook;
-#if !TARGET_OS_IPHONE
+#if !TARGET_OS_IPHONE && !defined(__ANDROID__)   /* Android: the VR camera hook and stereo B2 are Mac-only (Mach-O veneers); stubs below */
 vr_cam_state g_vr_cam __attribute__((aligned(16)));
 _Static_assert(offsetof(vr_cam_state,cam)==8&&offsetof(vr_cam_state,h)==16&&offsetof(vr_cam_state,used)==64&&offsetof(vr_cam_state,fp_lag)==68&&offsetof(vr_cam_state,ret)==72&&offsetof(vr_cam_state,ring)==80&&sizeof g_vr_cam.ring[0]==64&&offsetof(vr_cam_state,fp_pos)==1104&&offsetof(vr_cam_state,fp_blend)==1112&&offsetof(vr_cam_state,eye_half)==1116&&offsetof(vr_cam_state,fp_up)==1120&&offsetof(vr_cam_state,fp_fwd)==1136&&offsetof(vr_cam_state,cam_back)==1140&&offsetof(vr_cam_state,level)==1144&&offsetof(vr_cam_state,calls)==1148&&offsetof(vr_cam_state,off)==1152&&offsetof(vr_cam_state,game_right)==1168&&offsetof(vr_cam_state,callee)==1184&&offsetof(vr_cam_state,main_vs)==1192&&offsetof(vr_cam_state,v0n)==1200&&offsetof(vr_cam_state,v0ring)==1216&&sizeof g_vr_cam.v0ring[0]==64,"vr_cam_hook offsets");
 __asm__(".text\n.p2align 4\n.globl _vr_cam_hook\n_vr_cam_hook:\n"
@@ -1856,7 +1889,359 @@ static void vr_headlook_install(Module *m){
     camera_distance_load();
     fprintf(stderr,"[vr] head look: camera hook at main+%#llx, main camera from main+%#llx, branches +%#llx (TOTK_VR_HEADLOOK=0 turns it off)\n",(unsigned long long)site,(unsigned long long)call,(unsigned long long)v1);
 }
+#elif defined(__ANDROID__)
+/* Android: no VR. What the rest of the runtime calls, as "VR off". */
+static int b2_in_second_run(void){return 0;}
+static void vr_headlook_install(Module *m){(void)m;}
+static int vr_active(void){return 0;}
+vr_cam_state g_vr_cam;
+static void b2_calls_present(void){}
+static void vr_b2_install(Module *m){(void)m;}
+int runtime_camera_distance_cm(void){return 0;}
+int runtime_camera_distance_available(void){return 0;}
+void runtime_camera_distance_set(int cm){(void)cm;}
+void *runtime_b2_left_cap(void){return NULL;}
+void runtime_b2_rec(uint32_t draws,uint64_t handle){(void)draws;(void)handle;}
+void runtime_vr_b2_calls(void){}
+void runtime_vr_b2_pair(void){}
+void runtime_vr_b2_slots(void){}
+int runtime_b2_stereo(void){return 0;}
+int runtime_b2_keep(void){return 0;}
+uint64_t runtime_b2_stereo_marks(void){return 0;}
+uint64_t runtime_b2_twin(uint64_t h){(void)h;return 0;}
+void runtime_b2_called(int n,const uint64_t *h,uint64_t caller){(void)n;(void)h;(void)caller;}
+void runtime_vr_b2_set_eye(float m){(void)m;}
+void runtime_vr_b2_eye(float mm){(void)mm;}
+void runtime_vr_b2_mask(unsigned m){(void)m;}
+void runtime_vr_b2(int on){(void)on;}
 #endif
+/* Graphics lever hunt (TOTK_INPUT_FILE / Android files/input.now lines starting with "gfx"): the game runs natively, so
+   its objects are live in this process's memory and its pointers are real addresses.
+   - "gfxfind <hex main offset>": the heap addresses holding main+offset (a class's vtable: its live instances)
+   - "gfxref <hex address>": the heap addresses holding that address (who points at an object)
+   - "gfxpeek <hex address> <hex bytes>": the words there, as hex and as floats
+   - "gfxpoke <hex address> f|u|b <value>": writes a float, a u32 or a byte (the old value is logged) */
+static Module *gfx_main;
+static void glyph_ring_dump(void);   /* gfxring (patch_glyph_trace) */
+uint64_t runtime_heap_base(void);
+void runtime_guest_committed(uint64_t *heap_bytes,uint64_t *alias_mapped);
+/* Only the readable parts of the heap (/proc/self/maps): the reservation has guard and unmapped pages. */
+static void gfx_scan(uint64_t want,const char *what){
+    uint64_t heap,alias;runtime_guest_committed(&heap,&alias);uint64_t lo=runtime_heap_base(),hi=lo+heap,scanned=0;
+    unsigned hits=0;uint64_t t0=runtime_now_ns();FILE *maps=fopen("/proc/self/maps","r");char l[512];
+    while(maps&&fgets(l,sizeof l,maps)){
+        unsigned long long a,b;char perm[8];if(sscanf(l,"%llx-%llx %7s",&a,&b,perm)!=3||perm[0]!='r')continue;
+        if(b<=lo||a>=hi)continue;if(a<lo)a=lo;if(b>hi)b=hi;
+        for(const uint64_t *p=(const uint64_t *)(uintptr_t)a;p<(const uint64_t *)(uintptr_t)b;p++)
+            if(*p==want&&++hits<=24)fprintf(stderr,"[gfx] %s %#llx at %#llx (heap+%#llx)\n",what,(unsigned long long)want,(unsigned long long)(uintptr_t)p,(unsigned long long)((uintptr_t)p-lo));
+        scanned+=b-a;
+    }
+    if(maps)fclose(maps);
+    fprintf(stderr,"[gfx] %s %#llx: %u hits in %.1f MB of readable heap (%.2f s)\n",what,(unsigned long long)want,hits,scanned/1048576.0,(runtime_now_ns()-t0)/1e9);
+}
+/* "gfxsweep <hex parent> <hex from> <hex to> <hex bytes> <scale> [first test]": for each sub-module pointer in
+   [parent+from, parent+to) and each word of its first <bytes> that holds a plausible float (0.01..1e5, not part of a
+   pointer), multiply it by <scale> for 2 s, logging "[gfx] sweep <n> begin/end <object>+<offset>" around the window, then
+   restore it. The frames between the markers (the [frameprof] lines) show what the field does to draws and timings.
+   [first test] resumes after a crash. */
+static struct { uint64_t parent,from,to,bytes;float scale;unsigned first; } sweep;
+static void *gfx_sweep_run(void *arg){
+    (void)arg;uint64_t heap,alias;runtime_guest_committed(&heap,&alias);uint64_t lo=runtime_heap_base(),hi=lo+heap;unsigned n=0;
+    for(uint64_t s=sweep.from;s<sweep.to;s+=8){
+        uint64_t obj;memcpy(&obj,(const void *)(uintptr_t)(sweep.parent+s),8);if(obj<lo||obj+sweep.bytes>hi)continue;
+        for(uint64_t o=0;o<sweep.bytes;o+=4){
+            uint32_t w;memcpy(&w,(const void *)(uintptr_t)(obj+o),4);uint32_t prev=0,next=0;
+            if(o>=4)memcpy(&prev,(const void *)(uintptr_t)(obj+o-4),4);if(o+4<sweep.bytes)memcpy(&next,(const void *)(uintptr_t)(obj+o+4),4);
+            if((prev==0x3||prev==0x72||next==0x3||next==0x72)&&(o&7)==0)continue;   /* low half of a heap / main pointer */
+            if((o&7)==4&&(w==0x3||w==0x72))continue;
+            float f;memcpy(&f,&w,4);float a=f<0?-f:f;if(!(a>=0.01f&&a<=1e5f))continue;
+            if(n++<sweep.first)continue;
+            float t=f*sweep.scale;
+            fprintf(stderr,"[gfx] sweep %u begin slot+%#llx obj %#llx +%#llx: %g -> %g\n",n-1,(unsigned long long)s,(unsigned long long)obj,(unsigned long long)o,f,t);
+            memcpy((void *)(uintptr_t)(obj+o),&t,4);usleep(1500000);
+            fprintf(stderr,"[gfx] sweep %u end\n",n-1);
+            memcpy((void *)(uintptr_t)(obj+o),&f,4);usleep(800000);
+        }
+    }
+    fprintf(stderr,"[gfx] sweep done: %u fields\n",n);return NULL;
+}
+void runtime_diag_gfx(const char *line){
+    if(!gfx_main){fprintf(stderr,"[gfx] main not loaded\n");return;}
+    char cmd[16],type[4];unsigned long long a=0,b=0;double v=0;
+    if(sscanf(line,"%15s",cmd)!=1)return;
+    if(!strcmp(cmd,"gfxfind")&&sscanf(line,"%*s %llx",&a)==1)gfx_scan((uintptr_t)gfx_main->base+a,"main+offset");
+    else if(!strcmp(cmd,"gfxref")&&sscanf(line,"%*s %llx",&a)==1)gfx_scan(a,"pointer");
+    else if(!strcmp(cmd,"gfxpeek")&&sscanf(line,"%*s %llx %llx",&a,&b)==2){
+        if(a<0x10000000&&gfx_main)a+=(uintptr_t)gfx_main->base;   /* below 256 MiB: an offset into main */
+        for(uint64_t o=0;o<b&&o<0x1000;o+=16){char t[256];int k=snprintf(t,sizeof t,"[gfx] %#llx +%#05llx:",(unsigned long long)a,(unsigned long long)o);
+            for(int j=0;j<4&&o+4*j<b;j++){uint32_t w;memcpy(&w,(const void *)(uintptr_t)(a+o+4*j),4);float f;memcpy(&f,&w,4);
+                k+=snprintf(t+k,sizeof t-k," %08x(%g)",w,(f>-1e7f&&f<1e7f&&(w&0x7f800000)&&(w&0x7f800000)!=0x7f800000)?f:0.0f);}
+            fprintf(stderr,"%s\n",t);}
+    }else if(!strcmp(cmd,"gfxkids")&&sscanf(line,"%*s %llx %llx %llx",&a,&b,(unsigned long long *)&v)==3){
+        /* each pointer slot of [a+b, a+v) into the heap: the object and its first word as a main offset (the vtable) */
+        uint64_t heap,alias;runtime_guest_committed(&heap,&alias);uint64_t lo=runtime_heap_base(),hi=lo+heap,mb=(uintptr_t)gfx_main->base,me=mb+gfx_main->size;
+        unsigned long long end;memcpy(&end,&v,8);
+        for(uint64_t o=b;o<end;o+=8){uint64_t q;memcpy(&q,(const void *)(uintptr_t)(a+o),8);if(q<lo||q+8>hi)continue;
+            uint64_t vt;memcpy(&vt,(const void *)(uintptr_t)q,8);
+            if(vt>=mb&&vt<me)fprintf(stderr,"[gfx] +%#05llx -> %#llx vtable main+%#llx\n",(unsigned long long)o,(unsigned long long)q,(unsigned long long)(vt-mb));
+            else fprintf(stderr,"[gfx] +%#05llx -> %#llx first word %#llx\n",(unsigned long long)o,(unsigned long long)q,(unsigned long long)vt);}
+    }else if(!strcmp(cmd,"gfxsweep")){
+        unsigned long long pa,fr,to,by;float sc;unsigned first=0;
+        if(sscanf(line,"%*s %llx %llx %llx %llx %f %u",&pa,&fr,&to,&by,&sc,&first)>=5){sweep.parent=pa;sweep.from=fr;sweep.to=to;sweep.bytes=by;sweep.scale=sc;sweep.first=first;
+            pthread_t t;if(!pthread_create(&t,NULL,gfx_sweep_run,NULL))pthread_detach(t);}
+    }else if(!strcmp(cmd,"gfxpoke")&&sscanf(line,"%*s %llx %3s %lf",&a,type,&v)==3){
+        if(a<0x10000000&&gfx_main)a+=(uintptr_t)gfx_main->base;   /* below 256 MiB: an offset into main */
+        void *at=(void *)(uintptr_t)a;
+        if(gfx_main&&a>=(uintptr_t)gfx_main->base+gfx_main->text_end&&a<(uintptr_t)gfx_main->base+gfx_main->size){   /* main's read-only data (relocated tables): writable for the poke */
+            uintptr_t page=(uintptr_t)a&~(uintptr_t)0xfff;if(mprotect((void *)page,0x2000,PROT_READ|PROT_WRITE))fprintf(stderr,"[gfx] poke %#llx: mprotect failed\n",a);}
+        if(type[0]=='f'){float o,n=(float)v;memcpy(&o,at,4);memcpy(at,&n,4);fprintf(stderr,"[gfx] poke %#llx float %g -> %g\n",a,o,n);}
+        else if(type[0]=='u'){uint32_t o,n=(uint32_t)v;memcpy(&o,at,4);memcpy(at,&n,4);fprintf(stderr,"[gfx] poke %#llx u32 %#x -> %#x\n",a,o,n);}
+        else if(type[0]=='b'){uint8_t o=*(uint8_t *)at,n=(uint8_t)v;*(uint8_t *)at=n;fprintf(stderr,"[gfx] poke %#llx byte %u -> %u\n",a,o,n);}
+        else if(type[0]=='m'&&gfx_main){uint64_t o,n=(uint64_t)(uintptr_t)gfx_main->base+(uint64_t)v;memcpy(&o,at,8);memcpy(at,&n,8);   /* a pointer into main: main + value */
+            fprintf(stderr,"[gfx] poke %#llx pointer main+%#llx -> main+%#llx\n",a,(unsigned long long)(o-(uintptr_t)gfx_main->base),(unsigned long long)(n-(uintptr_t)gfx_main->base));}
+    }else if(!strcmp(cmd,"gfxring"))glyph_ring_dump();
+    else if(!strcmp(cmd,"gfxicon")&&gfx_main){   /* the text icon function (main+0x20d7808, patched): ids 0..44 -> font characters */
+        typedef void (*icon_fn)(void *,uint16_t *,uint16_t *,uint32_t);icon_fn f=(icon_fn)(void *)(gfx_main->base+0x20d7808);
+        char t[600];int k=snprintf(t,sizeof t,"[gfx] text icons:");
+        for(uint32_t id=0;id<45;id++){uint16_t c=0,dflt=0;f(NULL,&c,&dflt,id);k+=snprintf(t+k,sizeof t-k," %u:%04x",id,c);}
+        fprintf(stderr,"%s\n",t);}
+    else fprintf(stderr,"[gfx] did not understand: %s\n",line);
+}
+/* Sun shadows (found with the gfxsweep lever hunt, 2026-10-26). The shadow settings object (constructor main+0xb76c3c,
+   held by the graphics system) has the cascade count at +0xfc (4) and the shadow map size at +0xf4/+0xf8, picked when the
+   maps are created from a preset table the setup at main+0xb744c8 writes (+0x78: handheld 720, docked 800; later entries
+   up to 3072 for the other modes). The maps keep the size they are created with, so both are set at load:
+   - TOTK_SHADOW_CASCADES=1..4: main+0xb76d34 "mov w8, #4" (each cascade dropped from 4 removes the farthest shadows and
+     ~7% of the still scene's draws, -0.3..0.5 ms a frame)
+   - TOTK_SHADOW_RES=<256..4096>: main+0xb7450c "mov w10, #720" (handheld) and main+0xb74510 "movk w10, #800, lsl #16"
+     (docked), both set to the size asked for (sharper sun shadows); 720 = the game's own sizes, nothing patched */
+static void patch_shadows(Module *m){
+    const char *c=getenv("TOTK_SHADOW_CASCADES"),*r=getenv("TOTK_SHADOW_RES");
+    struct{uint64_t off;uint32_t original,replacement;const char *what;}sites[3];unsigned n=0;
+    if(c&&*c&&strcmp(c,"0")){int v=atoi(c);if(v<1||v>4)runtime_fail("TOTK_SHADOW_CASCADES must be 1..4");
+        if(v!=4)sites[n++]=(typeof(sites[0])){0xb76d34,0x52800088,0x52800008|((uint32_t)v<<5),"cascade count"};}
+    if(r&&*r&&strcmp(r,"0")){int v=atoi(r);if(v<256||v>4096)runtime_fail("TOTK_SHADOW_RES must be 256..4096");
+        if(v!=720){sites[n++]=(typeof(sites[0])){0xb7450c,0x52805a0a,0x5280000a|((uint32_t)v<<5),"handheld shadow map size"};
+                   sites[n++]=(typeof(sites[0])){0xb74510,0x72a0640a,0x72a0000a|((uint32_t)v<<5),"docked shadow map size"};}}
+    for(unsigned i=0;i<n;i++){uint32_t w;memcpy(&w,m->base+sites[i].off,4);
+        if(w!=sites[i].original){fprintf(stderr,"[totk] shadow patch main+%#llx (%s): found %08x, expected %08x\n",(unsigned long long)sites[i].off,sites[i].what,w,sites[i].original);
+            runtime_fail("shadow patch: main does not match 1.4.3");}}
+    for(unsigned i=0;i<n;i++){memcpy(m->base+sites[i].off,&sites[i].replacement,4);
+        fprintf(stderr,"[totk] sun shadows: %s %u (main+%#llx)\n",sites[i].what,(sites[i].replacement>>5)&0xffff,(unsigned long long)sites[i].off);}
+}
+/* Where the patches below put their code and data. Veneers go after main's text (from its end rounded to 16 bytes):
+   +0 frame step (16 bytes), +16 output size (28), +48 ultrawide (4 x 32), +176 cloth/hair clock (19 words), +256 bounce
+   (20), then STUB_ACTIONS (+288, 41 words), STUB_GLYPH_TRACE (+480, 11), STUB_GLYPHS (+528, 12) and STUB_TEXT_ICONS
+   (+576, 18), all within the text's last 4 KiB page. The data page after the module's file: +0 frame step, +8 frame
+   interval, +16..+48 render and output sizes, the benchmark camera's block (+0x100..+0x170, BENCH_CAM_DATA, survey
+   sessions), GLYPH_DATA (+0x700, flag word before it), TEXT_ICON_DATA (+0x780, 64 characters, flag word before it),
+   GLYPH_RING_DATA (+0x800, 257 x 16 bytes, TOTK_GLYPH_TRACE only), ACTION_DATA (+0x2000: flag word before it, then sets
+   0, 1, 2 of GAME_ACTION_TABLE words: to +0x2570). */
+enum { STUB_ACTIONS = 288, STUB_GLYPH_TRACE = 480, STUB_TEXT_ICONS = 576, STUB_GLYPHS = 656, GLYPH_RING_DATA = 0x800 };
+/* Field controls by action (game_actions.h, 2026-10-27): the player's input routine turns each packed button into fixed
+   action bits (main+0xf23f90..0xf24008, pressed and held; 0xf24000.. released, from Y and L only). The veneer builds the
+   three masks from tables on the data page instead: set 0 the game's own, set 1 its "Swap Jump Controls" (the option's
+   value is in w9 here), set 2 ours (runtime_actions_set) when the flag word before them is set. The released mask is
+   taken whole from the controller (w22 = its sead bits, main+0xf23eb0) so an action that fires on release (charged
+   attacks) can move with its button. Menus read the buttons themselves and keep confirm / cancel where they are.
+   Registers: w21 / w20 / w22 the packed pressed / held masks and the released bits; out x8 / x21 / x9 as the original
+   stores them at main+0xf2400c; x10-x13 are dead there (reloaded or caller-saved before the next use). */
+enum { ACTION_DATA = 0x2000, ACTION_SET_BYTES = GAME_ACTION_TABLE * 8 };   /* not +0x100: the benchmark camera's block (BENCH_CAM_DATA) */
+static uint64_t *action_sets;   /* on the data page: flag word, then sets 0, 1, 2 */
+static uint64_t action_pending[GAME_ACTION_TABLE]; static int action_pending_on = -1;
+/* The game's input routine reads set 2 while its flag word is set; a new set goes in with the flag cleared, so a read
+   meanwhile takes the game's own set for that frame rather than half of the old one and half of the new (a read that
+   loaded the flag just before it was cleared can still overlap the copy: one frame's action bits, as the veneer reads the
+   set once a frame). Callers are serialized by the host (app.c actions_apply). */
+void runtime_actions_set(const uint64_t *table) {
+    if (table) memcpy(action_pending, table, sizeof action_pending);
+    action_pending_on = table != NULL;
+    if (!action_sets) return;
+    if (table) {
+        __atomic_store_n(&action_sets[-1], 0, __ATOMIC_RELAXED);
+        __atomic_thread_fence(__ATOMIC_RELEASE);   /* the cleared flag is seen before any word of the new set */
+        for (unsigned i = 0; i < GAME_ACTION_TABLE; i++) __atomic_store_n(&action_sets[2 * GAME_ACTION_TABLE + i], table[i], __ATOMIC_RELAXED);
+    }
+    __atomic_store_n(&action_sets[-1], (uint64_t)(table != NULL), __ATOMIC_RELEASE);
+    fprintf(stderr, "[totk] field controls: %s\n", table ? "our layout" : "the game's own");
+}
+/* The button prompts (game_actions.h): the field guides' glyph map (patch_glyphs), the text icons' characters
+   (patch_text_icons) and the face letters (the glyph name table main+0x3714c28: A <-> B and X <-> Y swapped for face
+   buttons by position, so the menus' guides and the game's own jump swap show the printed letters too). Each table's
+   flag word is just before it on the data page. */
+enum { GLYPH_DATA = 0x700, TEXT_ICON_DATA = 0x780, GLYPH_NAMES = 0x3714c28 };
+static uint8_t *glyph_map; static uint16_t *text_icon_map; static Module *prompt_main;
+static struct { int set, swap; uint8_t field[GAME_GLYPHS]; int field_on; uint16_t text[64]; int text_on; } prompt_pending;
+/* The protection of the page at p (/proc/self/maps), or -1: the glyph names are on a page that is writable while the
+   module loads (the loader checks that) and read-only once the game runs */
+static int page_protection(uintptr_t p){
+    FILE *f=fopen("/proc/self/maps","r");if(!f)return -1;char line[512];int prot=-1;
+    while(fgets(line,sizeof line,f)){unsigned long long lo,hi;char perm[8];
+        if(sscanf(line,"%llx-%llx %7s",&lo,&hi,perm)==3&&p>=lo&&p<hi){prot=(perm[0]=='r'?PROT_READ:0)|(perm[1]=='w'?PROT_WRITE:0)|(perm[2]=='x'?PROT_EXEC:0);break;}}
+    fclose(f);return prot;
+}
+static void glyph_names_swap(int swap){
+    static uint64_t original[5]; static int have, swapped;
+    if(!prompt_main||swap==swapped)return;
+    uint64_t *names=(uint64_t *)(void *)(prompt_main->base+GLYPH_NAMES);
+    uintptr_t page=(uintptr_t)names&~(uintptr_t)0xfff;int prot=page_protection(page);
+    if(prot<0||(!(prot&PROT_WRITE)&&mprotect((void *)page,0x1000,prot|PROT_WRITE))){fprintf(stderr,"[totk] button prompts: the glyph names stay (page not writable)\n");return;}
+    if(!have){memcpy(original,names,sizeof original);have=1;}
+    static const int order[5]={0,2,1,4,3};
+    for(int i=1;i<=4;i++)names[i]=original[swap?order[i]:i];
+    if(!(prot&PROT_WRITE))mprotect((void *)page,0x1000,prot);
+    swapped=swap;
+}
+void runtime_prompts_set(const uint8_t *field, int swap_faces, const uint16_t *text) {
+    prompt_pending.set=1;prompt_pending.swap=swap_faces;prompt_pending.field_on=field!=NULL;prompt_pending.text_on=text!=NULL;
+    if(field)memcpy(prompt_pending.field,field,GAME_GLYPHS);
+    if(text)memcpy(prompt_pending.text,text,sizeof prompt_pending.text);
+    if(glyph_map){if(field)memcpy(glyph_map,field,GAME_GLYPHS);__atomic_store_n((uint64_t *)(void *)(glyph_map-8),(uint64_t)(field!=NULL),__ATOMIC_RELEASE);}
+    if(text_icon_map){if(text)memcpy(text_icon_map,text,64*sizeof *text);__atomic_store_n((uint64_t *)(void *)((uint8_t *)text_icon_map-8),(uint64_t)(text!=NULL),__ATOMIC_RELEASE);}
+    glyph_names_swap(swap_faces);
+}
+/* The field prompts' glyphs (game_actions.h game_actions_glyphs): the control guide's calls of the glyph lookup
+   main+0xba29e0 (eight sites, main+0x20eb744..0x20ebd6c) go to a second entry that swaps the glyph id for the one of the
+   button the action is on now, while our layout is in use; the menus' calls keep the game's ids (confirm and back stay
+   where the face-button setting puts them). x16 / x17 are the call's scratch registers.
+   Other screens share some of these key-guide methods, and their buttons are read raw (as menus' are), so their keys
+   keep the game's ids: the cutscene's "Skip" (UIEventSkipScreen, main+0x214bb64) calls setKey main+0x20ebc78 (site
+   main+0x20ebcd0) and the item shortcut wheel (UIShortCutMainItemScreen, main+0x21824fc) calls main+0x20ebd44 (site
+   main+0x20ebd6c), which the control guide calls too (from main+0x2147f9c and main+0x21480a4): at those two sites the id
+   is mapped only when the method's saved return address ([x29, #8], its frame) is the control guide's. The location
+   screen's X (main+0x20ebb4c, site main+0x20ebbf0, UILocationScreen only) is not redirected at all.
+   Fuse's target guide (the held material's "Weapon / Shield / Bow" lines, main+0x20dafec, called only from
+   main+0x2135434) takes its glyph from the table main+0x2d16ee8 by slot (ZL shield, ZR bow, Y weapon): field actions,
+   so its call (site main+0x20db198) is mapped like the control guide's; with attack moved, it showed the old key. */
+static void patch_glyphs(Module *m,uint64_t data){
+    uint64_t stub=((m->text_end+15)&~15ULL)+STUB_GLYPHS;
+    enum { WORDS=27, SHARED_A=0x20ebcd0, GUIDE_A=0x2147fa0, SHARED_B=0x20ebd6c, GUIDE_B=0x21480a8, FUSE=0x20db198 };
+    if(data+GLYPH_DATA+GAME_GLYPHS>m->size||stub+WORDS*4>((m->text_end+0xfff)&~0xfffULL))runtime_fail("1.4.3 field prompts patch layout");
+    static const uint64_t calls[]={0x20eb744,0x20eb808,0x20eb8cc,0x20eb9ac,0x20eb9e0,SHARED_A,SHARED_B,FUSE};
+    uintptr_t b=(uintptr_t)m->base;
+    #define ADD_LO(rd,rn,target) (0x91000000|((uint32_t)((target)&0xfff)<<10)|((rn)<<5)|(rd))
+    #define AT(word) (b+stub+4*(word))
+    uint32_t veneer[WORDS]={adrp(16,AT(0),b+data),
+        0x91000000|((uint32_t)GLYPH_DATA<<10)|(16<<5)|16,   /* add x16, x16, #GLYPH_DATA */
+        0xf85f8211,   /* ldur x17, [x16, #-8]: our layout's prompts on */
+        0xb4000000|((25-3)<<5)|17,   /* cbz x17, the lookup */
+        0x7100fc3f,   /* cmp w1, #63 */
+        0x54000008|((25-5)<<5),   /* b.hi the lookup */
+        adrp(17,AT(6),b+SHARED_A+4),ADD_LO(17,17,SHARED_A+4),0xeb1103df,   /* cmp x30, x17: called from shared site A? */
+        0x54000000|((17-9)<<5),   /* b.eq: compare with the guide's return A */
+        adrp(17,AT(10),b+SHARED_B+4),ADD_LO(17,17,SHARED_B+4),0xeb1103df,   /* shared site B? */
+        0x54000001|((24-13)<<5),   /* b.ne the map: a control-guide-only site */
+        adrp(17,AT(14),b+GUIDE_B),ADD_LO(17,17,GUIDE_B),
+        0x14000000|(19-16),   /* b the comparison */
+        adrp(17,AT(17),b+GUIDE_A),ADD_LO(17,17,GUIDE_A),
+        0xf94007b0,   /* ldr x16, [x29, #8]: the shared method's return address */
+        0xeb11021f,   /* cmp x16, x17 */
+        0x54000001|((25-21)<<5),   /* b.ne the lookup: another screen, the game's own id */
+        adrp(16,AT(22),b+data),0x91000000|((uint32_t)GLYPH_DATA<<10)|(16<<5)|16,   /* the table again */
+        0x38614a01,   /* the map: ldrb w1, [x16, w1, uxtw] */
+        0xd10143ff,   /* the lookup: sub sp, sp, #0x50, its first instruction */
+        branch(stub+4*26,0xba29e4)};
+    #undef ADD_LO
+    #undef AT
+#if !TARGET_OS_IPHONE
+    for(unsigned i=0;i<sizeof calls/sizeof *calls;i++){uint32_t w;memcpy(&w,m->base+calls[i],4);
+        if(w!=(0x94000000|(((uint32_t)((int64_t)(0xba29e0-calls[i])>>2))&0x3ffffff)))runtime_fail("field prompts patch: main does not match 1.4.3");}
+    for(unsigned i=0;i<sizeof veneer;i++)if(m->base[stub+i])runtime_fail("1.4.3 field prompts veneer padding not empty");
+    memcpy(m->base+stub,veneer,sizeof veneer);
+    for(unsigned i=0;i<sizeof calls/sizeof *calls;i++){uint32_t w=branch(calls[i],stub)|0x80000000u;memcpy(m->base+calls[i],&w,4);}   /* bl */
+#endif
+    glyph_map=m->base+data+GLYPH_DATA;
+    fprintf(stderr,"[totk] 1.4.3 field prompts follow the field controls: %u control-guide calls, veneer +%#llx\n",(unsigned)(sizeof calls/sizeof *calls),(unsigned long long)stub);
+}
+/* The button icons in message text (game_actions.h game_text_icon_chars): the font character for a {1.4:<id>} tag
+   comes from main+0x20d7808 (a virtual function: x1 the character out, x2 the default out, w3 the id). The veneer
+   answers from our table while it is in use (0 = the game's own), with the same default store; else the function runs. */
+static void patch_text_icons(Module *m,uint64_t data){
+    uint64_t stub=((m->text_end+15)&~15ULL)+STUB_TEXT_ICONS;
+    enum { WORDS=18 };
+    if(data+TEXT_ICON_DATA+128>m->size||stub+WORDS*4>((m->text_end+0xfff)&~0xfffULL))runtime_fail("1.4.3 text icons patch layout");
+    uint32_t veneer[WORDS]={adrp(16,(uintptr_t)m->base+stub,(uintptr_t)m->base+data),0x91000000|((uint32_t)TEXT_ICON_DATA<<10)|(16<<5)|16,   /* add x16, x16, #TEXT_ICON_DATA */
+        0xf85f8211,0xb40001b1,0x12001c71,0x7100fe3f,0x54000148,0x78715a11,0x34000111,0x79000031,   /* flag, id < 64, table, store */
+        adrp(16,(uintptr_t)m->base+stub+40,(uintptr_t)m->base+0x395e000),0xf9452210,0xf9400210,0xb94a7a10,0x79000050,   /* the default, as the function: the object at [main+0x395ea40], its +0xa78 */
+        0xd65f03c0,0xa9be7bfd,branch(stub+68,0x20d780c)};   /* ret; else the function's first instruction and on */
+#if !TARGET_OS_IPHONE
+    uint32_t w;memcpy(&w,m->base+0x20d7808,4);if(w!=0xa9be7bfd)runtime_fail("text icons patch: main does not match 1.4.3");
+    memcpy(&w,m->base+0x20d7814,4);if(w!=0xf000c429)runtime_fail("text icons patch: main does not match 1.4.3 (default)");
+    for(unsigned i=0;i<sizeof veneer;i++)if(m->base[stub+i])runtime_fail("1.4.3 text icons veneer padding not empty");
+    memcpy(m->base+stub,veneer,sizeof veneer);w=branch(0x20d7808,stub);memcpy(m->base+0x20d7808,&w,4);
+#endif
+    text_icon_map=(uint16_t *)(void *)(m->base+data+TEXT_ICON_DATA);
+    fprintf(stderr,"[totk] 1.4.3 text icons follow the controls: veneer +%#llx\n",(unsigned long long)stub);
+}
+static void patch_actions(Module *m){
+    uint64_t data=(m->file_size+0x3fff)&~0x3fffULL,stub=((m->text_end+15)&~15ULL)+STUB_ACTIONS;
+    enum { WORDS=41 };
+    if(data+ACTION_DATA+3*ACTION_SET_BYTES>m->size||stub+WORDS*4>((m->text_end+0xfff)&~0xfffULL))runtime_fail("1.4.3 field controls patch layout");
+    const Patch sites[]={
+        {0xf23eb0,0x37201e68,0x2a0803f6},   /* tbnz w8, #4 (Y released) -> mov w22, w8: all released bits */
+        {0xf23eb4,0x2a1f03f6,0xd503201f},   /* mov w22, wzr -> nop */
+        {0xf23eb8,0x37681e68,0xd503201f},   /* tbnz w8, #13 (L released) -> nop */
+        {0xf23f90,0x37001975,branch(0xf23f90,stub)},   /* tbnz w21, #0 (first pressed button) -> the veneer */
+    };
+    uint32_t veneer[WORDS]={adrp(10,(uintptr_t)m->base+stub,(uintptr_t)m->base+data),
+        0x91400000|((ACTION_DATA>>12)<<10)|(10<<5)|10,   /* add x10, x10, #ACTION_DATA>>12, lsl #12: set 0 */
+        /* the rest from llvm-mc: pick the set (flag at x10-8, else w9), then per set bit OR table[bit] into x8, x21, x9 */
+        0xb85f814b,0x3500008b,0x34000089,0x9107414a,0x14000002,0x910e814a,0xaa1f03e8,0x2a1503eb,0x3400010b,0x5ac0016c,
+        0x5ac0118c,0xf86c794d,0xaa0d0108,0x5100056d,0x0a0d016b,0x17fffff9,0x9101c14a,0x2a1403eb,0xaa1f03f5,0x3400010b,
+        0x5ac0016c,0x5ac0118c,0xf86c794d,0xaa0d02b5,0x5100056d,0x0a0d016b,0x17fffff9,0x9101814a,0x2a1603eb,0xaa1f03e9,
+        0x3400010b,0x5ac0016c,0x5ac0118c,0xf86c794d,0xaa0d0129,0x5100056d,0x0a0d016b,0x17fffff9,
+        branch(stub+40*4,0xf2400c)};
+    /* sets 0 and 1: the game's own, without and with its jump swap (the same bits the routine adds) */
+    uint64_t *sets=(uint64_t *)(void *)(m->base+data+ACTION_DATA);
+    int8_t buttons[GAME_ACTIONS];game_actions_default(buttons);
+    if(game_actions_table(buttons,sets))runtime_fail("field controls: default table");
+    buttons[GA_JUMP]=1;buttons[GA_SPRINT]=2;   /* jump on B, sprint on X */
+    if(game_actions_table(buttons,sets+GAME_ACTION_TABLE))runtime_fail("field controls: swapped table");
+#if TARGET_OS_IPHONE
+    for(unsigned i=0;i<sizeof sites/sizeof *sites;i++){uint32_t w;memcpy(&w,m->base+sites[i].off,4);if(w!=sites[i].replacement)runtime_fail("1.4.3 embedded field controls patch mismatch");}
+    if(memcmp(m->base+stub,veneer,sizeof veneer))runtime_fail("1.4.3 embedded field controls veneer mismatch");
+#else
+    for(unsigned i=0;i<sizeof sites/sizeof *sites;i++){uint32_t w;memcpy(&w,m->base+sites[i].off,4);
+        if(w!=sites[i].original){fprintf(stderr,"[totk] field controls main+%#llx: found %08x, expected %08x\n",(unsigned long long)sites[i].off,w,sites[i].original);
+            runtime_fail("field controls patch: main does not match 1.4.3");}}
+    for(unsigned i=0;i<sizeof veneer;i++)if(m->base[stub+i])runtime_fail("1.4.3 field controls veneer padding not empty");
+    memcpy(m->base+stub,veneer,sizeof veneer);
+    for(unsigned i=0;i<sizeof sites/sizeof *sites;i++)memcpy(m->base+sites[i].off,&sites[i].replacement,4);
+#endif
+    action_sets=sets;
+    patch_glyphs(m,data);
+    patch_text_icons(m,data);
+    prompt_main=m;
+    if(action_pending_on>0)runtime_actions_set(action_pending);
+    if(prompt_pending.set)runtime_prompts_set(prompt_pending.field_on?prompt_pending.field:NULL,prompt_pending.swap,prompt_pending.text_on?prompt_pending.text:NULL);
+    fprintf(stderr,"[totk] 1.4.3 field controls by action: veneer +%#llx, tables on the data page +%#x\n",(unsigned long long)stub,ACTION_DATA);
+}
+/* TOTK_GLYPH_TRACE=1 (diagnostic, 2026-10-27): the button-glyph name lookup main+0xba29e0 (glyph id in w1 -> "A",
+   "B_OptionX"... for the menus' button guides and the field control guides) records each call's caller and id in a ring
+   on the data page (+0x800); the gfxring command lists the distinct pairs: which UI code asks for which glyph. */
+static uint64_t *glyph_ring;
+static void patch_glyph_trace(Module *m){
+    const char *e=getenv("TOTK_GLYPH_TRACE");if(!e||strcmp(e,"1"))return;
+    uint64_t data=(m->file_size+0x3fff)&~0x3fffULL,stub=((m->text_end+15)&~15ULL)+STUB_GLYPH_TRACE;
+    enum { WORDS=11 };
+    if(data+GLYPH_RING_DATA+16*257>m->size||stub+WORDS*4>((m->text_end+0xfff)&~0xfffULL))runtime_fail("glyph trace layout");
+    uint32_t w;memcpy(&w,m->base+0xba29e0,4);if(w!=0xd10143ff)runtime_fail("glyph trace: main+0xba29e0 is not sub sp, sp, #0x50");
+    uint32_t veneer[WORDS]={adrp(16,(uintptr_t)m->base+stub,(uintptr_t)m->base+data),0x91000000|((uint32_t)GLYPH_RING_DATA<<10)|(16<<5)|16,   /* add x16, x16, #GLYPH_RING_DATA */
+        0xf9400211,0x91000631,0xf9000211,0x92401e31,0x8b111211,0xf900063e,0xf9000a21,0xd10143ff,branch(stub+40,0xba29e4)};
+    for(unsigned i=0;i<sizeof veneer;i++)if(m->base[stub+i])runtime_fail("glyph trace veneer padding not empty");
+    memcpy(m->base+stub,veneer,sizeof veneer);uint32_t j=branch(0xba29e0,stub);memcpy(m->base+0xba29e0,&j,4);
+    glyph_ring=(uint64_t *)(void *)(m->base+data+GLYPH_RING_DATA);
+    fprintf(stderr,"[totk] glyph trace: main+0xba29e0 callers recorded (gfxring)\n");
+}
+static void glyph_ring_dump(void){
+    if(!glyph_ring||!gfx_main){fprintf(stderr,"[gfx] gfxring: TOTK_GLYPH_TRACE=1 is not set\n");return;}
+    uint64_t n=glyph_ring[0];uint64_t seen[256][2];int k=0;
+    for(uint64_t e=1;e<256&&e<=n;e++){uint64_t c=glyph_ring[2*e+1]-(uintptr_t)gfx_main->base,id=glyph_ring[2*e+2]&0xffffffff;int dup=0;   /* entry e: caller at +16e+8, id at +16e+16 */
+        for(int j=0;j<k;j++)dup|=seen[j][0]==c&&seen[j][1]==id;if(!dup&&k<256){seen[k][0]=c;seen[k][1]=id;k++;}}
+    fprintf(stderr,"[gfx] gfxring: %llu calls, %d distinct (caller, id):",(unsigned long long)n,k);
+    for(int j=0;j<k;j++)fprintf(stderr," %llx:%llu",(unsigned long long)seen[j][0],(unsigned long long)seen[j][1]);
+    fputc('\n',stderr);glyph_ring[0]=0;
+}
 static void patch_output_res(Module *m);
 static void patch_render_res(Module *m);
 static void patch_fixed_res(Module *m);
@@ -1867,6 +2252,10 @@ void runtime_game_patches(Module *m) {
     patch_output_res(m);
     patch_render_res(m);
     patch_fixed_res(m);
+    patch_shadows(m);
+    patch_actions(m);
+    patch_glyph_trace(m);
+    gfx_main=m;   /* gfx* lever-hunt commands */
     patch_slowmo_bounce(m);
     patch_fade_increment(m);
 #if !TARGET_OS_IPHONE

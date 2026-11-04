@@ -1,4 +1,10 @@
 /* Gate register preservation adapted from D2R Mobile (MIT), pinned in third_party/d2r/README.md. */
+#ifdef __ANDROID__
+/* Android: this thread's slot block is in bionic's TLS_SLOT_APP (thread pointer + 16; free for apps since API 29). */
+#define HOST_TSD(reg) mrs reg, tpidr_el0 ; ldr reg, [reg, #16]
+#else
+#define HOST_TSD(reg) mrs reg, tpidrro_el0
+#endif
 .text
     .globl _runtime_gate
     .p2align 2
@@ -6,7 +12,7 @@ _runtime_gate:
     // Switch to this thread's host stack first (see hle_stack.S): the guest stack only holds x16/x17.
     // Frame above the 800-byte register area: [sp+800] guest sp (points at saved x16/x17), [sp+808] host top or 0.
     stp x16, x17, [sp, #-16]!
-    mrs x16, tpidrro_el0
+    HOST_TSD(x16)
     adrp x17, _runtime_hle_tsd_off@PAGE
     ldr x17, [x17, _runtime_hle_tsd_off@PAGEOFF]
     add x16, x16, x17
@@ -67,7 +73,7 @@ _runtime_gate:
     bl _runtime_dispatch
     ldr x9, [sp, #808]          // give the host stack back to this thread
     cbz x9, 3f
-    mrs x10, tpidrro_el0
+    HOST_TSD(x10)
     adrp x11, _runtime_hle_tsd_off@PAGE
     ldr x11, [x11, _runtime_hle_tsd_off@PAGEOFF]
     str x9, [x10, x11]

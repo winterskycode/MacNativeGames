@@ -35,6 +35,7 @@ void mtl_sub_begin(void);
    handed to the translation thread; snapshot_cap builds the submission's copies at the start of its replay (cap may be
    NULL: copy from memory now) and frees cap. */
 void *mtl_sub_capture_ubos(const uint64_t *h, int n);
+void mtl_sub_capture_copy(void *cap);   /* TOTK: the capture's bytes, after the submission was queued */
 void mtl_sub_snapshot_ubos_cap(const uint64_t *h, int n, void *cap);
 void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n);               // GPU 时序上的缓冲拷贝 | Buffer copy in GPU ordering
 void mtl_sub_event(volatile uint32_t *val, uint32_t mode, uint32_t v);   // 完成后写事件值（0 写 / 1 加） | Write the event value after completion (0 write / 1 add)

@@ -3,7 +3,9 @@
    On the Switch the call starts the software-keyboard library applet, which takes the screen until the player confirms
    or cancels. Here the player types on the Mac keyboard in a bar inside the game window (runtime_front_text_input in
    runtime/frontend.m; input methods work, Return confirms, Escape cancels), or on a system alert (ios/Sources/
-   text_input.m). User, 2026-10-17: "no software keyboard, just support the user's keyboard". TOTK calls it in one place: naming a horse (main+0x1e5cb58 -> main+0x1adb720:
+   text_input.m). User, 2026-10-17: "no software keyboard, just support the user's keyboard". On Android a dialog takes
+   the text with the system's on-screen keyboard, touch operated as the Switch's applet is (runtime_front_text_input in
+   port/android/host/app.c). TOTK calls it in one place: naming a horse (main+0x1e5cb58 -> main+0x1adb720:
    user-name preset, at most 9 characters, '@' '%' '\' disabled, UTF-16 output; an empty name counts as cancelled).
 
    ABI of TOTK 1.0.0's SDK, read from the original sdk+0x3cbd40 (ShowKeyboard with a trigger) and the setters
@@ -136,7 +138,7 @@ static unsigned show_keyboard(void *out_string, const void *arg_ptr) {
         confirmed = strcmp(forced, "<cancel>") != 0;
         snprintf(text, sizeof text, "%s", strcmp(forced, "<initial>") ? forced : initial);
     } else {
-#if TARGET_OS_OSX || TARGET_OS_IPHONE
+#if TARGET_OS_OSX || TARGET_OS_IPHONE || defined(__ANDROID__)
         RuntimeTextRequest req = { prompt, initial, max_len, min_len, password != 0, type == KB_TYPE_NUMPAD, disabled };
         int away = runtime_core_away();   /* the other guest threads keep running while the player types */
         confirmed = runtime_front_text_input(&req, text, sizeof text);
@@ -180,8 +182,8 @@ static void *selftest_thread(void *unused) {
     uint8_t *arg = calloc(1, ARG_SIZE); uint16_t *out = calloc(1, 0x7d4); uint8_t *work = calloc(1, 0x1000);
     if (!arg || !out || !work) runtime_fail("keyboard self-test allocation");
     uint32_t max = 9, disabled = 0x12c; uint64_t w = (uint64_t)(uintptr_t)work, ws = 0x1000;
-    static const uint16_t title[] = {0x6d4b, 0x8bd5, 0xff1a, 0x7ed9, 0x9a6c, 0x53d6, 0x540d, 0};   /* 测试：给马取名 */
-    memcpy(arg + KB_HEADER, title, sizeof title); memcpy(arg + KB_MAX_LEN, &max, 4); memcpy(arg + KB_DISABLED, &disabled, 4);
+    uint16_t title[0x40]; size_t n = utf8_to_utf16(TOTK_UI("测试：给马取名", "Test: name your horse"), title, 0x3f); title[n] = 0;   /* in the host's UI language */
+    memcpy(arg + KB_HEADER, title, (n + 1) * 2); memcpy(arg + KB_MAX_LEN, &max, 4); memcpy(arg + KB_DISABLED, &disabled, 4);
     memcpy(arg + ARG_WORK, &w, 8); memcpy(arg + ARG_WORK_SIZE, &ws, 8);
     uint64_t str[2] = { (uint64_t)(uintptr_t)out, 0x7d4 };
     unsigned r = show_keyboard(str, arg);

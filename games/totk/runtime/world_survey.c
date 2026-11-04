@@ -427,7 +427,13 @@ static void clock_scan(float lo, float hi, int second, float dmin, float dmax) {
         scan_n = kept; return;
     }
     const char *ef = getenv("TOTK_CLOCKSCAN_FROM"), *et = getenv("TOTK_CLOCKSCAN_TO");   // diagnostic: other address ranges
+#ifdef __ANDROID__
+    /* Android: the game's heap is low in the guest space (services.c guest layout), not at Darwin's 0x7000000000 */
+    extern uint64_t runtime_heap_base(void); const uint64_t heap = runtime_heap_base();
+    mach_vm_address_t addr = ef ? strtoull(ef, NULL, 16) : heap, end = et ? strtoull(et, NULL, 16) : heap + (8ULL << 30);
+#else
     mach_vm_address_t addr = ef ? strtoull(ef, NULL, 16) : 0x7000000000ULL, end = et ? strtoull(et, NULL, 16) : 0x8000000000ULL;
+#endif
     size_t regions = 0, bytes = 0, dense = 0;
     while (addr < end && scan_n < MAXHITS) {
         mach_vm_size_t size = 0; natural_t depth = 1; vm_region_submap_info_data_64_t info; mach_msg_type_number_t cnt = VM_REGION_SUBMAP_INFO_COUNT_64;
@@ -463,10 +469,13 @@ static void clock_write(int hour) {
 }
 /* Runs on the input-file thread (survey clockfind) while the game runs on: the frame thread must not stall for the scan. */
 static void clock_find(void) {
+    double s0 = now_seconds();
     clock_scan(3600, 86000, 0, 0, 0);
     double t0 = now_seconds(); usleep(2500000);
     double dt = now_seconds() - t0;
-    clock_scan(0, 0, 1, (float)(dt * 20), (float)(dt * 110));   // the slow full scan read each value at a different time
+    /* the slow full scan read each value at a different time: a value read at its start has moved for the scan's time
+       too (Android: ~10 s for 2.9 GB, so the clock moved past dt x 110 and nothing was found) */
+    clock_scan(0, 0, 1, (float)(dt * 20), (float)((now_seconds() - s0) * 110));
     t0 = now_seconds(); usleep(2000000); dt = now_seconds() - t0;
     size_t kept = 0;
     for (size_t i = 0; i < scan_n; i++) {   // both readings fast: the rate is exact
