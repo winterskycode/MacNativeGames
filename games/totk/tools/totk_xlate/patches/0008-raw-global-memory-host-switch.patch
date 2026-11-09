@@ -1,0 +1,33 @@
+diff --git a/src/Ryujinx.Graphics.Shader/IGpuAccessor.cs b/src/Ryujinx.Graphics.Shader/IGpuAccessor.cs
+index 667c111..8f5122e 100644
+--- a/src/Ryujinx.Graphics.Shader/IGpuAccessor.cs
++++ b/src/Ryujinx.Graphics.Shader/IGpuAccessor.cs
+@@ -30,6 +30,15 @@ namespace Ryujinx.Graphics.Shader
+             return 0;
+         }
+ 
++        /// <summary>
++        /// Whether a global memory access traced to no storage buffer may go through the host's memory pool table and a
++        /// physical pointer. Without it the access is dropped, as Ryujinx does (a load reads 0).
++        /// </summary>
++        bool QueryHostSupportsRawGlobalMemory()
++        {
++            return true;
++        }
++
+         /// <summary>
+         /// NVN2 (Switch 2) compute shaders: the counts of the shader's own driver constant layout in c[0] (uniform buffer entries, storage buffer entries, texture
+         /// handles), its size and the bytes of its push constants, from the control section; null for other shaders.
+diff --git a/src/Ryujinx.Graphics.Shader/Translation/Optimizations/GlobalToStorage.cs b/src/Ryujinx.Graphics.Shader/Translation/Optimizations/GlobalToStorage.cs
+index 2fd44a5..03bbf3d 100644
+--- a/src/Ryujinx.Graphics.Shader/Translation/Optimizations/GlobalToStorage.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/Optimizations/GlobalToStorage.cs
+@@ -663,7 +663,7 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
+                 return true;
+             }
+ 
+-            if (targetCbs.Count == 0)
++            if (targetCbs.Count == 0 && gpuAccessor.QueryHostSupportsRawGlobalMemory())
+             {
+                 return TryGenerateRawStorageOp(gtsContext, resourceManager, gpuAccessor, operation, out functionId);
+             }

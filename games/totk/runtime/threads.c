@@ -331,7 +331,14 @@ static int64_t block_inner(thr_t *t, int kind, int64_t ns);
 // run guest code; a core is given up only where Horizon would switch threads (waits, sleep, yield, exit, blocking
 // host services) and handed to the best waiting thread (lowest priority value, then first come). A thread that a
 // higher-priority waiter wants to preempt gives its core up at its next SVC. TOTK_FREE_CORES=1 disables this.
+/* The application's cores: three on the Switch, six on the Switch 2 (Donkey Kong Bananza puts threads on core 5 by
+   number). services.c GetInfo 0 (CoreMask) answers the same set. */
+#ifdef GAME_NS2
+#define NCORE 6
+#else
 #define NCORE 3
+#endif
+#define ALL_CORES ((1ull << NCORE) - 1)   /* 7 on the Switch, 0x3f on the Switch 2 */
 static thr_t *g_core_owner[NCORE];
 static thr_t *g_core_wait;
 static uint64_t g_core_wait_all_ns, g_core_wait_all_n;   // all guest threads' waits in core_take (holding G; dm_core_wait_stats)
@@ -389,6 +396,42 @@ static void core_wait_complete(thr_t *t, uint64_t granted_ns) {
     t->core_stats_since = 0;
     t->core_wait_ns += elapsed; t->core_nwait++; g_core_wait_all_ns += elapsed; g_core_wait_all_n++;
 }
+/* Horizon moves a thread to an idle core it may run on when the core it holds has another thread ready to run there
+   (KScheduler's migration of suggested threads to idle cores, Atmosphere kern_k_scheduler.cpp). Here a virtual core is
+   only an entitlement, so moving its owner is bookkeeping: the owner keeps running, holding the free core instead, and
+   the waiter gets the one it may use. Without it a thread allowed on one core only waited behind a better thread that
+   kept that core while others stood idle: Pokemon Pokopia's 0x1009 (priority 44, core 1) behind 0x1023 (priority 30,
+   cores 1-2) with cores 2-5 free, and the frame loop stopped (2026-11-03, at a different frame each run). Holding G. */
+/* On by default for the Switch 2 games only (TOTK_CORE_MIGRATE=1 / =0 overrides). The owner moves while it runs, so a
+   Switch 1 game thread that took its core's number before the move keeps using that core's data while the waiter now runs
+   on the core: Tears of the Kingdom's Gerudo Town after the Depths then drew huge slabs from stale geometry (Android,
+   2026-11-09: gone with TOTK_CORE_MIGRATE=0 alone). */
+#ifdef GAME_NS2
+#define CORE_MIGRATE_DEFAULT 1
+#else
+#define CORE_MIGRATE_DEFAULT 0
+#endif
+static uint64_t g_core_migrations;
+static int core_migrate(thr_t *w) {
+    static int on = -1; if (on < 0) { const char *e = getenv("TOTK_CORE_MIGRATE"); on = e ? strcmp(e, "0") != 0 : CORE_MIGRATE_DEFAULT; }
+    if (!on) return 0;
+    for (int c = 0; c < NCORE; c++) {
+        thr_t *o = g_core_owner[c];
+        if (!o || o == w || !core_allowed(w, c)) continue;
+        for (int f = 0; f < NCORE; f++) {
+            if (f == c || g_core_owner[f] || !core_allowed(o, f)) continue;
+            o->cur_core = f; g_core_owner[f] = o;
+            for (thr_t **p = &g_core_wait; *p; p = &(*p)->cnext) if (*p == w) { *p = w->cnext; break; }
+            w->cnext = NULL; w->cqueued = 0;
+            w->cur_core = c; w->core_since = now_ns(); core_wait_complete(w, w->core_since); g_core_owner[c] = w;
+            tev_signal(w);
+            if (g_core_migrations++ < 8) fprintf(stderr, "[threads] thread %#x moved from core %d to idle core %d for thread %#x (priority %d, mask %#llx)\n",
+                                                  o->handle, c, f, w->handle, w->prio, (unsigned long long)w->mask);
+            return 1;
+        }
+    }
+    return 0;
+}
 static void core_grant(int c) {   // holding G: give free core c to the best waiter
     thr_t *b = NULL, **bp = NULL;
 #ifdef GAME_BOTW
@@ -412,7 +455,7 @@ static void core_grant(int c) {   // holding G: give free core c to the best wai
     for (thr_t **p = &g_core_wait; *p; p = &(*p)->cnext)
         if (core_allowed(*p, c) && (!b || (*p)->prio < b->prio || ((*p)->prio == b->prio && (*p)->cseq < b->cseq))) { b = *p; bp = p; }
 #endif
-    if (!b) return;
+    if (!b) { for (thr_t *w = g_core_wait; w; w = w->cnext) if (core_migrate(w)) break; return; }   // no waiter may use c: perhaps an owner may
     *bp = b->cnext; b->cnext = NULL; b->cqueued = 0; b->cur_core = c; b->core_since = now_ns(); core_wait_complete(b, b->core_since); g_core_owner[c] = b; tev_signal(b);
 }
 static void core_put(thr_t *t) {   // holding G
@@ -703,6 +746,7 @@ static void core_take(thr_t *t) {   // holding G; waits until a core in t's mask
 #ifdef GAME_BOTW
     if (c >= 0) { core_unqueue(t); t->cur_core = c; t->core_since = now_ns(); core_wait_complete(t, t->core_since); g_core_owner[c] = t; return; }
     if (!t->cqueued) { t->cseq = ++g_wseq; t->cnext = g_core_wait; g_core_wait = t; t->cqueued = 1; t->cwait_ns = now_ns(); }
+    if (core_migrate(t)) { t->cwait_ns = 0; return; }
     int reported = 0, tlc = tl_on();
     if (tlc) totk_tl(TLK_CW_IN, 0, 0);
     while (t->cur_core < 0) {   // kicked owners are signalled again every millisecond; otherwise look again every 20 ms (starvation, inheritance)
@@ -715,6 +759,7 @@ static void core_take(thr_t *t) {   // holding G; waits until a core in t's mask
 #else
     if (c >= 0) { totk_core_unqueue(t); t->cur_core = c; t->core_since = now_ns(); g_core_owner[c] = t; return; }
     if (!t->cqueued) { t->cseq = ++g_wseq; t->cnext = g_core_wait; g_core_wait = t; t->cqueued = 1; }
+    if (core_migrate(t)) return;
     int reported = 0;
     uint64_t ws = runtime_svc_stats_on() ? now_ns() : 0;
     uint64_t spin_t0 = sync_spin_ns() > 0 ? now_ns() : 0;
@@ -984,7 +1029,7 @@ uint32_t svc_thread_main_init(void) {
 #ifdef GAME_BOTW
     t->started = 1; t->prio = 44; t->core = PROCESS_IDEAL_CORE; t->mask = 1u << PROCESS_IDEAL_CORE; t->pt = pthread_self(); t->mport = pthread_mach_thread_np(t->pt);
 #else
-    t->started = 1; t->prio = 44; t->core = 0; t->mask = 7; t->pt = pthread_self(); t->mport = pthread_mach_thread_np(t->pt);
+    t->started = 1; t->prio = 44; t->core = 0; t->mask = ALL_CORES; t->pt = pthread_self(); t->mport = pthread_mach_thread_np(t->pt);
 #endif
     t->cur_core = -1;
     g_lock(); t->handle = h_new(O_THREAD, t); t->id = g_next_id++; t->all = g_all; g_all = t; core_take(t); pthread_mutex_unlock(&G);
@@ -1209,7 +1254,7 @@ int svc_thread(int num, uint64_t *regs) {
           if (c < 0 || c > 2) { free(t); regs[0] = R_BAD_CORE; return 1; }   // Horizon: only -2 is adjusted, other negatives are invalid here
           t->prio = (int)regs[4]; t->core = c; t->mask = 1ull << c; }
 #else
-        t->prio = (int)regs[4]; t->core = (int)regs[5]; t->mask = t->core >= 0 ? 1ull << t->core : 7;
+        t->prio = (int)regs[4]; t->core = (int)regs[5]; t->mask = t->core >= 0 ? 1ull << t->core : ALL_CORES;
 #endif
         t->born_ns = now_ns(); t->born_tick = dm_thread_tick_fn ? dm_thread_tick_fn() : 0;
         g_lock(); t->handle = h_new(O_THREAD, t); t->id = g_next_id++; t->all = g_all; g_all = t; pthread_mutex_unlock(&G);

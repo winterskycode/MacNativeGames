@@ -224,15 +224,6 @@ diff --git a/src/Ryujinx.Graphics.Shader/Translation/ResourceManager.cs b/src/Ry
 index 2fc1534..de9ce80 100644
 --- a/src/Ryujinx.Graphics.Shader/Translation/ResourceManager.cs
 +++ b/src/Ryujinx.Graphics.Shader/Translation/ResourceManager.cs
-@@ -65,7 +65,7 @@ namespace Ryujinx.Graphics.Shader.Translation
-             _stage = stage;
-             _stagePrefix = GetShaderStagePrefix(stage);
- 
--            _cbSlotToBindingMap = new SetBindingPair[18];
-+            _cbSlotToBindingMap = new SetBindingPair[20];   // TOTK: slot 19 is the bindless slot block (TotkBindless)
-             _sbSlotToBindingMap = new SetBindingPair[16];
-             _cbSlotToBindingMap.AsSpan().Fill(new(-1, -1));
-             _sbSlotToBindingMap.AsSpan().Fill(new(-1, -1));
 @@ -78,7 +78,7 @@ namespace Ryujinx.Graphics.Shader.Translation
              _usedTextures = new();
              _usedImages = new();
