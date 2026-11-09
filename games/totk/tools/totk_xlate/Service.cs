@@ -451,6 +451,7 @@ static partial class ShaderService
         job["early_fragment_tests"] = Truthy(Get(rq, "early_fragment_tests"));   // fragment shaders: NVN control +0x718 (Program.cs QueryGraphicsState)
         if (Get(rq, "arch") is JsonValue arch) job["arch"] = arch.DeepClone();   // "sm86": Ampere code (NVN2, Switch 2); absent: Maxwell
         if (Get(rq, "nvn2_cs") is JsonArray cs) job["nvn2_cs"] = cs.DeepClone();   // an NVN2 compute shader's c[0] layout (Program.cs)
+        if (Truthy(Get(rq, "mvprev"))) job["mvprev"] = true;   // object motion: last frame's position too (Program.cs QueryMotionPrevious)
         if (Get(rq, "shared") is JsonValue sh) job["shared"] = sh.DeepClone();   // compute shared memory bytes when the request knows them (Program.cs)
         return job;
     }
@@ -613,6 +614,13 @@ static partial class ShaderService
         File.WriteAllText(tmp, PyJson(refl, 1, false));
         File.Move(tmp, Path.Combine(outDir, variant + "_v.json"), true);
         WriteMeta(variant, stage, (int)job["set"], res, Convert.FromHexString(GetStr(rq, "c1", "")), attr, inputs);
+        // object motion: "<output location> <banks>" for the C host (location -1: the position depends on no user bank)
+        if (res["mvprev"] is JsonNode mvl)
+        {
+            string mvtmp = Path.Combine(outDir, variant + ".mvprev.tmp");
+            File.WriteAllText(mvtmp, $"{Long(mvl)} {Long(res["mvprev_banks"])}\n");
+            File.Move(mvtmp, Path.Combine(outDir, variant + ".mvprev"), true);
+        }
         // the answers this variant depends on, one per line ("tex 3 2d", "img 1 2d R8G8B8A8Unorm", "attr 0 float", "fout 0 sint"),
         // for the C host's variant lookup; written last, so a variant with a .deps file is complete
         var lines = new StringBuilder();

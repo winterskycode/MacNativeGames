@@ -1115,6 +1115,10 @@ static void ubo_range_note(uint64_t lo, uint64_t hi) {
     if (t_ubo_n == t_ubo_cap) { t_ubo_cap = t_ubo_cap ? t_ubo_cap * 2 : 2048; t_ubo = realloc(t_ubo, t_ubo_cap * sizeof *t_ubo); if (!t_ubo) die("uniform range list"); }
     t_ubo[t_ubo_n++] = (ubo_range_t){lo, hi};
 }
+/* the vertex binding indices whose two-copy neighbours the capture takes (mtl_mv_banks, Vulkan backend; none without
+   it), read once */
+uint32_t mtl_mv_banks(void) __attribute__((weak));
+static uint32_t mv_banks(void) { static int64_t v = -1; if (v < 0) v = mtl_mv_banks ? mtl_mv_banks() : 0; return (uint32_t)v; }
 static void ubo_ranges_sort(ubo_range_t *r, uint32_t n) {   /* LSD radix on lo, 8 bits a pass */
     static __thread ubo_range_t *tmp; static __thread uint32_t tmp_cap;
     if (n < 2) return;
@@ -1160,7 +1164,13 @@ static uint8_t *flatten_recording(const uint8_t *p, size_t hint) {
         else if (h.op == OP_BEGIN && h.size >= 32) nmark++;
         else if (h.op != OP_END && h.op != OP_BEGIN) last_size = h.size;
         if (n + h.size > cap) { while (n + h.size > cap) cap *= 2; out = realloc(out, cap); if (!out) die("command copy allocation"); }
-        if (h.op == OP_BIND_UBO) { p_bind_buf b; memcpy(&b, p + 8, sizeof b); if (b.addr && b.size && b.size <= 65536) ubo_range_note(b.addr, b.addr + b.size); }
+        if (h.op == OP_BIND_UBO) { p_bind_buf b; memcpy(&b, p + 8, sizeof b); if (b.addr && b.size && b.size <= 65536) { ubo_range_note(b.addr, b.addr + b.size);
+            /* per-object motion vectors (Vulkan backend): the game writes these vertex blocks into two copies that take turns,
+               addr and addr +- the size rounded up to 256; the copy not written this frame still holds last frame's when
+               the frame is submitted, so both neighbours are captured with the bound block (a neighbour that is not
+               mapped is zeroed by the capture's fault-safe copy) */
+            if (b.stage == 0 && (unsigned)b.index < 32 && mv_banks() >> b.index & 1) { uint64_t step = (b.size + 255) & ~(uint64_t)255;
+                ubo_range_note(b.addr + step, b.addr + step + b.size); if (b.addr >= step) ubo_range_note(b.addr - step, b.addr - step + b.size); } } }
         if (h.op == OP_CALL) ncall++;
         if (op_indexed(h.op) && idx_ok) {
             if (n - sizeof(copy_prefix) > UINT32_MAX) idx_ok = 0;

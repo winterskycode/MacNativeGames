@@ -146,6 +146,12 @@ static class SwshXlate
         // Android/Vulkan binds no memory pool table and enables no buffer device addresses: an access traced to no storage
         // buffer is dropped there (patch 0008), as before. Mac jobs reach memory through the table.
         public bool QueryHostSupportsRawGlobalMemory() => _job["set"] is null;
+        // Object motion (job "mvprev": true, patch 0009): the vertex shader also writes last frame's position, computed from
+        // slot bank + 40 in place of the user banks c3-c16. res.json's "mvprev" names the output location (-1: none) and
+        // "mvprev_banks" the banks the position depends on (bit n: cn).
+        public bool QueryMotionPrevious() => _job["mvprev"] is JsonValue mv && mv.TryGetValue<bool>(out bool mvb) && mvb;
+        public int MotionPreviousLocation = -1, MotionPreviousBanks;
+        public void ReportMotionPrevious(int location, int banks) => (MotionPreviousLocation, MotionPreviousBanks) = (location, banks);
         public bool QueryHostSupportsTextureShadowLod() => true;
         // Android/Vulkan: Adreno picks a gather's 2x2 footprint differently from Maxwell when the coordinate sits on a texel
         // center, so a gather there returned the row above. Ryujinx's gather bias (1/(size*2^9)) moves it to Maxwell's
@@ -260,6 +266,7 @@ static class SwshXlate
                     foreach (var t in list) if (!(name == "textures" && t.Set == Accessor.BindlessSet && t.ArrayLength == 0 && acc.QueryTotkBindless())) res[name].AsArray().Add((JsonNode)new JsonObject { ["binding"] = t.Binding, ["type"] = (int)t.Type, ["format"] = t.Format.ToString(), ["cbuf_slot"] = t.CbufSlot, ["handle"] = t.HandleIndex, ["array"] = t.ArrayLength, ["separate"] = t.Separate, ["flags"] = (int)t.Flags });
                 if (acc.Bindless.Count > 0)
                     res["bindless"] = new JsonArray(acc.Bindless.Select(b => (JsonNode)new JsonObject { ["handle"] = b.handle, ["cbuf_slot"] = b.cbufSlot, ["type"] = b.type }).ToArray());
+                if (acc.QueryMotionPrevious()) { res["mvprev"] = acc.MotionPreviousLocation; res["mvprev_banks"] = acc.MotionPreviousBanks; }
                 File.WriteAllText(Path.Combine(outDir, key + ".res.json"), res.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
                 return null;
             }
