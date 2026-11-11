@@ -50,7 +50,7 @@ void totk_tl_at(int kind, uint64_t t_ns, uint64_t a, uint64_t b) {
     /* TOTK Android: TOTK_TIMELINE_LEAN=1 keeps only what latency_report.py reads: the buffer otherwise fills in ~250 game frames
        (TL_REC_COPY alone is ~3,500 events a frame), far short of a latency window */
     { static int lean = -1; if (lean < 0) { const char *e = getenv("TOTK_TIMELINE_LEAN"); lean = e && atoi(e) > 0; }
-      if (lean && kind != TL_INPUT && kind != TL_SHOWN && kind != TL_PIXELS && kind != TL_PRES_IN && kind != TL_PRES_OUT) return; }
+      if (lean && kind != TL_INPUT && kind != TL_SHOWN && kind != TL_PIXELS && kind != TL_PRES_IN && kind != TL_PRES_OUT && kind != TL_PLAN && kind != TL_READY) return; }
     uint64_t i = atomic_fetch_add_explicit(&g_n, 1, memory_order_relaxed);
     if (i >= TL_CAP) return;
     uint64_t tid; pthread_threadid_np(NULL, &tid);
@@ -70,7 +70,7 @@ static void tl_write(void) {
     static const char *names[] = {"?", "sub_in", "sub_out", "rep_begin", "rep_end", "commit", "gpu", "wait_in", "wait_out",
                                   "acq_in", "acq_out", "pres_in", "pres_out", "finish_in", "finish_out", "fence", "rs_join",
                                   "pass_begin", "pass_end", "gw_in", "gw_out", "gwake", "cw_in", "cw_out", "wb_in", "wb_out", "wb_step",
-                                  "input", "shown", "pixels", "rec_end", "rec_begin", "rec_copy"};
+                                  "input", "shown", "pixels", "rec_end", "rec_begin", "rec_copy", "plan", "ready"};
     for (uint64_t i = 0; i < n; i++) {
         const tl_ev *e = &g_ev[i];
         fprintf(f, "%llu\t%s\t%u\t%llu\t%llu\t%llu\n", (unsigned long long)e->t, e->kind < sizeof names / sizeof *names ? names[e->kind] : "?",

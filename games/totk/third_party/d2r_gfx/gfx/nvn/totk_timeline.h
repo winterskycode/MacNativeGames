@@ -31,6 +31,8 @@ enum {
     TL_REC_END,                     /* TOTK Android: nvnCommandBufferEndRecording (a = bytes recorded; the thread is the recording thread) */
     TL_REC_BEGIN,                   /* TOTK Android: nvnCommandBufferBeginRecording (a = the command buffer) */
     TL_REC_COPY,                    /* TOTK Android: CopyCommands / CallCommands inlines handle a into command buffer b */
+    TL_PLAN,                        /* TOTK Android: a present's requested time (VK_GOOGLE_display_timing): a = present id, b = desired time (0 none) */
+    TL_READY,                       /* TOTK Android: a present's GPU work finished: t = its copy to the screen image, a = present id, b = the work before it */
 };
 #define TL_INPUT_SCRIPTED (1ull << 40)   /* TL_INPUT a: input.now set stick axis (a & 0xff) to b (latency_report.py: a >> 40) */
 
