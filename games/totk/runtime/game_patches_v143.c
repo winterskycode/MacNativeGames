@@ -186,6 +186,25 @@ static void patch_realtime(Module *m){
    ratio). The shipping game steps at 30 Hz (ratio 1), so the check means "time slowed below 0.3"; above 100 FPS it also
    fires with time running normally. The veneer compares X+0x28 * X+0x38 = 30 / time scale instead: the same value at
    30 Hz, independent of the frame rate. TOTK_HIGHFPS_FIX=0 keeps the original check. */
+/* Equipment-switch cooldown on real time. The player update (main+0x2b0368) steps the countdown at player state +0x109c
+   only while it is above FLT_EPSILON, but the equipment gate (main+0x31cc7c) locks weapon, shield and bow changes while
+   it is above 0. Whole 30 Hz steps reach exactly 0; a measured step can leave a remainder in (0, FLT_EPSILON] that is
+   never stepped again, and equipment stays locked until a load. With real time the threshold is 0, so that remainder
+   is stepped below 0 like any last step. Site from totk-pc-recomp (MIT, recomp/patches-v143.txt). */
+static void patch_switch_cooldown(Module *m){
+    const char *e=getenv("TOTK_REALTIME");if(e&&!strcmp(e,"0"))return;
+    /* movi v1.2s, #0x34, lsl #24 (FLT_EPSILON in both lanes) -> movi v1.2s, #0 */
+    enum { SITE=0x2b036c, ORIGINAL=0x0f016681, REPLACEMENT=0x0f000401 };
+    uint32_t got;memcpy(&got,m->base+SITE,4);
+#if TARGET_OS_IPHONE
+    if(got!=REPLACEMENT)runtime_fail("1.4.3 embedded equipment cooldown patch mismatch");
+#else
+    if(got!=ORIGINAL){fprintf(stderr,"[totk] equipment cooldown main+%#x: found %08x, expected %08x\n",SITE,got,ORIGINAL);
+        runtime_fail("equipment cooldown patch: main does not match 1.4.3");}
+    const uint32_t word=REPLACEMENT;memcpy(m->base+SITE,&word,4);
+#endif
+    fprintf(stderr,"[totk] 1.4.3 equipment-switch cooldown: threshold 0 on real time (main+%#x)\n",SITE);
+}
 static void patch_slowmo_bounce(Module *m){
     const char *e=getenv("TOTK_HIGHFPS_FIX");if(e&&!strcmp(e,"0"))return;
     /* after the ultrawide veneers (+48, 4 x 32 bytes) and the cloth/hair clock (+176, 19 words); read-only data starts
@@ -1842,6 +1861,7 @@ void runtime_game_patches(Module *m) {
     runtime_survey_init(m);
     if (strcmp(m->name, "main")) runtime_fail("1.4.3 game patches expect main");
     patch_realtime(m);
+    patch_switch_cooldown(m);
     patch_output_res(m);
     patch_render_res(m);
     patch_fixed_res(m);
