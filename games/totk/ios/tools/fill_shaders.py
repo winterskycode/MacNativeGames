@@ -13,7 +13,7 @@ usage: fill_shaders.py --tree <work tree> --device <id> [--bundle-id <id>] [--ga
 import argparse, concurrent.futures, hashlib, json, os, platform, re, shutil, subprocess, sys, tempfile, time
 from pathlib import Path
 from xcode_dir import developer_dir
-from compile_seed import METAL_FLAGS
+from compile_seed import METAL_FLAGS, metal_flags, target_flags
 
 TOTK = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(TOTK/'scripts'))
@@ -51,7 +51,7 @@ def append_contribution(contrib, rows):
     """Append the rows the contribution file does not hold yet; returns how many were written.
 
     Rerunning for the same requests (--with-done rebuilds them on purpose) must not grow the file again: it is what
-    players attach to an issue, and the row text is what shader_contrib_watch.merge_rows compares.
+    the game contributes, and the row text is what the shared list compares.
     """
     exists = contrib.exists()
     have = set(contrib.read_text(errors='replace').splitlines()) if exists else set()
@@ -139,7 +139,7 @@ def record(out, variant, write=True):
 def compile_metallib(pack, name, env):
     src = pack/f'{name}.metal'; air = pack/f'{name}.air'
     try:
-        subprocess.run(['xcrun', '-sdk', 'iphoneos', 'metal', *METAL_FLAGS, '-c', str(src), '-o', str(air)], check=True, capture_output=True, env=env)
+        subprocess.run(['xcrun', '-sdk', 'iphoneos', 'metal', *metal_flags(src), *target_flags('iphoneos'), '-c', str(src), '-o', str(air)], check=True, capture_output=True, env=env)
         subprocess.run(['xcrun', '-sdk', 'iphoneos', 'metallib', str(air), '-o', str(pack/f'{name}.metallib')], check=True, capture_output=True, env=env)
         return None
     except subprocess.CalledProcessError as e:   # the device then compiles the MSL source itself
@@ -222,8 +222,8 @@ def main():
         if not variants: raise RuntimeError('no variant could be translated')
         name = time.strftime('%Y%m%d-%H%M%S'); pack = work/name; pack.mkdir()
         count = build_pack(pack, out, variants, ch, env)
-        # What this device needed leaves the repository alone by default: the rows go to the contribution file the
-        # project already submits through a GitHub issue (shader_contrib_watch.py). --update-list also writes the
+        # What this device needed leaves the repository alone by default: the rows go to the Mac's contribution file,
+        # which the game contributes when the player lets it (totk_contrib_upload.h). --update-list also writes the
         # shipped list, which every build reads, for someone who wants the next local build to carry the variant.
         # The pack's index rows are written by build_pack, so the list is merged from the pack after it is built.
         # The contribution file is shared by both games (collect_shader_issues.py sorts each row by its shader key); the
@@ -233,7 +233,7 @@ def main():
         if new:
             added = append_contribution(contribution_file(), [f'V\t{key}\t{deps}' for key, deps in new])
             if added:
-                print(f'contribution file: {added} new variants ({CONTRIBUTION}; shader_contrib_watch.py sends it in an issue)')
+                print(f'contribution file: {added} new variants ({CONTRIBUTION}; the game contributes it)')
         if args.update_list:
             shared.save(shader_list)
             print(f'shared shader list: {len(new)} new variants ({shader_list})')

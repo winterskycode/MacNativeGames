@@ -1,10 +1,13 @@
 """The player's contribution file (totk_shader_contrib.h): written by the runtime, merged by scripts/shader_list.py."""
 import json
+import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.request
+from unittest import mock
 from pathlib import Path
 
 TOTK = Path(__file__).resolve().parents[1] / 'games/totk'
@@ -42,7 +45,7 @@ class ContributionFileTests(unittest.TestCase):
             game = subprocess.run([str(probe), str(contrib), 'game'], capture_output=True, text=True)   # the iPhone / iPad app's tag
             self.assertEqual(game.returncode, 0, game.stderr)
             self.assertEqual(json.loads(game.stdout)['status'], 'pass')
-            self.assertEqual(watch.contribution_game(contrib.read_text()), 'TOTK 1.4.3')
+            self.assertIn('\n# Game: TOTK 1.4.3\n', contrib.read_text())
             prune = subprocess.run([str(probe), str(contrib), 'prune'], capture_output=True, text=True)   # served and sent rows leave
             self.assertEqual(prune.returncode, 0, prune.stderr)
             self.assertEqual(json.loads(prune.stdout)['status'], 'pass')
@@ -69,18 +72,12 @@ class IssueCollectionTests(unittest.TestCase):
         self.assertEqual(attachment_urls(None), [])
 
     def test_an_automatic_submission_is_read_like_a_form_issue(self):
-        link = watch.gist_raw('https://gist.github.com/someone/0123abcd\n')
-        self.assertEqual(link, 'https://gist.githubusercontent.com/someone/0123abcd/raw/shader-list-contribution.txt')
-        self.assertIsNone(watch.gist_raw('error: HTTP 401'))
-        body = watch.issue_body('iPad', link)
+        # How the gh submissions of the Mac's device reminder laid out their issues (the reminder went on 2026-11-10: the
+        # devices contribute over HTTPS now); issues sent that way are still merged.
+        link = 'https://gist.githubusercontent.com/someone/0123abcd/raw/shader-list-contribution.txt'
+        body = ('### Game version / 游戏版本\n\n1.4.3\n\n### Device / 设备\n\niPhone\n\n'
+                f'### shader-list-contribution.txt\n\n{link}\n\n### Where you played (optional) / 玩了哪些地方（可选）\n\n_No response_\n')
         self.assertEqual(attachment_urls(body), [link])
-        self.assertIn('### Device / 设备\n\niPad\n', body)
-        self.assertNotIn('udid', body.lower())
-        self.assertIn('### Game version / 游戏版本\n\nSent automatically / 自动提交\n', body)   # an app from before the tag
-        tagged = watch.issue_body('iPhone', link, 'TOTK 1.4.3')   # the device's file names its game and version (2026-10-29)
-        self.assertIn('### Game version / 游戏版本\n\n1.4.3\n\n### Device / 设备\n\niPhone\n', tagged)
-        self.assertEqual(watch.contribution_game('# x\n# Game: TOTK 1.2.1\nV\ta\t{}\n# Game: TOTK 1.4.3\n'), 'TOTK 1.4.3')
-        self.assertIsNone(watch.contribution_game('# Game: TOTK\n# Game: TOTK 1.4.3 and more\nV\ta\t{}\n'))
 
     def test_only_shader_rows_are_taken(self):
         text = '\n'.join([
@@ -116,6 +113,18 @@ class IssueCollectionTests(unittest.TestCase):
         self.assertEqual(games['totk'], ({(self.KEY_A, '{}')}, [own]))
         self.assertEqual(games['botw'], ({(self.KEY_B, '{}')}, [compute]))
         self.assertEqual(unknown, ({(key_c, '{}')}, [mixed, foreign]))
+
+    def test_a_row_two_games_hold_is_theirs_not_unknown(self):
+        # Tears of the Kingdom and Breath of the Wild share shaders (2026-11-10: 1,880 BotW pipelines whose every shader both
+        # lists hold had counted as unknown, and a plain title then gave them to Ocarina of Time)
+        both_key, botw_key = 'b' * 64, 'd' * 64
+        keys = {'totk': {both_key}, 'botw': {both_key, botw_key}}
+        both, botw_pipe = self.pipeline(both_key, both_key), self.pipeline(both_key, botw_key)
+        held = (set(), [])
+        games, unknown = route({(both_key, '{}')}, [both, botw_pipe], keys, held)
+        self.assertEqual(games, {'botw': (set(), [botw_pipe])})   # only Breath of the Wild holds both its shaders
+        self.assertEqual(held, ({(both_key, '{}')}, [both]))
+        self.assertEqual(unknown, (set(), []))
 
     def test_shader_keys_come_from_a_seed_or_a_list(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -178,6 +187,69 @@ class OtherGamesTests(unittest.TestCase):
         line, per_game = collect_shader_issues.merge_issue(issue, lists, keys, {}, '', False)
         return lists, line, per_game
 
+    def seeded_keys(self, game):
+        keys = {g: set() for g in collect_shader_issues.GAMES}
+        keys[game] = {self.KEY_A}
+        return keys
+
+    def test_a_seeded_game_named_in_the_title_takes_the_rows_no_seed_names(self):
+        body = f'```\nV\t{self.KEY_W}\t{{}}\n```'   # a shader outside the seed: new to the list, so it is collected
+        for title, game in (('Shader list (Breath of the Wild): 1 shaders', 'botw'),
+                            ('Shader list: 5227 shaders from Mac (TOTK 1.0.0)', 'totk')):
+            with self.subTest(title=title):
+                lists, line, per_game = self.merge(self.issue(title, body), self.seeded_keys(game))
+                self.assertEqual(lists[game].variants, {(self.KEY_W, '{}')})
+                self.assertEqual(per_game, {game: (1, 1)})
+                self.assertNotIn('neither game has', line)
+
+    def test_a_title_that_names_no_game_leaves_unknown_rows_open(self):
+        body = f'```\nV\t{self.KEY_W}\t{{}}\n```'
+        lists, line, per_game = self.merge(self.issue('Shader list: my iPhone, 2 hours', body), self.seeded_keys('totk'))
+        self.assertEqual(lists['totk'].variants, set())
+        self.assertIsNone(per_game)
+        self.assertIn('neither game has', line)
+
+    def test_known_rows_of_the_other_seeded_game_stay_with_it(self):
+        keys = self.seeded_keys('totk')
+        body = f'```\nV\t{self.KEY_A}\t{{}}\nV\t{self.KEY_W}\t{{}}\n```'
+        lists, _, per_game = self.merge(self.issue('Shader list (Breath of the Wild): 2 shaders', body), keys)
+        self.assertEqual(lists['totk'].variants, {(self.KEY_A, '{}')})
+        self.assertEqual(lists['botw'].variants, {(self.KEY_W, '{}')})
+        self.assertEqual(per_game, {'totk': (1, 1), 'botw': (1, 1)})
+
+    def test_a_plain_title_whose_known_rows_are_one_games_gives_it_the_rest(self):
+        body = f'```\nV\t{self.KEY_A}\t{{}}\nV\t{self.KEY_W}\t{{}}\n```'   # one install's file: one game's shaders
+        lists, line, per_game = self.merge(self.issue('Shader list:', body), self.seeded_keys('totk'))
+        self.assertEqual(lists['totk'].variants, {(self.KEY_A, '{}'), (self.KEY_W, '{}')})
+        self.assertEqual(per_game, {'totk': (2, 2)})
+        self.assertNotIn('neither game has', line)
+
+    def test_a_file_with_two_games_rows_leaves_the_rest_unknown(self):
+        key_b = 'b' * 64
+        keys = self.seeded_keys('totk'); keys['botw'] = {key_b}
+        body = f'```\nV\t{self.KEY_A}\t{{}}\nV\t{key_b}\t{{}}\nV\t{self.KEY_W}\t{{}}\n```'
+        lists, line, per_game = self.merge(self.issue('Shader list:', body), keys)
+        self.assertIsNone(per_game)
+        self.assertIn('1 rows of shaders neither game has', line)
+
+    def test_pokopia_issues_are_its_own_game(self):
+        titled = collect_shader_issues.titled_game
+        self.assertEqual(titled(self.issue('Shader list: 167 shaders from Mac (Pokopia 2.0.1)')), 'pokopia')
+
+    def test_the_report_is_what_the_merge_found(self):
+        issue = self.issue('Shader list (Breath of the Wild): 1 shaders', number=7)
+        report = collect_shader_issues.merged_report([(issue, {'botw': (3, 1)})])
+        self.assertEqual(report, [{'number': 7, 'titled': 'botw', 'per_game': {'botw': [3, 1]}}])
+
+    def test_bananza_issues_are_its_own_game(self):
+        titled = collect_shader_issues.titled_game
+        self.assertEqual(titled(self.issue('Shader list: 1120 shaders from Mac (Bananza v458752)')), 'dkb')
+        self.assertEqual(titled(self.issue('Shader list (Donkey Kong Bananza): Mac v458752, en')), 'dkb')
+        body = f'```\nV\t{self.KEY_W}\t{{}}\n```'
+        keys = {g: set() for g in collect_shader_issues.GAMES}
+        lists, _, _ = self.merge(self.issue('Shader list: 1 shaders from Mac (Bananza v458752)', body), keys)
+        self.assertEqual(lists['dkb'].variants, {(self.KEY_W, '{}')})
+
     def test_another_game_takes_every_row_no_seeded_game_has(self):
         keys = {g: set() for g in collect_shader_issues.GAMES}; keys['totk'] = {self.KEY_A}
         body = f'```\nV\t{self.KEY_A}\t{{}}\nV\t{self.KEY_W}\t{{}}\n```'   # a file shared with Tears of the Kingdom
@@ -197,6 +269,19 @@ class OtherGamesTests(unittest.TestCase):
         self.assertIsNone(per_game)
         self.assertIn('neither game has', line)
 
+    def test_rows_two_seeded_games_hold_never_go_to_the_other_game(self):
+        # a plainly titled file whose known rows are one other game's gives it the rows no game has, not the rows Tears of
+        # the Kingdom and Breath of the Wild both hold (2026-11-10, #2000 #2005 #2007: those went to Ocarina of Time)
+        both_key = 'b' * 64
+        keys = {g: set() for g in collect_shader_issues.GAMES}
+        keys['totk'] = {both_key}; keys['botw'] = {both_key}; keys['wonder'] = {self.KEY_W}
+        body = f'```\nV\t{self.KEY_W}\t{{}}\nV\t{both_key}\t{{}}\nV\t{"f" * 64}\t{{}}\n```'
+        lists, line, per_game = self.merge(self.issue('Shader list:', body), keys)
+        self.assertEqual(lists['wonder'].variants, {(self.KEY_W, '{}'), ('f' * 64, '{}')})
+        self.assertEqual(lists['totk'].variants | lists['botw'].variants, set())
+        self.assertEqual(per_game, {'wonder': (2, 2)})
+        self.assertIn('1 rows two games share', line)
+
     def test_a_pipeline_naming_a_bind_state_the_file_does_not_give_is_not_merged(self):
         keys = {g: set() for g in collect_shader_issues.GAMES}; keys['totk'] = {self.KEY_A}
         deps = '{"tex":{"0":"cube"}}'
@@ -209,6 +294,20 @@ class OtherGamesTests(unittest.TestCase):
         self.assertEqual(len(lists['totk'].warm), 1)
         self.assertIn('1 naming bind states the file does not give', line)
         self.assertIn(named[65:77], lists['totk'].answers)
+
+    def test_another_games_pipeline_naming_a_bind_state_the_file_does_not_give_is_not_merged(self):
+        # 2026-11-11, #2020 / PR #2092: two such rows reached Pokopia's list (only the seeded games were checked), and
+        # packaging stopped in resolve with a KeyError
+        keys = {g: set() for g in collect_shader_issues.GAMES}; keys['wonder'] = {self.KEY_W}
+        deps = '{"tex":{"0":"cube"}}'
+        named = f'{self.KEY_W}-{suffix(answers_for(json.loads(deps)))}_b'
+        def key(vs, fs):
+            return (vs.encode().ljust(80, b'\0') + fs.encode().ljust(80, b'\0') + b'\x07' * 40).hex()
+        body = (f'```\nV\t{self.KEY_W}\t{deps}\nR\t{key(named, named)}\n'
+                f'R\t{key(self.KEY_W + "-" + "9" * 12 + "_b", named)}\n```')
+        lists, line, per_game = self.merge(self.issue('Shader list (Super Mario Bros. Wonder): 3 rows', body), keys)
+        self.assertEqual(len(lists['wonder'].warm), 1)
+        self.assertIn('1 naming bind states the file does not give', line)
 
     def test_another_game_s_reply_names_its_own_list(self):
         reply = reply_text({'wonder': (40, 12)}, 'wonder')
@@ -235,94 +334,178 @@ class OtherGamesTests(unittest.TestCase):
                 collect_shader_issues.GAMES['odyssey'] = saved
 
 
-sys.path.insert(0, str(TOTK / 'ios/tools'))
-import shader_contrib_watch as watch  # noqa: E402
 
+class OcarinaOfTimeTests(unittest.TestCase):
+    """Ocarina of Time's issues go through its own shader_list.py (collect_shader_issues.OWN_SCRIPT): its list keeps mesh
+    pipelines (M rows) TOTK's script does not know, and the bind state of every pipeline (2026-11-09, #1980-#1991)."""
+    LIST = TOTK.parent / 'oot/assets/shader_list.tsv'
 
-class MacReminderForDevicesTests(unittest.TestCase):
-    def test_only_paired_reachable_ios_devices(self):
-        listing = {'result': {'devices': [
-            {'identifier': 'A', 'deviceProperties': {'name': 'iPhone'}, 'hardwareProperties': {'platform': 'iOS', 'udid': 'u-a'},
-             'connectionProperties': {'pairingState': 'paired', 'transportType': 'localNetwork', 'tunnelState': 'disconnected'}},
-            {'identifier': 'B', 'deviceProperties': {'name': 'iPad'}, 'hardwareProperties': {'platform': 'iOS', 'udid': 'u-b'},
-             'connectionProperties': {'pairingState': 'paired'}},                                   # not reachable now
-            {'identifier': 'E', 'deviceProperties': {'name': 'Tablet'}, 'hardwareProperties': {'platform': 'iOS', 'udid': 'u-e', 'deviceType': 'iPad'},
-             'connectionProperties': {'pairingState': 'paired', 'transportType': 'wired'}},
-            {'identifier': 'C', 'hardwareProperties': {'platform': 'watchOS'}, 'connectionProperties': {'pairingState': 'paired', 'transportType': 'wired'}},
-            {'identifier': 'D', 'hardwareProperties': {'platform': 'iOS'}, 'connectionProperties': {'pairingState': 'unpaired', 'transportType': 'wired'}}]}}
-        self.assertEqual(watch.reachable_devices(listing), [('A', 'u-a', 'iPhone', 'iPhone'), ('E', 'u-e', 'Tablet', 'iPad')])
-        self.assertEqual(watch.reachable_devices({}), [])
+    @staticmethod
+    def issue(title, body='', number=1):
+        return {'number': number, 'title': title, 'body': body, 'labels': [], 'comments': [], 'author': {'login': 'p'}}
 
-    def test_the_game_is_found_by_name_or_bundle(self):
-        self.assertEqual(watch.game_bundle({'result': {'apps': [{'name': 'Other', 'bundleIdentifier': 'x.y'},
-                                                                 {'name': 'Tears of the Kingdom', 'bundleIdentifier': 'com.someone.totk'}]}}), 'com.someone.totk')
-        self.assertEqual(watch.game_bundle({'result': {'apps': [{'name': 'TOTK', 'bundleIdentifier': 'org.macnativegames.totk'}]}}), 'org.macnativegames.totk')
-        self.assertIsNone(watch.game_bundle({'result': {'apps': [{'name': 'Other', 'bundleIdentifier': 'x.y'}]}}))
+    def test_the_launcher_titles_name_it(self):
+        titled = collect_shader_issues.titled_game
+        self.assertEqual(titled(self.issue('Shader list: 2557 shaders from Mac (OcarinaOfTime 1.0.0)')), 'oot')
+        self.assertEqual(titled(self.issue('Shader list: 151 shaders from Mac (OcarinaOfTime 2.0.0)')), 'oot')
 
-    def test_rows_and_every_100(self):
-        text = '# header\n' + ''.join(f'V\t{i:064x}\t{{}}\n' for i in range(3)) + f'V\t{0:064x}\t{{}}\n' + 'R\tab\n' + 'R\tab\n'
-        self.assertEqual(watch.contribution_rows(text), 4)   # shaders and pipelines together
-        self.assertFalse(watch.due(99, 0)); self.assertTrue(watch.due(100, 0))
-        self.assertFalse(watch.due(199, 100)); self.assertTrue(watch.due(200, 100))
+    def test_its_rows_in_a_plain_titled_file_go_through_its_own_merge(self):
+        # until ca3c4ad6 it wrote the contribution file TotK and BotW share, so one file holds rows of each (2026-11-10, #2000):
+        # the rows routed to it are merged as an issue titled for it is, keeping each warm row's bind state (A row)
+        oot_key, botw_key = 'a' * 64, 'd' * 64
+        keys = {g: set() for g in collect_shader_issues.GAMES}; keys['oot'] = {oot_key}; keys['botw'] = {botw_key}
+        lists = {g: ShaderList() for g in collect_shader_issues.GAMES}
+        seen = []
+        def own(label, texts, problems, game, shared):
+            seen.append((game, texts))
+            return '; oot 1 rows (1 new)', {'oot': (1, 1)}
+        body = f'```\nV\t{oot_key}\t{{}}\nV\t{botw_key}\t{{}}\n```'
+        with mock.patch.object(collect_shader_issues, 'merge_own_texts', own):
+            line, per_game = collect_shader_issues.merge_issue(self.issue('Shader list:', body), lists, keys, {}, '', False)
+        self.assertEqual(seen, [('oot', [f'V\t{oot_key}\t{{}}\n'])])
+        self.assertEqual(lists['botw'].variants, {(botw_key, '{}')})
+        self.assertEqual(per_game, {'oot': (1, 1), 'botw': (1, 1)})
 
-    def test_a_device_s_rows_are_merged_into_the_one_file(self):
-        with tempfile.TemporaryDirectory() as d:
-            d = Path(d); phone, mine = d / 'phone.txt', d / 'shader-list-contribution.txt'
-            mine.write_text('# Mac\nR\tab\nV\t' + 'a' * 64 + '\t{}\n')
-            phone.write_text('# phone\nR\tab\nR\tcd\nR\tcd\nB\tcd\t-\t-\n')
-            self.assertEqual(watch.merge_rows(phone, mine), 4)      # ab and the V row, then cd and its B row once
-            self.assertEqual(watch.merge_rows(phone, mine), 4)      # nothing new the second time
-            fresh = d / 'new.txt'
-            self.assertEqual(watch.merge_rows(phone, fresh), 3)
-            self.assertTrue(fresh.read_text().startswith('# '))
-
-    def test_rows_sent_or_served_are_not_merged_again(self):
-        with tempfile.TemporaryDirectory() as d:
-            d = Path(d); phone, mine = d / 'phone.txt', d / 'shader-list-contribution.txt'
-            done = d / '.shader-list-contribution.txt.done'   # totk_shader_contrib.h totk_contrib_side(path, "done")
-            mine.write_text('# Mac\nR\tab\n')
-            done.write_text('R\tcd\n')
-            phone.write_text('# phone\nR\tcd\nT\tef\t1:0;\nV\t' + 'a' * 64 + '\t{}\n')
-            self.assertEqual(watch.merge_rows(phone, mine), 3)      # ab, the T row and the V row; cd was sent
-            self.assertNotIn('R\tcd', mine.read_text())
-
-    def test_a_sent_file_keeps_only_what_came_after(self):
-        with tempfile.TemporaryDirectory() as d:
-            d = Path(d); mine = d / 'shader-list-contribution.txt'
-            done, state = d / '.shader-list-contribution.txt.done', d / '.shader-list-contribution.txt.reminded'
-            mine.write_text('# Mac\n# Game: TOTK 1.4.3\nR\tab\nR\tcd\nT\tef\t1:0;\n')
-            state.write_text('3\n')
-            self.assertEqual(watch.retire(mine, {'R\tab', 'T\tef\t1:0;'}), 2)
-            self.assertEqual(mine.read_text(), '# Mac\n# Game: TOTK 1.4.3\nR\tcd\n')
-            self.assertEqual(set(done.read_text().splitlines()), {'R\tab', 'T\tef\t1:0;'})
-            self.assertEqual(state.read_text(), '1\n')                # the reminder counts from the row left
-            state.write_text('never\n')
-            watch.retire(mine, {'R\tcd'})
-            self.assertEqual(state.read_text(), 'never\n')
-
-    def test_agent_runs_check_every_ten_minutes_with_the_xcode(self):
-        plist = watch.agent_plist('/usr/bin/python3', Path('/x/shader_contrib_watch.py'), '/X/Xcode.app/Contents/Developer')
-        self.assertEqual(plist['ProgramArguments'], ['/usr/bin/python3', '/x/shader_contrib_watch.py', 'check'])
-        self.assertEqual(plist['StartInterval'], 600)
-        stored = watch.agent_plist('/usr/bin/python3', Path('/x/w.py'), '/X', Path('/Users/me/MacNativeGames/shader-list-contribution'))
-        self.assertEqual(stored['ProgramArguments'][2:], ['check', '--store', '/Users/me/MacNativeGames/shader-list-contribution'])   # the clone
-        self.assertEqual(plist['EnvironmentVariables'], {'DEVELOPER_DIR': '/X/Xcode.app/Contents/Developer'})
-        self.assertFalse(plist['RunAtLoad'])
-
-    def test_never_stops_the_reminders(self):
-        self.assertEqual(watch.reminded_at(''), 0)
-        self.assertEqual(watch.reminded_at('500\n'), 500)
-        self.assertIsNone(watch.reminded_at('never\n'))
-        self.assertEqual(watch.message(500, 'iPad')[2:], ('Remind me next time', "Don't remind me again", 'Send')
-                         if not watch.chinese() else ('下次提醒', '不要提醒了', '发送'))
-
-    def test_gh_replaces_remind_me_next_time_with_submit(self):
-        self.assertEqual(watch.message(500, 'iPad', auto=True)[2:], ('Submit automatically', "Don't remind me again", 'Send')
-                         if not watch.chinese() else ('自动提交', '不要提醒了', '发送'))
-        with tempfile.TemporaryDirectory() as tmp:   # no gh on PATH or in the usual places: no automatic button
-            old = (watch.GH_CANDIDATES, watch.shutil.which)
-            watch.GH_CANDIDATES, watch.shutil.which = (str(Path(tmp) / 'gh'),), lambda name: None
+    @unittest.skipUnless(LIST.is_file(), 'needs the Ocarina of Time list')
+    def test_merged_by_its_own_script_keeping_mesh_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'games/oot/assets/shader_list.tsv'; path.parent.mkdir(parents=True)
+            shutil.copy2(self.LIST, path)
+            meshes = sum(1 for line in path.read_text().splitlines() if line.startswith('M\t'))
+            self.assertGreater(meshes, 0)
+            shared = collect_shader_issues.load_list('oot', path)
+            key = 'f' * 64
+            line, per_game = collect_shader_issues.merge_own(self.issue('Shader list: 1 shaders from Mac (OcarinaOfTime 2.0.0)',
+                                                                         f'```\nV\t{key}\t{{}}\n```'), 'oot', shared, token='')
+            self.assertEqual(per_game, {'oot': (1, 1)}, line)
+            saved = collect_shader_issues.GAMES['oot']
+            collect_shader_issues.GAMES['oot'] = (path, *saved[1:])
             try:
-                self.assertIsNone(watch.gh_path())
+                collect_shader_issues.save_list('oot', shared)
             finally:
-                watch.GH_CANDIDATES, watch.shutil.which = old
+                collect_shader_issues.GAMES['oot'] = saved
+            text = path.read_text()
+            self.assertTrue(text.startswith('# Ocarina of Time'), text[:60])
+            self.assertEqual(sum(1 for line in text.splitlines() if line.startswith('M\t')), meshes)
+            self.assertIn(f'V\t{key}\t{{}}', text)
+
+
+class ShaderInboxTests(unittest.TestCase):
+    """Rows the apps sent over HTTPS (the shader inbox) merge as an issue titled for the game they name."""
+    KEY_A, KEY_W = 'a' * 64, 'c' * 64
+
+    @staticmethod
+    def pending(rows):
+        return [{'id': str(i + 1), 'kind': r[0], 'body': r, 'players': 1, 'versions': ['1.0.0'], 'platforms': ['mac']}
+                for i, r in enumerate(rows)]
+
+    def merge(self, by_game, keys=None):
+        keys = keys or {g: set() for g in collect_shader_issues.GAMES}
+        lists = {g: ShaderList() for g in collect_shader_issues.GAMES}
+        with mock.patch.object(collect_shader_issues, 'inbox_pending', lambda base, token, game: by_game.get(game, [])):
+            done = collect_shader_issues.merge_inbox('https://inbox.test', 't', lists, keys, {}, False)
+        return lists, keys, {game: (line, ids) for line, game, ids in done}
+
+    def test_rows_go_to_the_game_the_app_named(self):
+        lists, keys, done = self.merge({'wonder': self.pending([f'V\t{self.KEY_W}\t{{}}'])})
+        self.assertEqual(lists['wonder'].variants, {(self.KEY_W, '{}')})
+        self.assertEqual(done['wonder'][1], ['1'])
+        self.assertIn(self.KEY_W, keys['wonder'], 'teaches plain-titled issues the game\'s keys')
+
+    def test_a_seeded_game_takes_rows_no_seed_names(self):
+        lists, _, done = self.merge({'botw': self.pending([f'V\t{self.KEY_W}\t{{}}', f'V\t{self.KEY_A}\t{{}}'])})
+        self.assertEqual(lists['botw'].variants, {(self.KEY_W, '{}'), (self.KEY_A, '{}')})
+        self.assertEqual(lists['totk'].variants, set())
+        self.assertEqual(done['botw'][1], ['1', '2'])
+
+    def test_a_failed_export_takes_nothing(self):
+        def broken(base, token, game):
+            raise ValueError('/v1/export: HTTP 401 unauthorized')
+        lists = {g: ShaderList() for g in collect_shader_issues.GAMES}
+        with mock.patch.object(collect_shader_issues, 'inbox_pending', broken):
+            done = collect_shader_issues.merge_inbox('https://inbox.test', 't', lists, {g: set() for g in lists}, {}, False)
+        self.assertTrue(done and all(ids == [] and 'HTTP 401' in line for line, _, ids in done))
+
+    def test_pending_follows_the_pages(self):
+        pages = {0: {'rows': [{'id': '1'}, {'id': '2'}], 'next': '2'}, 2: {'rows': [{'id': '3'}], 'next': None}}
+        asked = []
+        def call(base, token, path, payload=None):
+            asked.append(path)
+            return pages[int(path.split('after=')[1].split('&')[0])]
+        with mock.patch.object(collect_shader_issues, 'inbox_call', call):
+            rows = collect_shader_issues.inbox_pending('https://inbox.test', 't', 'totk')
+        self.assertEqual([r['id'] for r in rows], ['1', '2', '3'])
+        self.assertEqual(len(asked), 2)
+        self.assertTrue(all(p.startswith('/v1/export?game=totk&') for p in asked))
+
+
+class ShaderInboxScheduleTests(unittest.TestCase):
+    """Every game's copy of the upload (user 2026-11-10): the question has no row threshold, one upload at each start,
+    then one an hour."""
+
+    def test_every_copy_asks_without_rows_and_uploads_at_start_then_on_a_timer(self):
+        # The three Zelda games (games/totk: TotK and BotW; games/oot) send every half hour (user 2026-11-11: "开机和半小时间隔"),
+        # the other games every hour.
+        copies = sorted(TOTK.parent.glob('*/third_party/d2r_gfx/gfx/nvn/totk_contrib_upload.h'))
+        self.assertGreaterEqual(len(copies), 7)
+        for copy in copies:
+            text = copy.read_text()
+            ask = text[text.index('static inline NSUInteger totk_inbox_should_ask'):]
+            ask = ask[:ask.index('\n}\n')]
+            self.assertNotIn('totk_contrib_due', ask, f'{copy}: the question waits for rows')
+            zelda = copy.relative_to(TOTK.parent).parts[0] in ('totk', 'oot')
+            every = '(30 * 60)' if zelda else '(60 * 60)'
+            self.assertIn(f'#define TOTK_INBOX_EVERY {every}', text, f'{copy}: not every {"half hour" if zelda else "hour"}')
+            self.assertIn('#define TOTK_INBOX_FIRST 20', text, f'{copy}: no upload at the start')
+
+
+# The inbox is a project of its own (not in this repository): $SHADER_INBOX_DIR, else MacNativeGamesWeb/shader-inbox beside it.
+INBOX = Path(os.environ.get('SHADER_INBOX_DIR') or TOTK.parents[2] / 'MacNativeGamesWeb/shader-inbox')
+
+
+@unittest.skipUnless(shutil.which('xcrun') and shutil.which('node') and (INBOX / 'node_modules/@electric-sql/pglite').is_dir(),
+                     'needs the Xcode command line tools, node and the shader inbox (SHADER_INBOX_DIR) with npm install')
+class ShaderInboxUploadTests(unittest.TestCase):
+    """The app's upload (totk_contrib_upload.h) against the inbox's own handlers on 127.0.0.1 (test/local-server.js)."""
+
+    def build(self, tmp, url):
+        probe = tmp / f'probe-{len(list(tmp.iterdir()))}'
+        build = subprocess.run(['xcrun', 'clang', '-fobjc-arc', '-Wall', '-Wextra', '-Werror', f'-DTOTK_CONTRIB_INBOX="{url}"',
+                                f'-I{TOTK}/third_party/d2r_gfx/gfx/nvn', str(TOTK / 'tests/shader_contrib/inbox_probe.m'),
+                                '-framework', 'Foundation', '-o', str(probe)], capture_output=True, text=True)
+        self.assertEqual(build.returncode, 0, build.stderr[-600:])
+        return probe
+
+    def test_rows_go_to_the_inbox_once_and_leave_the_file(self):
+        server = subprocess.Popen(['node', str(INBOX / 'test/local-server.js')], cwd=INBOX, stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, text=True)
+        try:
+            port = int(server.stdout.readline().split()[1])
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp = Path(tmp)
+                probe = self.build(tmp, f'http://127.0.0.1:{port}/v1/contrib')
+                run = subprocess.run([str(probe), str(tmp / 'shader-list-contribution.txt'), 'up'], capture_output=True, text=True, timeout=120)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                result = json.loads(run.stdout)
+                self.assertEqual(result['status'], 'pass')
+                with urllib.request.urlopen(f'http://127.0.0.1:{port}/admin/rows?game=totk', timeout=30) as reply:
+                    rows = json.loads(reply.read())['data']['rows']
+                self.assertEqual(sorted(r['kind'] for r in rows), ['B', 'R', 'V'])
+                self.assertTrue(all(r['players'] == 1 and r['versions'] == ['1.4.3'] and r['platforms'] == ['mac'] for r in rows))
+                with urllib.request.urlopen(f'http://127.0.0.1:{port}/admin/uploads?game=totk', timeout=30) as reply:
+                    uploads = json.loads(reply.read())['data']
+                model = subprocess.run(['sysctl', '-n', 'hw.model'], capture_output=True, text=True).stdout.strip()
+                self.assertEqual([(u['install'], u['platform'], u['device'], u['game_version'], u['shaders_sent'], u['pipelines_sent'])
+                                  for u in uploads], [(result['install'], 'mac', model, '1.4.3', 1, 2)],
+                                 'one upload: this Mac\'s model, the rows by kind')
+                self.assertRegex(uploads[0]['os'], r'^macOS \d+\.\d+\.\d+$')
+        finally:
+            server.stdin.close(); server.wait(timeout=30); server.stdout.close()
+
+    def test_without_an_answer_the_rows_stay(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            probe = self.build(tmp, 'http://127.0.0.1:9/v1/contrib')   # the discard port: nothing listens
+            run = subprocess.run([str(probe), str(tmp / 'shader-list-contribution.txt'), 'down'], capture_output=True, text=True, timeout=120)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertEqual(json.loads(run.stdout)['status'], 'pass')

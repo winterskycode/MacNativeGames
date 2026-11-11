@@ -63,6 +63,7 @@ static _Atomic uint64_t g_taa_last;     // game frame of the last edge smoothing
 #include "nvn_geometry.h"   // geometry stages as compute: the capture record (GEO_CAPTURE_WORDS) the shader loader reads, the assembly nvn_geometry_rt.inc uses
 #include "nvn_texture_plan.h"
 #include "fps_overlay.h"
+#include "fps_board.h"   /* the leaderboard's frame-rate record: game presents after the world started (present_now) */
 #include "nvn_cover.h"
 #include "totk_shader_scope.h"   // totk_shader_scope_contains: the warm-up scope (PR #84)
 #include "dmsh_chain.h"   // DMSH_CHAIN：本源码树期望的 B 着色器库翻译链版本 | DMSH_CHAIN: the translation chain version of the B shader library expected by this source tree
@@ -245,6 +246,145 @@ static void q4_commit(id<MTL4CommandBuffer> cb, TotkCommitOptions *o) {
 static void cb_commit(id<MTLCommandBuffer> cb) { bg_gate(); if (!nogpu()) [cb commit]; }
 static void cb_wait(id<MTLCommandBuffer> cb) { if (!nogpu()) [cb waitUntilCompleted]; }
 static uint64_t g_fence;                        // 已提交的最大栅栏值（提交线程独占递增） | Highest committed fence value (incremented exclusively by the submit thread)
+/* Stereo by replaying a submission once per eye (vr开发.md section 23; "flag stereo_replay 1", off by default): the game
+   runs and records once, with a frustum that covers both eyes; hle_nvn.c submit_exec replays the submission for the left
+   eye (g_eye_pass 1), then for the right (2). The two replays are one submission of the game's: the GPU writes and pending
+   updates the first replay leaves (its fence, g_eye_skip_fence during the second) are not an earlier submission's for the
+   second one: its uniform copies (usnap_take) and their pending-write overlay (pend_overlay_x) pass them over, as a single
+   replay would not have seen them; later submissions treat them as any other. Event signals, the CPU's synchronisation
+   with the frame, stay with the second replay; counter reports and resets run in both (commands of the same replay read
+   what they write). */
+int g_eye_pass; static uint64_t g_eye_skip_fence; static _Atomic int g_stereo_replay;
+/* TOTK_VR_STEREO=1 at start turns the stereo replay with the eye's projection on (as "flag stereo_replay 2" does later). */
+static void stereo_replay_init(void) {   // applied once the VR camera runs (the first submissions come before the headset is there)
+    static int want = -1, applied; if (want < 0) { const char *e = getenv("TOTK_VR_STEREO"); want = e && *e == '1' && !e[1]; }
+    if (want && !applied && vr_wants_camera()) { applied = 1; atomic_store(&g_stereo_replay, 2); MLOG("[vr] stereo replay on from the start (TOTK_VR_STEREO=1)"); } }
+int mtl_stereo_replay(void) { stereo_replay_init(); return atomic_load(&g_stereo_replay) != 0; }
+int mtl_stereo_project(void) { return atomic_load(&g_stereo_replay) == 2; }   // "flag stereo_replay 2": also the eye's projection (1: the same picture twice, a check of the replay alone)
+/* Each eye replay's picture: the last pass it drew into a texture the game presents (their serials are noted at every
+   present, with the picture's rectangle), copied at the replay's end into one side of a side-by-side texture; after the
+   right eye's the pair goes to the headset as one source with each eye's rays and the frame's rotation (the path of
+   Breath of the Wild's native stereo, vr_source_encode_stereo). g_eye_have: this replay got the eye's projection. */
+static uint64_t g_eye_presented[4]; static int g_eye_npresented, g_eye_crop[4], g_eye_crop_have, g_eye_have[2], g_eye_pair_ok;
+static id<MTLTexture> g_eye_swap, g_eye_sbs; static float g_eye_view[12], g_eye_fov[2][4];
+static _Atomic uint64_t g_eye_pairs, g_eye_nopic;
+static void eye_note_pass(MTL4RenderPassDescriptor *pd);
+static inline void args_dirty_all(void);
+/* Stereo replay: passes that do not depend on the eye are drawn once ("flag eye_share 0|1|2": off, judged and logged
+   only, their draws and clears left out of the right eye's replay). A segment is the commands from one SetRenderTargets
+   to the next; both replays walk the same recordings, so the n-th segment of the right replay is the n-th of the left
+   (its op's address is checked). Judged during the left replay, by what the segment really uses:
+   - dependent: a draw binds a uniform range that holds a matrix mtl_ucap_eye replaced for the eye; or it samples a
+     texture a dependent segment wrote in this submission; or it draws into such a texture;
+   - not to be left out although independent: a counter is reported after it (the CPU reads the right replay's count); a
+     target of it is cleared or copied into outside segments, read and then written again (a reader between two writers
+     must see the first), or shared with a segment that runs; its ops were hoisted, frozen or deferred.
+   Left out, the targets keep what the left replay drew: the same picture, as nothing eye-dependent went into it.
+   Not seen by this: buffers a compute dispatch writes from a replaced matrix and an independent draw reads. */
+enum { EYE_SEGS = 4096, EYE_MEMS = 2048, EYE_PATCHES = 1024 };
+/* A texture's identity here is its serial, not its pool memory: the game puts one pass's depth target where another
+   pass's was (a 64x64 probe depth at the 256x144 occluder depth's address, share-04), and each has its own Metal texture. */
+#define EKEY(t) ((const void *)(uintptr_t)((t)->serial << 12))
+/* A target's own part of a texture: its layer and level when the view names them (the shadow cascades are the layers of
+   one array, the probe's faces and levels of one cube): one cascade a shader made eye-dependent does not take the others. */
+static const void *ekey_part(const tex_t *t, const view_t *v, int has) {
+    uint64_t k = t->serial << 12;
+    if (has && v->set_layers) k |= (uint64_t)((v->min_layer & 0xff) + 1) << 4;
+    if (has && v->set_levels) k |= (uint64_t)((v->base_level & 0xf) + 1);
+    return (const void *)(uintptr_t)k;
+}
+typedef struct { const uint8_t *op; const void *tgt[9], *whole[9]; uint32_t work; uint8_t ntgt, dep, keep, skip; uint8_t why, why_st, why_reg; uint16_t w, h; uint64_t why_addr, why_size, why_at; } eye_seg;   // why: 1 a uniform with an eye matrix, 2 a sampled eye-dependent texture, 3 an eye-dependent target (diagnostic)
+typedef struct { const void *mem; uint8_t dirty, read, unsafe, run; int16_t by; } eye_mem;   // by: the segment that made it eye-dependent (diagnostic; -2 a copy)
+static eye_seg g_eseg[EYE_SEGS]; static int g_eseg_n, g_eseg_cur = -1, g_eseg_cnt0, g_eseg_r, g_eye_skip, g_eseg_bad;
+static eye_mem g_emem[EYE_MEMS]; static int g_emem_n;
+static uint64_t g_epatch[EYE_PATCHES]; static int g_epatch_n;
+static _Atomic int g_eye_share = 2;   /* on by default (user 2026-11-11: "默认打开"); "flag eye_share 0" turns it off */
+static uint64_t g_eshare_stat[6];   // submissions, segments, left out, draws and clears left out, order mismatches
+static eye_mem *emem_get(const void *mem, int add) {
+    if (!mem) return NULL;
+    unsigned i = (unsigned)((uintptr_t)mem * 2654435761u >> 16) & (EYE_MEMS - 1);
+    for (int t = 0; t < EYE_MEMS; t++, i = (i + 1) & (EYE_MEMS - 1)) {
+        if (g_emem[i].mem == mem) return &g_emem[i];
+        if (!g_emem[i].mem) { if (!add || g_emem_n >= EYE_MEMS / 2) { if (add) g_eseg_bad = 1; return NULL; } g_emem[i].mem = mem; g_emem_n++; return &g_emem[i]; }
+    }
+    return NULL;
+}
+static int g_eseg_why; static uint64_t g_eseg_why_a[3]; static int g_eseg_why_s[2];
+static void eseg_dep(void) {
+    if (g_eseg_cur < 0) return; eye_seg *g = &g_eseg[g_eseg_cur]; if (g->dep) return; g->dep = 1;
+    g->why = (uint8_t)g_eseg_why; g->why_addr = g_eseg_why_a[0]; g->why_size = g_eseg_why_a[1]; g->why_at = g_eseg_why_a[2]; g->why_st = (uint8_t)g_eseg_why_s[0]; g->why_reg = (uint8_t)g_eseg_why_s[1];
+    for (int i = 0; i < g->ntgt; i++) { eye_mem *m = emem_get(g->tgt[i], 1), *w = emem_get(g->whole[i], 1); if (m && !m->dirty) { m->dirty = 1; m->by = (int16_t)g_eseg_cur; } if (w && !w->dirty) { w->dirty = 1; w->by = (int16_t)g_eseg_cur; } }
+}
+static void eseg_keep(int why) { if (g_eseg_cur >= 0) g_eseg[g_eseg_cur].keep |= (uint8_t)why; }   // 1 a samples-passed report follows, 2 hoisted, 4 frozen / deferred
+static void eseg_reset(void) { g_eseg_n = 0; g_eseg_cur = -1; g_eseg_cnt0 = 0; g_eseg_bad = 0; g_eye_skip = 0; if (g_emem_n) { memset(g_emem, 0, sizeof g_emem); g_emem_n = 0; } }
+static void eseg_begin(const uint8_t *op, const p_set_rt *r) {
+    if (g_eye_pass == 2) {   // the right replay: the same segment as the left one's
+        const int n = g_eseg_r++;
+        if (n < g_eseg_n && g_eseg[n].op == op && !g_eseg_bad) g_eye_skip = g_eseg[n].skip && atomic_load(&g_eye_share) == 2;
+        else { if (!g_eseg_bad) g_eshare_stat[4]++; g_eseg_bad = 1; g_eye_skip = 0; }
+        return;
+    }
+    if (g_eseg_n >= EYE_SEGS) { g_eseg_bad = 1; g_eseg_cur = -1; return; }
+    eye_seg *g = &g_eseg[g_eseg_cur = g_eseg_n++]; memset(g, 0, sizeof *g); g->op = op;
+    for (int i = 0; i <= r->n && i <= 8; i++) { const tex_t *t = i < r->n ? r->color[i] : r->depth; if (t && t->serial && g->ntgt < 9) { g->whole[g->ntgt] = EKEY(t); g->tgt[g->ntgt++] = i < r->n ? ekey_part(t, &r->cview[i], r->has_cview[i]) : ekey_part(t, &r->dview, r->has_dview); if (!g->w) { g->w = (uint16_t)t->d.width; g->h = (uint16_t)t->d.height; } } }
+    int dirty = 0;
+    for (int i = 0; i < g->ntgt; i++) { eye_mem *m = emem_get(g->tgt[i], 1), *w = emem_get(g->whole[i], 1); if (!m || !w) continue;
+        if (w->read) m->unsafe = 1;   // sampled, then written again: the reader must see what was there
+        if (m->dirty) { dirty = 1; g_eseg_why_a[0] = (uint64_t)(uintptr_t)g->tgt[i]; g_eseg_why_a[1] = (uint64_t)i; g_eseg_why_a[2] = (uint64_t)(uint16_t)m->by; } }
+    if (dirty) { g_eseg_why = 3; eseg_dep(); }
+    args_dirty_all();   // a continued pass binds again, so this segment's own uniforms and textures are seen (encode_args)
+}
+static void eseg_ubo(uint64_t addr, uint64_t size, int st, int reg) {   // encode_args, the left replay: a bound uniform range
+    if (g_eseg_cur < 0 || g_eseg[g_eseg_cur].dep || !g_epatch_n) return;
+    int lo = 0, hi = g_epatch_n; while (lo < hi) { int m = (lo + hi) / 2; if (g_epatch[m] + 64 <= addr) lo = m + 1; else hi = m; }
+    if (lo < g_epatch_n && g_epatch[lo] < addr + size) { g_eseg_why = 1; g_eseg_why_a[0] = addr; g_eseg_why_a[1] = size; g_eseg_why_a[2] = g_epatch[lo] - addr; g_eseg_why_s[0] = st; g_eseg_why_s[1] = reg; eseg_dep(); }
+}
+static void eseg_tex(const void *mem) {   // encode_args, the left replay: a sampled texture
+    eye_mem *m = emem_get(mem, 1); if (!m) return;
+    m->read = 1; if (m->dirty) { g_eseg_why = 2; g_eseg_why_a[0] = (uint64_t)(uintptr_t)mem; eseg_dep(); }
+}
+static void eseg_write(const void *mem, int dirty) { eye_mem *m = emem_get(mem, 1); if (m) { m->unsafe = 1; if (dirty && !m->dirty) { m->dirty = 1; m->by = -2; } } }   // a clear or copy outside the segments' draws
+static void eseg_op(uint32_t op, const void *a) {   // the left replay, every op
+    switch (op) {
+        case OP_DRAW: case OP_DRAW_IDX: case OP_CLEAR_COLOR: case OP_CLEAR_DS: if (g_eseg_cur >= 0) g_eseg[g_eseg_cur].work++; break;
+        /* only the samples-passed count depends on what was drawn (timestamps and the others do not) */
+        case OP_RESET_COUNTER: { uint64_t t; memcpy(&t, a, 8); if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) g_eseg_cnt0 = g_eseg_n > 0 ? g_eseg_n - 1 : 0; break; }
+        case OP_REPORT_COUNTER: { uint64_t t; memcpy(&t, a, 8); if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) for (int i = g_eseg_cnt0; i < g_eseg_n; i++) g_eseg[i].keep |= 1; break; }
+        case OP_CLEAR_TEX: { const p_clear_tex *c = a; if (c->tex) eseg_write(EKEY(c->tex), 0); break; }
+        case OP_COPY_B2T: { const p_copy_b2t *c = a; if (c->tex) eseg_write(EKEY(c->tex), 0); break; }
+        case OP_COPY_T2T: { const p_copy_t2t *c = a; const eye_mem *sm = c->src && (uintptr_t)c->src > 0x10000 ? emem_get(EKEY((const tex_t *)c->src), 0) : NULL;
+            if (c->dst && (uintptr_t)c->dst > 0x10000) eseg_write(EKEY(c->dst), sm && sm->dirty); break; }
+        default: break;
+    }
+}
+static void eseg_finish(void) {   // between the replays: which segments the right replay leaves out
+    g_eseg_r = 0; g_eye_skip = 0; if (!g_eseg_n) return;
+    for (int i = 0; i < g_eseg_n; i++) g_eseg[i].skip = !g_eseg[i].dep && !g_eseg[i].keep && g_eseg[i].ntgt > 0;
+    for (int round = 0; round < 8; round++) {   // a target any running segment writes is written by all its segments
+        int changed = 0;
+        for (int i = 0; i < g_eseg_n; i++) { eye_seg *g = &g_eseg[i];
+            for (int k = 0; k < g->ntgt; k++) { eye_mem *m = emem_get(g->tgt[k], 0), *w = emem_get(g->whole[k], 0); if (!m || !w) { if (g->skip) { g->skip = 0; changed = 1; } continue; }
+                if (!g->skip && !m->run) { m->run = 1; changed = 1; }
+                if (!g->skip && g->tgt[k] == g->whole[k] && !w->run) { w->run = 1; changed = 1; }   // a pass on the whole texture runs: so do its parts' passes
+                if (g->skip && (m->run || m->dirty || m->unsafe || w->unsafe || (g->tgt[k] != g->whole[k] && w->run))) { g->skip = 0; changed = 1; } } }
+        if (!changed) break;
+    }
+    uint64_t left = 0, work = 0, all = 0; for (int i = 0; i < g_eseg_n; i++) { all += g_eseg[i].work; if (g_eseg[i].skip && g_eseg[i].work) { left++; work += g_eseg[i].work; } }
+    g_eshare_stat[0]++; g_eshare_stat[1] += (uint64_t)g_eseg_n; g_eshare_stat[2] += left; g_eshare_stat[3] += work;
+    static uint64_t said, allsum; allsum += all;
+    if (g_eshare_stat[0] == 1 || g_eshare_stat[0] >= said + 600) { said = g_eshare_stat[0];
+        uint64_t dep = 0, keep = 0; for (int i = 0; i < g_eseg_n; i++) { dep += g_eseg[i].dep; keep += !g_eseg[i].dep && !g_eseg[i].skip; }
+        MLOG("[vr] eye share (%s): %llu stereo submissions, a submission has %.1f segments of which %.1f are left out of the right eye (%.0f of %.0f draws and clears); this one: %d segments, %llu eye-dependent, %llu independent but kept, %llu left out with %llu of %llu draws and clears; order mismatches %llu",
+             atomic_load(&g_eye_share) == 2 ? "on" : "judged only", (unsigned long long)g_eshare_stat[0], (double)g_eshare_stat[1] / (double)g_eshare_stat[0], (double)g_eshare_stat[2] / (double)g_eshare_stat[0],
+             (double)g_eshare_stat[3] / (double)g_eshare_stat[0], (double)allsum / (double)g_eshare_stat[0], g_eseg_n, (unsigned long long)dep, (unsigned long long)keep, (unsigned long long)left, (unsigned long long)work, (unsigned long long)all, (unsigned long long)g_eshare_stat[4]);
+        static int listed; if (listed < 3) { listed++; for (int i = 0; i < g_eseg_n && i < 400; i++) if (g_eseg[i].work)
+            MLOG("[vr] eye share segment %d: %ux%u, %u draws and clears, why %d (stage %d reg %d; 1: uniform %#llx size %llu, eye matrix at byte %llu; 3: target memory, its index, the segment that made it eye-dependent), %s", i, g_eseg[i].w, g_eseg[i].h, g_eseg[i].work, g_eseg[i].why, g_eseg[i].why_st, g_eseg[i].why_reg,
+                 (unsigned long long)g_eseg[i].why_addr, (unsigned long long)g_eseg[i].why_size, (unsigned long long)g_eseg[i].why_at, g_eseg[i].dep ? "eye-dependent" : g_eseg[i].skip ? "left out" : g_eseg[i].keep == 1 ? "kept (a samples-passed report follows)" : g_eseg[i].keep == 2 ? "kept (hoisted)" : g_eseg[i].keep ? "kept (frozen / deferred, or several)" : "kept (its target is shared, read then written, or copied into)"); }
+    }
+}
+void mtl_eye_pass(int e) { g_eye_skip_fence = e == 2 ? g_fence : 0;
+    if (e == 1) eseg_reset(); else if (e == 2) { if (atomic_load(&g_eye_share)) eseg_finish(); else { g_eseg_n = 0; g_eseg_r = 0; } } else g_eye_skip = 0;
+    g_eye_pass = e; if (e) g_eye_swap = nil; }   // 2: the first replay was committed just before (mtl_sub_commit: ++g_fence)
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
 static uint64_t g_done;                         // 已完成的最大栅栏值（完成回调写） | Highest completed fence value (written by the completion callback)
@@ -268,7 +408,8 @@ static struct { uint64_t adds, removes, live_bytes; _Atomic uint64_t alive, aliv
 static char g_alloc_track_key;
 static NSMapTable *g_res_site_of;   // resource (weak key) -> NSNumber source line
 static uint64_t g_res_live_bytes;
-static void res_add_at(id<MTLResource> r, int site) {
+static void res_add_at(id<MTLResource> r, int site) { @autoreleasepool {
+    // Weak-table growth autoreleases retained keys; guest threads may not drain an outer pool.
     if (!r) return;
     if (site < 0 || site >= RES_SITES) site = 0;
     pthread_mutex_lock(&g_res_mu);
@@ -285,7 +426,7 @@ static void res_add_at(id<MTLResource> r, int site) {
     }
     g_res_dirty = 1;
     pthread_mutex_unlock(&g_res_mu);
-}
+} }
 #define res_add(r) res_add_at((r), __LINE__)
 static void res_remove_body(id<MTLResource> r) {
     if (!r) return;
@@ -342,6 +483,7 @@ static uint64_t gpu_budget_bytes(void) {
     return b;
 }
 static void defer_drain(void);
+static void stor_diag_report(void);
 static void gpu_budget_check(const char *where) {
     uint64_t budget = gpu_budget_bytes(); if (!budget) return;
     uint64_t cur = (uint64_t)g_dev.currentAllocatedSize; if (cur <= budget) return;
@@ -370,6 +512,7 @@ static void gpu_budget_check(const char *where) {
         return;
     }
     res_site_report(16);
+    stor_diag_report();
     MDIE("%s：显卡已分配 %llu MB 超过预算 %llu MB（等在途提交完成、放掉退役对象 %.1f ms 前是 %llu MB）；四次内核崩溃都发生在驻留内存约 15 GB 时，拒绝继续提交（TOTK_GPU_BUDGET_MB 调整）",
          where, (unsigned long long)(cur >> 20), (unsigned long long)(budget >> 20), waited_ms, (unsigned long long)(first >> 20));
 }
@@ -557,7 +700,7 @@ static void udc_selftest(void) {
         MLOG("UDC自检 %s %s %lux%lu 首值 %08x 与首值不同 %lu / %lu", g_dev.name.UTF8String, depth ? "Depth32F_S8" : "RGBA8", (unsigned long)w, (unsigned long)h, px[0], (unsigned long)bad, (unsigned long)(w * h));
     }
 }
-/* TOTK: GPU keep-alive (default on on the Mac, TOTK_GPU_KEEPALIVE=0 turns it off; off on iOS, TOTK_GPU_KEEPALIVE=1 turns it on). A thread keeps up to two short spin kernels (one
+/* TOTK: GPU keep-alive (default on on the Mac, TOTK_GPU_KEEPALIVE=0 or the settings panel's switch turns it off; off on iOS, TOTK_GPU_KEEPALIVE=1 turns it on). A thread keeps up to two short spin kernels (one
    threadgroup) in flight on its own command queue while the game is submitting frames. The M4 GPU lowers its clock when it
    idles part of each frame: the same compute work took 10.9 ms back to back, 16.8 ms with 10 ms gaps and 10.9 ms again with a
    spinner in the gaps (standalone test). TOTK idles the GPU between frames because it waits for each frame before it submits
@@ -573,26 +716,49 @@ static _Atomic uint64_t g_last_sub_ns;
 static _Atomic int g_ka_target_us = 1000;
 static _Atomic uint64_t g_ka_n, g_ka_us, g_ka_max_us;   // spin kernels completed, their summed / longest GPU time (us)
 void mtl_keepalive_stats(uint64_t v[3]) { v[0] = atomic_load(&g_ka_n); v[1] = atomic_load(&g_ka_us); v[2] = atomic_exchange(&g_ka_max_us, 0); }
-static void keepalive_start(void) {
-    static int started; const char *e = getenv("TOTK_GPU_KEEPALIVE");
+/* On or off: TOTK_GPU_KEEPALIVE decides first; otherwise, on the Mac, the settings panel's switch (gpu-keepalive.txt, read
+   before the guest starts: dm_gfx_keepalive_start) or, in play, dm_gfx_keepalive_set. Switched off in play, the thread stays
+   and only sleeps; switched on, it starts if it has not yet. On a fast Mac the game's own work may keep the clock up anyway:
+   an M4 Max at 60+60 interpolation lost no frame without the spinner, which kept its GPU ~90 % busy instead of ~63 %. */
+static _Atomic int g_ka_on = -1, g_ka_started;
+static void keepalive_start(void);
+int dm_gfx_keepalive_locked(void) { return getenv("TOTK_GPU_KEEPALIVE") != NULL; }
+int dm_gfx_keepalive(void) {
+    int v = atomic_load(&g_ka_on);
+    if (v < 0) {
+        const char *e = getenv("TOTK_GPU_KEEPALIVE");
 #if TARGET_OS_IPHONE
-    int on = e && atoi(e);    // iPhone / iPad: off unless TOTK_GPU_KEEPALIVE=1 (the spinning heats the phone; the gain above was measured on the M4)
+        int on = e && atoi(e);    // iPhone / iPad: off unless TOTK_GPU_KEEPALIVE=1 (the spinning heats the phone; the gain above was measured on the M4)
 #else
-    int on = !e || atoi(e);
+        int on = !e || atoi(e);
 #endif
-    if (started || !on || nogpu() || getenv("TOTK_HEADLESS")) return; started = 1;   // not in standalone probes
+        int was = -1; atomic_compare_exchange_strong(&g_ka_on, &was, on); v = atomic_load(&g_ka_on);
+    }
+    return v;
+}
+void dm_gfx_keepalive_start(int on) { if (!dm_gfx_keepalive_locked()) atomic_store(&g_ka_on, on ? 1 : 0); }
+void dm_gfx_keepalive_set(int on) {
+    if (dm_gfx_keepalive_locked() || dm_gfx_keepalive() == !!on) return;
+    atomic_store(&g_ka_on, on ? 1 : 0);
+    MLOG("GPU 保活：设置面板%s | GPU keep-alive: %s from the settings panel", on ? "打开" : "关闭", on ? "on" : "off");
+    if (on && atomic_load(&g_last_sub_ns)) keepalive_start();   // the game already renders; before that the first submission starts it
+}
+static void keepalive_start(void) {
+    if (!dm_gfx_keepalive() || nogpu() || getenv("TOTK_HEADLESS")) return;   // not in standalone probes
+    if (atomic_exchange(&g_ka_started, 1)) return;
     NSError *err = nil;
     id<MTLLibrary> lib = [g_dev newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\nkernel void keep(device float *a [[buffer(0)]], constant uint &n [[buffer(1)]], uint i [[thread_position_in_grid]]) { float x = a[i]; for (uint j = 0; j < n; j++) x = fma(x, 1.0000001f, 0.5f); a[i] = x; }\n" options:nil error:&err];
     id<MTLComputePipelineState> ps = lib ? [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"keep"] error:&err] : nil;
     id<MTLCommandQueue> q = [g_dev newCommandQueue]; id<MTLBuffer> buf = [g_dev newBufferWithLength:4096 options:MTLResourceStorageModePrivate];
     if (!ps || !q || !buf) { MLOG("【红】TOTK_GPU_KEEPALIVE：建不出自旋核 %s", err.localizedDescription.UTF8String); return; }
     { const char *us = getenv("TOTK_GPU_KEEPALIVE_US"); int v = us ? atoi(us) : 0; if (v >= 100 && v <= 1000) atomic_store(&g_ka_target_us, v); }   /* like flag keepalive_us, from the start */
-    MLOG("GPU 保活：独立队列上持续跑短自旋核（每个约 %d µs），避免 GPU 在帧间空闲时降频（TOTK_GPU_KEEPALIVE=0 关闭）", atomic_load(&g_ka_target_us));
+    MLOG("GPU 保活：独立队列上持续跑短自旋核（每个约 %d µs），避免 GPU 在帧间空闲时降频（设置面板或 TOTK_GPU_KEEPALIVE=0 关闭）", atomic_load(&g_ka_target_us));
     g_ka_idle = dispatch_semaphore_create(0);
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         __block uint32_t n = 40000; dispatch_semaphore_t sem = dispatch_semaphore_create(1);   // ~1 ms on the M4 at full clock
         for (;;) @autoreleasepool {
             int target_us = atomic_load(&g_ka_target_us);
+            if (!atomic_load(&g_ka_on)) { usleep(20000); continue; }   // switched off in the settings panel
             if (!target_us) { usleep(2000); continue; }
             uint64_t last = atomic_load(&g_last_sub_ns);
             if (!last || clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - last > 100000000ull) { usleep(10000); continue; }   // the game is not rendering
@@ -1074,11 +1240,8 @@ typedef struct { uint64_t lo, hi, fence; } gw_t;
 static gw_t *g_gw; static int g_ngw, g_capgw;
 static uint64_t g_usnap_skip_gpu;
 static int g_usnap_drop_off;   // probe-gpu-ubo-snapshot negative control only
-uint64_t g_b2gw_page; _Atomic int g_b2gw_n;   // stereo B2 diagnostic ("flag b2gw <page>"): GPU writes into that page, with the eye pass and region
-static void b2gw_note(uint64_t a, uint64_t n, const void *ra);   // below, with the replay's state
 static void usnap_drop(uint64_t a, uint64_t n) {   // the GPU writes [a, a+n) within this submission
     if (!n) return;
-    if (g_b2gw_page && a < ((g_b2gw_page + 1) << 12) && a + n > (g_b2gw_page << 12)) b2gw_note(a, n, __builtin_return_address(0));
     if (usnap_on()) {
         int dup = 0;   // the same buffer bound for many dispatches in a row: log it once
         for (int j = g_ngw - 1; j >= 0 && j >= g_ngw - 8; j--) if (g_gw[j].lo == a && g_gw[j].hi == a + n && g_gw[j].fence == g_fence + 1) { dup = 1; break; }
@@ -1171,72 +1334,7 @@ static uint64_t g_sub_serial;   // 第几次提交（并行预编「每次提交
 static void pt_apply_request(void);
 static int g_sub_chunks; static uint64_t g_chunk_mark, g_stat_draw; static void chunk_cfg(void);   // mid-submission commits, defined before mtl_sub_commit
 static int g_nupd, g_nshadow; static inline int upd_guard(uint64_t lo, uint64_t hi);   // renamed uniform updates, defined with mtl_sub_update
-/* zeldaVR stereo B2 (game_patches_v143.c, hle_nvn.c): a stereo frame's submission holds both eyes' recordings between OP_EYE
-   marks and is replayed once per eye (hle_nvn.c submit_exec): g_eye_pass 1 the left eye, 2 the right, 0 an ordinary
-   replay (what the right eye's marks hold is replayed, as before stereo). The left pass's picture (the presented texture
-   its last pass wrote, g_b2_swap) goes to the headset from mtl_sub_commit, tagged left; the right one at the present. */
-int g_eye_pass; static uint32_t g_eye_region = 3; static id<MTLTexture> g_b2_swap; static int g_b2_crop[4], g_b2_crop_have, g_b2_capture = -1, g_b2_retake;
-static vr_projection_image g_b2_image;
-static void vr_image_projection(vr_projection_image image);
-#ifndef GAME_BOTW
-static float g_totk_ui_reference[9];static int g_totk_ui_reference_valid;
-#endif
-static uint64_t g_b2_draws[2][2];   // stereo B2: [pass][0 inside that eye's marks, 1 outside any]
-/* Stereo B2: the left and the right pass are one submission of the game's. The GPU writes and pending updates the left pass
-   leaves (its fence, g_eye_skip_fence, during the right pass) are not an earlier submission's for the right pass: its
-   uniform copies (usnap_take) and their pending-write overlay (pend_overlay_x) pass them over, as a single replay would
-   not have seen them; later submissions treat them as any other. Without this every range the left pass writes on the GPU
-   was read live by the right pass, where the game was already writing the next frame (b2ag: the ground missing). */
-static uint64_t g_eye_skip_fence;
-static uint64_t g_b2_nopic, g_b2_pics;   // stereo B2: left passes that drew no presented texture / that did
-static id<MTLTexture> g_b2_scene[3]; static uint64_t g_b2_scene_pass[3];   // stereo B2: per eye, the colour target of the last pass inside its own marks
-static int g_b2_scene_shot, g_b2_scene_right; static void b2_scene_shot(int eye);
-static _Atomic int g_b2_passlog;   // diagnostic: the eye passes' passes into the game's presented textures, while a b2shot is pending
-static _Atomic int g_b2_shot; static int g_b2_rep = 1, g_b2_ucap;
-int mtl_b2_submit_uniforms_only(void) { return g_b2_ucap; }   // hle_nvn.c submit_exec   // "flag b2rep 0" (diagnostic): the left pass leaves out counter reports / resets; "flag b2ucap 1" (diagnostic): its uniforms are the submit call's only
-   // stereo B2 diagnostic ("flag b2shot <n>"): the next n left pictures saved beside the VR control file
-static void shot(id<MTLTexture> src, const char *path, int screen, const int crop[4]);
-static void mtl_finish_gpu(void);
-static int g_b2_order;   // diagnostic ("flag b2order 1"): the right eye's pass first, then the left one
-int mtl_b2_right_first(void) { return g_b2_order; }   // hle_nvn.c submit_exec
-void mtl_eye_done(int left, int last);
-void mtl_eye_pass(int e) {
-    const int second = e & 4; e &= 3;   // second: the other eye's pass was committed just before
-#ifndef GAME_BOTW
-    if(e&&!second)g_totk_ui_reference_valid=0;
-#endif
-    if (!e && g_b2_scene_right) { g_b2_scene_right = 0; b2_scene_shot(2); }   // diagnostic: the right eye's, after its pass
-    if (!e && (g_b2_draws[0][0] | g_b2_draws[0][1] | g_b2_draws[1][0] | g_b2_draws[1][1])) {   // the stereo submission's replays done
-        static int n; if (n++ < 12 || !(n % 600)) MLOG("[vr] stereo B2: the left replay drew %llu inside left marks and %llu shared; the right %llu inside right marks and %llu shared (left pictures %llu, left passes without one %llu)",
-            (unsigned long long)g_b2_draws[0][0], (unsigned long long)g_b2_draws[0][1], (unsigned long long)g_b2_draws[1][0], (unsigned long long)g_b2_draws[1][1],
-            (unsigned long long)g_b2_pics, (unsigned long long)g_b2_nopic);
-        memset(g_b2_draws, 0, sizeof g_b2_draws); }
-    if (e) { g_b2_swap = nil;g_b2_image=(vr_projection_image){0}; }   // this pass's own picture or none (never an older one)
-    if (e) g_b2_scene[e] = nil;
-    g_eye_skip_fence = second ? g_fence : 0;   // the other pass was committed just before (mtl_sub_commit: ++g_fence)
-    g_eye_pass = e; g_eye_region = 3; if (e) g_b2_retake = 1; }   // each eye's replay takes its own G-buffer camera (its head pose)
-static void b2_scene_shot(int eye) {   // diagnostic: the eye's own last pass target (b2shot)
-    id<MTLTexture> t = g_b2_scene[eye]; const char *cf = getenv("TOTK_VR_CONTROL"); char path[1100]; const char *sl = cf ? strrchr(cf, '/') : NULL;
-    snprintf(path, sizeof path, "%.*s/scene-%s-%d.png", sl ? (int)(sl - cf) : 1, sl ? cf : ".", eye == 1 ? "left" : "right", g_b2_scene_shot);
-    if (!t) { MLOG("[vr] b2shot: no pass inside the %s eye's marks", eye == 1 ? "left" : "right"); return; }
-    mtl_finish_gpu(); shot(t, path, 0, NULL);
-    MLOG("[vr] b2shot: the %s eye's last own pass %llu target %lux%lu format %lu -> %s", eye == 1 ? "left" : "right", (unsigned long long)g_b2_scene_pass[eye], (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.pixelFormat, path);
-}
-void mtl_eye_done(int left, int last) {   // after an eye pass's commit (hle_nvn.c submit_exec); last: the submission's second pass
-    static int k, active;
-    if (!active && atomic_load(&g_b2_shot) > 0) { active = 1; k++; }
-    if (active) {   // diagnostic: each eye's picture (the presented texture its pass drew), as it is after that pass
-        if (last) { active = 0; atomic_fetch_sub(&g_b2_shot, 1); }
-        const char *cf = getenv("TOTK_VR_CONTROL"); char path[1100];
-        const char *sl = cf ? strrchr(cf, '/') : NULL; snprintf(path, sizeof path, "%.*s/%s-%d%s.png", sl ? (int)(sl - cf) : 1, sl ? cf : ".", left ? "left" : "right", k, last ? "-second" : "-first");
-        g_b2_scene_shot = k; if (left) b2_scene_shot(1);   // and the left eye's own last pass (its HDR scene)
-        if (g_b2_swap) { mtl_finish_gpu(); shot(g_b2_swap, path, 1, g_b2_crop_have ? g_b2_crop : NULL); MLOG("[vr] b2shot: the eye's picture (%lux%lu, format %lu) -> %s; this pass drew %llu inside its marks and %llu shared, its last own pass %llu", (unsigned long)g_b2_swap.width, (unsigned long)g_b2_swap.height, (unsigned long)g_b2_swap.pixelFormat, path,
-            (unsigned long long)g_b2_draws[left ? 0 : 1][0], (unsigned long long)g_b2_draws[left ? 0 : 1][1], (unsigned long long)g_b2_scene_pass[left ? 1 : 2]); }
-        else MLOG("[vr] b2shot: this eye pass drew no presented texture"); }
-}
-void mtl_eye_capture(int eye) { g_b2_capture = eye; }
 void mtl_sub_begin(void) {
-    g_eye_region = 3;   // stereo B2: a submission starts outside eye marks
     g_fc_begin0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     /* The submission's autorelease pool, drained in mtl_sub_commit, opens before anything else: the guest's submit
        thread has no pool of its own that drains (frontend.m's lasts the whole game), so what defer_drain, defer_reset,
@@ -1499,7 +1597,6 @@ static inline void enc_r_draw_indexed_indirect(id<MTL4RenderCommandEncoder> e, M
 static inline void enc_r_draw_indexed(id<MTL4RenderCommandEncoder> e, MTLPrimitiveType p, NSUInteger n, MTLIndexType t, uint64_t gpu, NSUInteger len, NSUInteger i, NSInteger bv, NSUInteger bi) { if (rs_using(e)) rs_put((nvn_encode_packet){.op=RS_INDEXED,.u={p,n,t,gpu,len,i,(uint64_t)bv,bi}},1); else [e drawIndexedPrimitives:p indexCount:n indexType:t indexBuffer:gpu indexBufferLength:len instanceCount:i baseVertex:bv baseInstance:bi]; }
 static inline void enc_r_store(id<MTL4RenderCommandEncoder> e, int depth, MTLStoreAction action, NSUInteger index) { if (rs_using(e)) rs_put((nvn_encode_packet){.op=RS_STORE,.u={(uint64_t)depth,action,index}},0); else if (depth == 1) [e setDepthStoreAction:action]; else if (depth == 2) [e setStencilStoreAction:action]; else [e setColorStoreAction:action atIndex:index]; }
 static inline id<MTL4ComputeCommandEncoder> enc_c_begin(MTLComputePassDescriptor *d) { (void)d; blit_close(); rs_sync(); pt_mark(g_cb, 'C', nil); id<MTL4ComputeCommandEncoder> e = [g_cb computeCommandEncoder]; if (bar_start_on()) [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:bar_vis()]; [e setArgumentTable:g_ct]; return e; }
-static inline id<MTLComputeCommandEncoder> enc_c_begin_concurrent(id<MTLCommandBuffer> cb) { return [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent]; }
 static inline void enc_c_end(id e) { m4_end(e); }
 static inline void enc_c_pso(id e, id<MTLComputePipelineState> p) { [e setComputePipelineState:p]; }
 static inline void enc_c_args(id e, uint64_t gpu, NSUInteger i) { (void)e; [g_ct setAddress:gpu atIndex:i]; }
@@ -1539,7 +1636,6 @@ static id<MTL4ComputeCommandEncoder> blit_buffer(id<MTLBuffer> src, NSUInteger s
 static size_t arena_alloc(size_t n, __strong id<MTLBuffer> *buf);
 static size_t arena_alloc_u(size_t n, __unsafe_unretained id<MTLBuffer> *buf, uint8_t **cpu, uint64_t *gpu);
 static void pend_materialize(uint64_t a, uint8_t *out, size_t n, int depth);
-static void pend_overlay(uint64_t a, uint8_t *out, size_t n, int depth);
 static void pend_materialize_x(uint64_t a, uint8_t *out, size_t n, int depth, int wait);
 static void pend_overlay_x(uint64_t a, uint8_t *out, size_t n, int depth, int wait);
 typedef struct { uint64_t lo, hi; } usnap_rng;
@@ -1675,13 +1771,11 @@ void *mtl_sub_capture_ubos(const uint64_t *h, int n) {
     return c;
 }
 static void ucap_free(usnap_cap *c) { if (c) { free(c->r); free(c->off); ucap_bytes_put(c->bytes, c->cap); free(c); } }
-void mtl_ucap_free(void *c) { ucap_free((usnap_cap *)c); }   // zeldaVR stereo B2: a first-run capture the left replay did not take
-/* zeldaVR stereo B2: the left eye's uniforms. base: the whole submission's bindings as of the submit call (both eyes'
-   recordings are inlined in it); over: the first run's bindings captured between the runs. The result has base's ranges
-   and bytes, with over's bytes wherever over covers them: what the second run rewrote reads as the first run left it, the
-   rest as the right eye sees it (nothing reads live memory that the game may already be rebuilding). Neither is consumed. */
-void *mtl_ucap_overlay(const void *basev, const void *overv) {
-    const usnap_cap *base = basev, *over = overv;
+void mtl_ucap_free(void *c) { ucap_free(c); }   // hle_nvn.c: a copy made for an eye replay that does not happen
+/* Stereo replay (hle_nvn.c submit_exec): a replay consumes its capture (usnap_finish frees it), so the first replay
+   takes a copy of the submission's capture and the second the capture itself. */
+void *mtl_ucap_dup(const void *basev) {
+    const usnap_cap *base = basev;
     if (!base) return NULL;
     usnap_cap *c = calloc(1, sizeof *c); if (!c) MDIE("uniform capture");
     c->done = base->done; c->n = base->n; c->ns = 0;
@@ -1691,12 +1785,101 @@ void *mtl_ucap_overlay(const void *basev, const void *overv) {
     if (c->n) { memcpy(c->r, base->r, sizeof *c->r * (size_t)c->n); memcpy(c->off, base->off, sizeof *c->off * (size_t)c->n); }
     c->bytes = ucap_bytes_get(total ? total : 1, &c->cap);
     if (total) memcpy(c->bytes, base->bytes, total);
-    if (over) for (int i = 0, j = 0; i < c->n && j < over->n;) {   // both sorted and disjoint: walk them together
-        const uint64_t lo = c->r[i].lo > over->r[j].lo ? c->r[i].lo : over->r[j].lo, hi = c->r[i].hi < over->r[j].hi ? c->r[i].hi : over->r[j].hi;
-        if (lo < hi) memcpy(c->bytes + c->off[i] + (lo - c->r[i].lo), over->bytes + over->off[j] + (lo - over->r[j].lo), (size_t)(hi - lo));
-        if (c->r[i].hi <= over->r[j].hi) i++; else j++;
-    }
     return c;
+}
+/* Stereo replay, the eye's projection (vr开发.md section 23). The game renders with one camera whose frustum covers both
+   eyes; a replay for one eye uses that camera's view matrix unchanged and, wherever a uniform of this submission holds
+   the camera's projection P, its inverse, P*V or (P*V)^-1 (row-major or transposed), the eye's: P * T, T the shift of half the eye distance in view space (the frustum
+   itself stays the game's, see below). View-space quantities stay the centre camera's and positions rebuilt from depth through the eye's inverse
+   land in that same view space. V and P are this submission's own bytes of the main scene camera's block
+   (runtime_vr_camera_block). Only the capture (our copy) is written. Returns the matrices replaced. */
+static int m4_inv(const double *m, double *o) {
+    double a[4][8];
+    for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++) { a[r][c] = m[r * 4 + c]; a[r][4 + c] = r == c; }
+    for (int c = 0; c < 4; c++) {
+        int p = c; for (int r = c + 1; r < 4; r++) if (fabs(a[r][c]) > fabs(a[p][c])) p = r;
+        if (fabs(a[p][c]) < 1e-12) return 0;
+        if (p != c) for (int k = 0; k < 8; k++) { double t = a[c][k]; a[c][k] = a[p][k]; a[p][k] = t; }
+        double d = a[c][c]; for (int k = 0; k < 8; k++) a[c][k] /= d;
+        for (int r = 0; r < 4; r++) if (r != c) { double f = a[r][c]; if (f != 0) for (int k = 0; k < 8; k++) a[r][k] -= f * a[c][k]; }
+    }
+    for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++) o[r * 4 + c] = a[r][4 + c];
+    return 1;
+}
+static void m4_mul(const double *a, const double *b, double *o) {
+    for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++) { double s = 0; for (int k = 0; k < 4; k++) s += a[r * 4 + k] * b[k * 4 + c]; o[r * 4 + c] = s; }
+}
+static _Atomic uint64_t g_eye_fix[6];   // submissions patched, matrices replaced, submissions without a camera, nanoseconds, bytes scanned, ranges with a replacement
+int mtl_ucap_eye(void *capv, int eye) {
+    extern uint64_t runtime_vr_camera_block(void);
+    usnap_cap *c = capv; vr_views hv; uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (eye == 0 || eye == 1) g_eye_have[eye] = 0;   // set again below once this replay has the eye's projection
+    /* one address for both eyes of a submission: the game flips the scene's camera blocks at its next frame's start, and
+       with the replay behind the game thread the second eye would look for the next frame's block (st-06: every right
+       eye without a camera block) */
+    static uint64_t latched; if (eye == 0) latched = runtime_vr_camera_block();
+    const uint64_t blk = latched;
+    if (!c || !c->n || !blk || eye < 0 || eye > 1 || !vr_link_views(&hv) || !(hv.ipd > 0.03f && hv.ipd < 0.09f)) { atomic_fetch_add(&g_eye_fix[2], 1); return 0; }
+    /* the camera block's bytes in the capture (a captured range must cover them: bound by this submission) */
+    int lo = 0, hi = c->n; while (lo < hi) { int m = (lo + hi) / 2; if (c->r[m].hi <= blk) lo = m + 1; else hi = m; }
+    if (lo >= c->n || c->r[lo].lo > blk || c->r[lo].hi < blk + 44 * 4) { atomic_fetch_add(&g_eye_fix[2], 1); return 0; }
+    float cam[44]; memcpy(cam, c->bytes + c->off[lo] + (blk - c->r[lo].lo), sizeof cam);
+    double V[16] = {0}, P[16], Pe[16], PV[16], PVe[16], Pi[16], Pei[16], PVi[16], PVei[16];
+    for (int i = 0; i < 12; i++) V[i] = cam[i]; V[15] = 1;
+    for (int i = 0; i < 16; i++) P[i] = cam[28 + i];
+    int ok = P[0] > 0.05 && P[5] > 0.05 && P[14] == -1 && P[15] == 0 && P[1] == 0 && P[4] == 0 && P[12] == 0 && P[13] == 0;
+    for (int r = 0; r < 3 && ok; r++) { double n2 = V[r * 4] * V[r * 4] + V[r * 4 + 1] * V[r * 4 + 1] + V[r * 4 + 2] * V[r * 4 + 2]; if (!(fabs(n2 - 1) < 1e-3)) ok = 0; }
+    if (!ok) { atomic_fetch_add(&g_eye_fix[2], 1); return 0; }
+    /* The eye keeps the game's own frustum (the one that covers both eyes) and only moves sideways. An eye's own
+       asymmetric frustum was tried first (st-07) and gave each eye its own lighting and HUD: the game also hands the
+       projection to its shaders as loose parameters (1/P00, 1/P11, the aspect, the field of view, P02/P00, per-light
+       values: cb-01 / cb-02, about ten kinds of blocks), all computed for the centre camera's frustum; with the same
+       frustum for both eyes every one of them stays right, and the HUD keeps one direction for both eyes. */
+    float pf[16], rays[4]; for (int i = 0; i < 16; i++) pf[i] = (float)P[i];
+    if (!vr_projection_fov(pf, rays)) { atomic_fetch_add(&g_eye_fix[2], 1); return 0; }
+    memcpy(Pe, P, sizeof Pe);
+    const double shift = (eye ? -0.5 : 0.5) * hv.ipd;   // the left eye sits at -ipd/2: the scene moves by +ipd/2 in its view space
+    for (int r = 0; r < 4; r++) Pe[r * 4 + 3] += Pe[r * 4] * shift;   // Pe * T(shift, 0, 0)
+    m4_mul(P, V, PV); m4_mul(Pe, V, PVe);
+    if (!m4_inv(P, Pi) || !m4_inv(Pe, Pei) || !m4_inv(PV, PVi) || !m4_inv(PVe, PVei)) { atomic_fetch_add(&g_eye_fix[2], 1); return 0; }
+    /* 8 patterns: {P, P^-1, PV, PV^-1} x {row-major, transposed}; key: the element of largest magnitude */
+    float pat[8][16], rep[8][16]; int key[8]; const double *src[4] = {P, Pi, PV, PVi}, *dst[4] = {Pe, Pei, PVe, PVei};
+    for (int k = 0; k < 4; k++) for (int i = 0; i < 16; i++) {
+        pat[2 * k][i] = (float)src[k][i]; rep[2 * k][i] = (float)dst[k][i];
+        pat[2 * k + 1][i] = (float)src[k][(i % 4) * 4 + i / 4]; rep[2 * k + 1][i] = (float)dst[k][(i % 4) * 4 + i / 4];
+    }
+    for (int k = 0; k < 8; k++) { key[k] = 0; for (int i = 1; i < 16; i++) if (fabsf(pat[k][i]) > fabsf(pat[k][key[k]])) key[k] = i; }
+    int replaced = 0, ranges = 0; uint64_t bytes = 0; if (eye == 0) g_epatch_n = 0;
+    for (int i = 0; i < c->n; i++) {
+        const size_t nb = (size_t)(c->r[i].hi - c->r[i].lo); uint8_t *b = c->bytes + c->off[i];
+        const size_t skew = (size_t)((4 - (c->r[i].lo & 3)) & 3);   // floats at 4-byte addresses
+        if (nb < skew + 64) continue;
+        float *f = (float *)(void *)(b + skew); const size_t nf = (nb - skew) / 4; int here = 0; bytes += nb;
+        for (int k = 0; k < 8; k++) {
+            const float kv = pat[k][key[k]], tol = 2e-4f * fmaxf(1, fabsf(kv)); const int ko = key[k];
+            for (size_t o = 0; o + 16 <= nf; o++) {
+                float x; memcpy(&x, &f[o + ko], 4);
+                if (!(fabsf(x - kv) <= tol)) continue;
+                float w[16]; memcpy(w, &f[o], sizeof w); int same = 1;
+                for (int j = 0; j < 16 && same; j++) if (!(fabsf(w[j] - pat[k][j]) <= 5e-4f * fmaxf(1, fabsf(pat[k][j])))) same = 0;
+                if (same) { memcpy(&f[o], rep[k], sizeof rep[k]); replaced++; here = 1;
+                    if (eye == 0 && g_epatch_n < EYE_PATCHES) g_epatch[g_epatch_n++] = c->r[i].lo + skew + 4 * (uint64_t)o;   // where an eye matrix is (eseg_ubo)
+                    o += 15; }
+            }
+        }
+        ranges += here;
+    }
+    memcpy(g_eye_view, cam, sizeof g_eye_view); g_eye_have[eye] = 1;
+    memcpy(g_eye_fov[eye], rays, sizeof rays);   // the picture's rays: the game's frustum, the same for both eyes
+    if (eye == 0 && g_epatch_n > 1) { for (int x = 1; x < g_epatch_n; x++) { uint64_t v = g_epatch[x]; int y = x; while (y > 0 && g_epatch[y - 1] > v) { g_epatch[y] = g_epatch[y - 1]; y--; } g_epatch[y] = v; } }
+    atomic_fetch_add(&g_eye_fix[0], 1); atomic_fetch_add(&g_eye_fix[1], (uint64_t)replaced); atomic_fetch_add(&g_eye_fix[3], clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0);
+    atomic_fetch_add(&g_eye_fix[4], bytes); atomic_fetch_add(&g_eye_fix[5], (uint64_t)ranges);
+    { static uint64_t said; const uint64_t n = atomic_load(&g_eye_fix[0]);
+      if (n >= said + 600 || !said) { said = n ? n : 1;
+        MLOG("[vr] stereo replay: %llu eye replays with the eye's projection (%llu matrices in %llu ranges, %.2f ms and %.0f KB scanned each), %llu without a camera block; this one: eye %d, %d matrices, P00 %.4f -> %.4f, P02 %.4f -> %.4f, shift %.4f m",
+             (unsigned long long)n, (unsigned long long)atomic_load(&g_eye_fix[1]), (unsigned long long)atomic_load(&g_eye_fix[5]), (double)atomic_load(&g_eye_fix[3]) / 1e6 / (double)(n ? n : 1),
+             (double)atomic_load(&g_eye_fix[4]) / 1024.0 / (double)(n ? n : 1), (unsigned long long)atomic_load(&g_eye_fix[2]), eye, replaced, P[0], Pe[0], P[2], Pe[2], shift); } }
+    return replaced;
 }
 /* The bytes of [a, a+n) as captured: memory at the capture where a captured range covers them (they are memory now
    elsewhere: no binding of this submission reads there). */
@@ -1775,7 +1958,7 @@ static void usnap_take(const uint64_t *h, int n, const usnap_cap *cap) {
     uint64_t tq0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     uint64_t done = cap && !g_ucap_probe_now ? cap->done : __atomic_load_n(&g_done, __ATOMIC_ACQUIRE);
     int ng = 0; uint64_t gw_maxlen = 0;   // GPU writes not finished at the capture, sorted by start
-    static gw_t *eyegw; static int eyegw_cap; int neye = 0;   // stereo B2: the left pass's, kept for later submissions but not looked at here
+    static gw_t *eyegw; static int eyegw_cap; int neye = 0;   // stereo replay: the first replay's, kept for later submissions but not looked at here
     for (int i = 0; i < g_ngw; i++) if (g_gw[i].fence > done) {
         if (g_eye_skip_fence && g_gw[i].fence == g_eye_skip_fence) {
             if (neye == eyegw_cap) { eyegw_cap = eyegw_cap ? eyegw_cap * 2 : 1024; eyegw = realloc(eyegw, (size_t)eyegw_cap * sizeof *eyegw); if (!eyegw) MDIE("GPU write ranges"); }
@@ -2014,14 +2197,13 @@ static void pend_overlay_x(uint64_t a, uint8_t *out, size_t n, int depth, int wa
     for (int i = 0; i < npend; i++) {
         uint64_t lo = g_pend_lo[i], hi = g_pend_hi[i];
         if (hi <= a || lo >= a + n || g_pend_fence[i] <= done) continue;   // completed writes are already in memory (which may hold newer CPU writes)
-        if (g_eye_skip_fence && g_pend_fence[i] == g_eye_skip_fence) continue;   // stereo B2: the left pass's, not before the right pass (mtl_eye_pass)
+        if (g_eye_skip_fence && g_pend_fence[i] == g_eye_skip_fence) continue;   // stereo replay: the first replay's, not before the second (mtl_eye_pass)
         uint64_t s0 = lo > a ? lo : a, e0 = hi < a + n ? hi : a + n;
         if (g_pend_kind[i] == 0) memcpy(out + (s0 - a), (const uint8_t *)g_pend_src[i] + (s0 - lo), e0 - s0);
         else if (depth < 2) pend_materialize_x((uint64_t)(uintptr_t)g_pend_src[i] + (s0 - lo), out + (s0 - a), e0 - s0, depth + 1, wait);
         else memcpy(out + (s0 - a), (const uint8_t *)g_pend_src[i] + (s0 - lo), e0 - s0);
     }
 }
-static void pend_overlay(uint64_t a, uint8_t *out, size_t n, int depth) { pend_overlay_x(a, out, n, depth, 1); }
 // Write the logged updates into memory on the GPU timeline (ends a render pass if one is open).
 static void upd_flush(void) {
     if (!g_nupd) return;
@@ -2453,21 +2635,6 @@ uint64_t mtl_sub_commit(void) {
     res_commit();
     if (totk_tl_on()) { uint64_t tlid = totk_tl_commit_id(); totk_tl(TL_COMMIT, tlid, 1); totk_tl(TL_FENCE, tlid, fence);
         [o addFeedbackHandler:^(id<MTL4CommitFeedback> fb) { totk_tl_at(TL_GPU, (uint64_t)(fb.GPUStartTime * 1e9), tlid, (uint64_t)(fb.GPUEndTime * 1e9)); }]; }
-    #ifndef GAME_BOTW
-    if (g_b2_capture >= 0) {   // stereo B2: the left pass's picture for the headset (the presented texture as drawn, no MetalFX)
-        const int eye = g_b2_capture; g_b2_capture = -1;
-        if (g_b2_swap) g_b2_pics++; else g_b2_nopic++;
-        if (g_b2_swap) {
-            vr_image_projection(g_b2_image);
-            const int slot = vr_source_encode_eye(g_cb, g_b2_swap, g_b2_crop_have ? g_b2_crop : NULL, eye);
-            if (slot >= 0) {   // published when this command buffer completes, as the present's copy is
-                static int added; if (!added) { [g_q4 addResidencySet:vr_residency()]; added = 1; }
-                [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) { vr_source_done(slot, !f.error); }];
-                static uint64_t n; if (!n++) MLOG("[vr] stereo B2: the first left-eye picture went to the headset (%lux%lu)", (unsigned long)g_b2_swap.width, (unsigned long)g_b2_swap.height);
-            } else { static uint64_t m; if (!m++) MLOG("[vr] stereo B2: no free picture slot for a left-eye picture (later ones are counted in the VR line)"); }
-        }
-    }
-    #endif
     for (NSNumber *entry in g_vr_native_slots) {
         const int slot = entry.intValue;
         [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) { vr_source_done(slot, !f.error); }];
@@ -2542,7 +2709,6 @@ static int tex_need_pfv(MTLPixelFormat base, MTLPixelFormat view) {
 }
 // 回放热路径的缓存表一律用 nvn_hmap（C 哈希，键不装箱）；表里存 CFBridgingRetain 过的对象，替换 / 删除时 CFRelease
 // Cache tables on the replay hot path always use nvn_hmap (C hash, keys not boxed); the table stores CFBridgingRetain'ed objects, CFRelease'd on replace / delete
-static void hm_rel(void *v) { CFRelease(v); }
 static __unsafe_unretained id hm_get_id(const nvn_hmap *m, const void *k) { return (__bridge id)nvn_hm_get(m, k); }
 static void hm_put_id(nvn_hmap *m, const void *k, id o) { void *old = nvn_hm_put(m, k, (void *)CFBridgingRetain(o)); if (old) CFRelease(old); }
 static void hm_del_id(nvn_hmap *m, const void *k) { void *old = nvn_hm_del(m, k); if (old) CFRelease(old); }
@@ -2636,7 +2802,20 @@ static id<MTLTexture> stor_recreate(const stor_key *k, MTLTextureUsage usage);
    table (directly or through its NvPkg), whose entries are dropped only through the deferred-release queue (also
    pkg_evict_sweep, reup_retire). As an id return each call was a retain + autorelease in here and a claim in the caller. */
 static void *tex_mtl_p(const tex_t *ct);
+#include "totk_prompt_icons.h"
+#if !defined(GAME_BOTW) && !defined(GAME_NS2) && !TARGET_OS_IPHONE   /* only TotK on the Mac has the prompt hook (1.4.3 turns it on; this file is shared by its versions, so no version macro); other games and iOS skip this lookup */
+#define TOTK_PROMPT_ICONS_ON 1
+static void prompt_resident(id<MTLResource> resource) { res_add(resource); }
+static void *prompt_texture(const tex_t *t) {
+    __unsafe_unretained id<MTLTexture> original = (__bridge id<MTLTexture>)tex_mtl_p(t);
+    if (!t || t->d.format != NVN_FORMAT_R8) return (__bridge void *)original;
+    return (__bridge void *)totk_prompt_texture(t, original, prompt_resident, defer_obj_release);
+}
+#define tex_mtl(t) ((__bridge id<MTLTexture>)prompt_texture(t))
+#else
+#define TOTK_PROMPT_ICONS_ON 0
 #define tex_mtl(t) ((__bridge id<MTLTexture>)tex_mtl_p(t))
+#endif
 static int rp_active(void);
 /* TOTK: plain pointers for the replay hot paths. The functions above return id, and the __unsafe_unretained on their
    return types is ignored by ARC, so every lookup was a retain / autorelease pair. Table entries are only freed through
@@ -2846,6 +3025,7 @@ void dm_gfx_set_flag(const char *name, int v) {
     if (!strcmp(name, "vr_quest_fov")) { atomic_store(&g_vr_quest_fov_on,v!=0); MLOG("[flag] Quest native projection %s",v?"on":"off"); return; }
     if (!strcmp(name, "vr_ui_layout")) { atomic_store(&g_vr_ui_layout_on,v!=0); MLOG("[flag] native UI camera viewport fitting %s",v?"on":"off"); return; }
     if (!strcmp(name,"vr_packet_log")){vr_packet_trace(v);return;}
+    if (!strcmp(name,"vr_head_only")){extern void vr_head_only_set(int on);vr_head_only_set(v!=0);return;}
     if (!strcmp(name, "vr_fp")) { vr_set_first_person(v); return; }    // first person 1 / third person 0
     if (!strcmp(name, "vr_eye")) { vr_set_eye_cm(v); return; }         // first person: eye height in cm
     if (!strcmp(name, "vr_pitch")) { vr_set_pitch_lock(v); return; }   // 1: up / down only from the headset
@@ -2893,12 +3073,7 @@ void dm_gfx_set_flag(const char *name, int v) {
     if (!strcmp(name, "draw_log")) { extern _Atomic long g_draw_log; atomic_store(&g_draw_log, v); MLOG("[flag] draw_log: every draw and dispatch of the next %d frames", v); return; }
     if (!strcmp(name, "uw_log")) { extern _Atomic long g_uw_log; atomic_store(&g_uw_log, v); MLOG("[flag] uw_log: canvas draws of the next %d frames", v); return; }   // key 4 UI squeeze diagnostic
     if (!strcmp(name, "mfx_output")) { mfxup_output_set(v < 0 ? !mfxup_output_enabled() : v); return; }   // TOTK_MFX_OUTPUT at run time (the window output stage)
-    if (!strcmp(name, "b2order")) { g_b2_order = v; MLOG("[flag] b2order: %s", v ? "the right eye's pass first (diagnostic)" : "the left eye's pass first"); return; }
-    if (!strcmp(name, "b2rep")) { g_b2_rep = v != 0; MLOG("[flag] b2rep: the left pass %s counter reports and resets", v ? "replays" : "leaves out (diagnostic)"); return; }
-    if (!strcmp(name, "b2ucap")) { g_b2_ucap = v; MLOG("[flag] b2ucap: the left pass's uniforms %s", v ? "as of the submit call only (diagnostic)" : "with the first run's bytes over them"); return; }
-    if (!strcmp(name, "b2shot")) { atomic_store(&g_b2_shot, v); atomic_store(&g_b2_passlog, v ? 2 : 0); MLOG("[flag] b2shot: the next %d left pictures saved", v); return; }
-    if (!strcmp(name, "b2gw")) { extern uint64_t g_b2gw_page; extern _Atomic int g_b2gw_n; g_b2gw_page = (uint64_t)(uint32_t)v; atomic_store(&g_b2gw_n, 0);   // stereo B2 diagnostic: GPU writes into page v (address / 4096)
-        MLOG("[flag] b2gw: GPU writes into %#llx..+0x1000 are logged (40 at most)", (unsigned long long)g_b2gw_page << 12); return; }
+
     if (!strcmp(name, "pass_gpu")) {
         if (v < 0 || v > 120) { MLOG("[flag] pass_gpu requires 0..120 frames"); return; }
         atomic_store_explicit(&g_pt_request, v, memory_order_relaxed);
@@ -2934,6 +3109,8 @@ void dm_gfx_set_flag(const char *name, int v) {
     if (!strcmp(name, "shadow_index_check")) { atomic_store(&g_shadow_index_check, v != 0); MLOG("[flag] shadow_index_check = %d", v != 0); return; }
     if (!strcmp(name, "pkg_final_cache")) { atomic_store(&g_pkg_final_cache, v != 0); MLOG("[flag] pkg_final_cache = %d", v != 0); return; }
     if (!strcmp(name, "pend_arena_pin")) { atomic_store(&g_pend_arena_pin, v != 0); MLOG("[flag] pend_arena_pin = %d", v != 0); return; }
+    if (!strcmp(name, "eye_share")) { atomic_store(&g_eye_share, v < 0 ? 0 : v > 2 ? 2 : v); MLOG("[flag] eye_share = %d (0 off, 1 eye-independent passes judged and logged, 2 left out of the right eye's replay)", v); return; }
+    if (!strcmp(name, "stereo_replay")) { atomic_store(&g_stereo_replay, v < 0 ? 0 : v > 2 ? 2 : v); MLOG("[flag] stereo_replay = %d (0 off, 1 each submission replayed once per eye, 2 with the eye's projection)", v); return; }
     if (!strncmp(name, "skipfs_", 7)) {
         const char *p = name + 7;
         if (strlen(p) != 16 || strspn(p, "0123456789abcdefABCDEF") != 16) { MLOG("[flag] skipfs needs exactly 16 hex digits"); return; }
@@ -3041,6 +3218,17 @@ static int wb_target_lock(const tex_t *t) {
              (unsigned long long)t->serial, t->d.width, t->d.height, (void *)t->mem, (unsigned long long)t->L.size, (unsigned long long)gone);
     return 0;
 }
+/* 先锁定目标内存池，再占用跟踪页。GPU 提交和等待必须在进入此区段之前完成。 */
+static int wb_target_begin(const tex_t *t, void **tok) {
+    if (!wb_target_lock(t)) return 0;
+    *tok = nvn_dirty_tracked(t->mem, t->L.size) ? nvn_dirty_gpu_write_begin(t->mem, t->L.size) : NULL;
+    if (!*tok) dm_guest_write_prepare(t->mem, t->L.size);
+    return 1;
+}
+static void wb_target_end(void *tok) {
+    nvn_dirty_gpu_write_end(tok);
+    pthread_mutex_unlock(&g_mu);
+}
 /* Every level and layer of a texture is read back with one command buffer and one wait: one blit per level and layer
    waited for the GPU each time, 24 round trips (about 3.7 ms on the game's thread) for the 64x64 cubemap with four
    levels that Breath of the Wild reads back every 10 frames (1.6.0, Kakariko, 2026-10-28). */
@@ -3069,14 +3257,15 @@ static int wb_tex_back(const tex_t *t, id<MTLTexture> mt, unsigned layers) {   /
     }
     enc_b_end(b); cb_commit(cb); cb_wait(cb);
     if (totk_tl_on()) totk_tl(TL_WB_STEP, 3, t->serial);
-    if (!wb_target_lock(t)) return WB_POOL_GONE;
+    void *tok;
+    if (!wb_target_begin(t, &tok)) return WB_POOL_GONE;
     const uint8_t *src = (const uint8_t *)buf.contents; int bad = 0; off = 0;
     for (unsigned l = 0; l < t->d.levels && !bad; l++) for (unsigned y = 0; y < layers && !bad; y++) {
         uint32_t lw = MAX(t->d.width >> l, 1u), lh = MAX(t->d.height >> l, 1u);
         size_t lp = (size_t)((lw + bw - 1) / bw) * bpb, lr = (lh + bh - 1) / bh;
         bad = nvn_swizzle(&t->d, l, y, src + off, lp, t->mem); off += lp * lr;
     }
-    pthread_mutex_unlock(&g_mu);
+    wb_target_end(tok);
     if (bad) return 0;
     g_wb_bytes += total;
     }
@@ -3242,13 +3431,8 @@ static void wb_write_list_body(wb_ent **list, int nl, int force) {
             wb_ent_free(e); continue;
         }
         if (!mt || bc_unpack(t->d.format, &upf, &ubpp) || t->d.target == 2 || t->d.samples > 1) { if (++g_wb_skip_fmt <= 8) MLOG("【红】GPU 写回内存：不支持的贴图 ser=%llu 格式 %#x 目标 %d", (unsigned long long)t->serial, t->d.format, t->d.target); wb_ent_free(e); continue; }
-        /* the GPU's bytes landing in memory: not a CPU write (with dm_guest_write_prepare the page this texture shares
-           with a neighbour counted as written, and the neighbour's own write-back was skipped as "CPU wrote since") */
-        void *tok = nvn_dirty_tracked(t->mem, t->L.size) ? nvn_dirty_gpu_write_begin(t->mem, t->L.size) : NULL;
-        if (!tok) dm_guest_write_prepare(t->mem, t->L.size);
         unsigned layers = t->L.layers ? t->L.layers : 1; int ok = 1; BOTW_WB_FROM_STAGE(e, ok, layers)
         if (ok == 1 && layers) ok = wb_tex_back(t, mt, layers);   // layers 0: written back from the stage
-        nvn_dirty_gpu_write_end(tok);
         if (ok == WB_POOL_GONE) { wb_ent_free(e); continue; }   // counted and logged by wb_target_lock
         if (ok) { BOTW_WB_LANDED(t) uint64_t d = ++g_wb_done; if (d <= 8 || d % 500 == 0) MLOG("[writeback] ser=%llu %ux%u nvnfmt=%#x lv%u：GPU 渲染结果写回内存（累计 %llu 张 / %llu MB，CPU 已改写而跳过 %llu 张）", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, t->d.levels, (unsigned long long)d, (unsigned long long)(g_wb_bytes >> 20), (unsigned long long)g_wb_skip_cpu); }
         else MLOG("【红】GPU 写回内存失败 ser=%llu 格式 %#x", (unsigned long long)t->serial, t->d.format);
@@ -3393,22 +3577,20 @@ static MTLTextureDescriptor *tex_desc(const tex_t *t, int packaged) {
     if (tex_swizzle(t, t->d.format, &sw) && !(d.usage & (MTLTextureUsageRenderTarget | MTLTextureUsageShaderWrite))) d.swizzle = sw;
     return d;
 }
-// 就地升级：原贴图没开 PixelFormatView（缺省不开，保住苹果显卡无损压缩）却要建换格式视图时，按原规格 + PixelFormatView 新建、逐 slice × level 拷过去并替换登记。
-// 计数：选角 / 营地 / 野外 / 战斗 4 页 17473 张贴图换格式视图 0 次，所以这里是兜底，不靠预测哪些贴图需要
-// In-place upgrade: when the original texture was not created with PixelFormatView (off by default, to keep Apple GPU lossless compression) but a different-format view is needed, create a new one with the original spec + PixelFormatView, copy over every slice × level, and replace the registration.
-// Count: across the 4 screens character select / camp / wilderness / combat, 17473 textures needed a different-format view 0 times, so this is a fallback and does not rely on predicting which textures need it
-static id<MTLTexture> tex_upgrade_pfv(const tex_t *t, id<MTLTexture> base, MTLPixelFormat view_pf) {
+// 就地补齐后来才需要的换格式视图 / 图像写入用途，逐 slice × level 保留内容并替换登记。
+// Add late format-view / image-write usage, preserving every slice and mip before replacing the registration.
+static id<MTLTexture> tex_upgrade_usage(const tex_t *t, id<MTLTexture> base, MTLTextureUsage usage) {
     if (g_tex_preparing && rp_active()) { g_tex_prepare_split = 1; return base; }
     { stor_key k;   // TOTK: a storage-shared base is recreated for every serial holding it, then this serial re-resolves
-      if (stor_key_lookup(base, &k)) { if (!stor_recreate(&k, base.usage | MTLTextureUsagePixelFormatView)) return base; id<MTLTexture> nb = tex_mtl(t); return nb ? nb : base; } }
+      if (stor_key_lookup(base, &k)) { if (!stor_recreate(&k, base.usage | usage)) return base; id<MTLTexture> nb = tex_mtl(t); return nb ? nb : base; } }
     MTLTextureDescriptor *d = [MTLTextureDescriptor new];
-    d.textureType = base.textureType; d.pixelFormat = base.pixelFormat; d.width = base.width; d.height = base.height; d.depth = base.depth;   // 保留原格式，只加换格式视图用途 | Keep the original format, only add the format-view usage
+    d.textureType = base.textureType; d.pixelFormat = base.pixelFormat; d.width = base.width; d.height = base.height; d.depth = base.depth;
     d.swizzle=base.swizzle;
     d.arrayLength = base.arrayLength; d.mipmapLevelCount = base.mipmapLevelCount; d.sampleCount = base.sampleCount;
     d.storageMode = base.storageMode; d.cpuCacheMode = base.cpuCacheMode; d.hazardTrackingMode = base.hazardTrackingMode;
-    d.resourceOptions = base.resourceOptions; d.usage = base.usage | MTLTextureUsagePixelFormatView;
+    d.resourceOptions = base.resourceOptions; d.usage = base.usage | usage;
     id<MTLTexture> upgraded = [g_dev newTextureWithDescriptor:d];
-    if (!upgraded) { RED_ONCE(45, "贴图升级失败 ser=%llu 格式 %lu → %lu", t->serial, (unsigned long)base.pixelFormat, (unsigned long)view_pf); return base; }
+    if (!upgraded) { RED_ONCE(45, "texture usage upgrade failed ser=%llu format %lu usage %#lx", t->serial, (unsigned long)base.pixelFormat, (unsigned long)usage); return base; }
     res_add(upgraded);
     id<MTL4ComputeCommandEncoder> b = blit();
     NSUInteger slices = base.textureType == MTLTextureType3D ? 1 : base.arrayLength * (base.textureType == MTLTextureTypeCube || base.textureType == MTLTextureTypeCubeArray ? 6 : 1);
@@ -3422,7 +3604,7 @@ static id<MTLTexture> tex_upgrade_pfv(const tex_t *t, id<MTLTexture> base, MTLPi
     id holder = serial_get(t->serial);
     if ([holder isKindOfClass:[NvPkg class]]) { id<MTLTexture> old = ((NvPkg *)holder)->tex; ((NvPkg *)holder)->tex = upgraded; memset(&((NvPkg *)holder)->key, 0, sizeof(reup_key)); defer_obj_release(old); ser_bump(t->serial); }   // key 0: the upgraded texture is not recycled
     else serial_put(t->serial, upgraded);
-    MLOG("贴图升级为可换格式视图 ser=%llu 基格式 %lu → 视图格式 %lu（升级次数=%llu）", t->serial, (unsigned long)base.pixelFormat, (unsigned long)view_pf, ++g_pfv_upgrades);
+    MLOG("texture usage upgraded ser=%llu format %lu usage %#lx (upgrades=%llu)", t->serial, (unsigned long)base.pixelFormat, (unsigned long)d.usage, ++g_pfv_upgrades);
     return upgraded;
 }
 static int stor_key_lookup(id o, stor_key *k) {
@@ -3601,6 +3783,32 @@ static void stor_sweep(uint64_t fence) {
 static void stor_drop_range(uintptr_t lo, uintptr_t hi) {
     stor_collect_drop(^int(const stor_ent *e) { return e->k.mem >= lo && e->k.mem < hi; }, &g_stor_dropped);
     stor_det_sweep(^int(const stor_ent *e) { return e->k.mem >= lo && e->k.mem < hi; }, &g_stor_dropped);
+}
+/* Storage diagnostic accounting (g_smu held). */
+typedef struct {
+    unsigned long long n, bytes, held, idle, idle_bytes, dead_only, dead_bytes, holders, dead_holders;
+} stor_diag;
+static void stor_diag_add(stor_diag *s, const stor_ent *e) {
+    id<MTLTexture> t = (__bridge id<MTLTexture>)e->tex;
+    unsigned long long bytes = t.allocatedSize, dead = 0;
+    for (int i = 0; i < e->nser; i++) dead += totk_serial_has(&g_dead_serial, e->ser[i]) != 0;
+    s->n++; s->bytes += bytes; s->holders += e->nser; s->dead_holders += dead;
+    if (e->nser) {
+        s->held++;
+        if (dead == (unsigned)e->nser) { s->dead_only++; s->dead_bytes += bytes; }
+    } else { s->idle++; s->idle_bytes += bytes; }
+}
+static void stor_diag_report(void) {
+    const char *on = getenv("TOTK_STORAGE_REPORT"); if (!on || !atoi(on)) return;
+    // A budget failure can occur inside resource work: never wait for another registry lock here.
+    if (pthread_mutex_trylock(&g_smu)) { MLOG("[storage-live] skipped: storage registry busy"); return; }
+    stor_diag s = {0};
+    for (uint32_t i = 0; i < g_by_storage.cap; i++) if (g_by_storage.vals[i]) stor_diag_add(&s, g_by_storage.vals[i]);
+    for (int i = 0; i < g_stor_ndet; i++) stor_diag_add(&s, g_stor_det[i]);
+    int detached = g_stor_ndet;
+    pthread_mutex_unlock(&g_smu);
+    MLOG("[storage-live] bases=%llu bytes=%llu held=%llu idle=%llu idle-bytes=%llu dead-only=%llu dead-bytes=%llu holders=%llu dead-holders=%llu detached=%d",
+         s.n, s.bytes, s.held, s.idle, s.idle_bytes, s.dead_only, s.dead_bytes, s.holders, s.dead_holders, detached);
 }
 // 预排布贴图上传：先设只读、再取戳、再读池内存解排布进暂存缓冲，blit 进新的 private 贴图。
 // 批量：一次回放提交内的上传共用一个上传命令缓冲（计算编码器解排布 + 统一 blit），在回放命令缓冲提交前冲刷；
@@ -4447,6 +4655,7 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
     MLOG("[pkg-final-cache] enabled=%d kept=%llu", pkg_final_cache_on(), (unsigned long long)atomic_load(&g_pkg_final_kept));
     MLOG("贴图类型缓存已回收退役视图 %llu 个", (unsigned long long)g_type_retired_views);
     res_site_report(8);
+    stor_diag_report();
 }
 void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads) { *uploads = g_pkg_uploads; *reuploads = g_pkg_reuploads; }
 uint64_t mtl_pkg_miss(void) { return g_pkg_miss; }
@@ -4544,7 +4753,7 @@ static int passdump_slow(void) {
 }
 /* TOTK: TOTK_INPUT_FILE command "passdump <n>": full pass dump (as DM_NVN_PASSDUMP_ALL) of the n frames after the next one. */
 void dm_gfx_passdump_next(long n) { g_pd_n = n > 0 && n < 16 ? n : 1; g_pd_at = (long)atomic_load(&g_cur_frame) + 2; g_pd_armed = 1; MLOG("[pass] 按输入文件转储帧 %ld 起 %ld 帧", g_pd_at, g_pd_n); }
-#define PD(...) do { if (passdump()) { fprintf(stderr, "[pass] F%llu ", (unsigned long long)atomic_load(&g_cur_frame)); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } } while (0)
+#define PD(...) do { if (passdump()) { fprintf(stderr, "[pass] F%llu E%d ", (unsigned long long)atomic_load(&g_cur_frame), g_eye_pass); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } } while (0)   /* E0: a fixed field (scripts parse the line) */
 static void pd_xfer(const char *what, uint64_t src, uint64_t dst, uint64_t n) { PD("X %llu %s src=%#llx dst=%#llx n=%#llx", g_stat_pass, what, (unsigned long long)src, (unsigned long long)dst, (unsigned long long)n); }
 static void pd_update_bytes(const void *data, uint64_t dst, uint64_t n, uint64_t seq) {
     if (passdump()) { const char *dir = getenv("DM_NVN_CBDUMP"); if (dir && n <= 65536) {
@@ -5123,7 +5332,7 @@ static void vr_image_projection(vr_projection_image image){
     float fov[4]={0},rotation[9]={0};int have=vr_projection_graph_get(image,fov)&&vr_projection_graph_rotation(image,rotation);
     vr_source_projection(have?fov:NULL,have?rotation:NULL);
     if(passdump())MLOG("[vr-image] F%llu P%llu eye=%d pool=%p off=%llx grid=%ux%u mapped=%d rays=%.9g,%.9g,%.9g,%.9g rotation=%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g",
-        (unsigned long long)atomic_load(&g_cur_frame),(unsigned long long)g_stat_pass,g_eye_pass,
+        (unsigned long long)atomic_load(&g_cur_frame),(unsigned long long)g_stat_pass,0,
         (__bridge void *)image.allocation,(unsigned long long)image.offset,image.width,image.height,have,
         fov[0],fov[1],fov[2],fov[3],rotation[0],rotation[1],rotation[2],rotation[3],rotation[4],rotation[5],rotation[6],rotation[7],rotation[8]);
 #else
@@ -5137,7 +5346,7 @@ static id<MTLTexture> attachment_texture(const tex_t *t, const view_t *v, int ha
     MTLPixelFormat bpf = b0.pixelFormat, pf = attachment_format(t, v, has_v, bpf);
     if (pf == bpf) return b0;
     id<MTLTexture> base = b0;
-    if (tex_need_pfv(base.pixelFormat, pf) && !(base.usage & MTLTextureUsagePixelFormatView)) base = tex_upgrade_pfv(t, base, pf);
+    if (tex_need_pfv(base.pixelFormat, pf) && !(base.usage & MTLTextureUsagePixelFormatView)) base = tex_upgrade_usage(t, base, MTLTextureUsagePixelFormatView);
     /* Bounded cache: views retain their base. Evictions remain resident until their last submit finishes. */
     static id<MTLTexture> views[32]; static unsigned next;
     for (unsigned i = 0; i < 32; i++) if (views[i].parentTexture == base && views[i].pixelFormat == pf) return views[i];
@@ -5164,24 +5373,6 @@ static void attach(MTLRenderPassAttachmentDescriptor *a, const tex_t *t, const v
    target with the presented texture's aspect ratio before a pass into a presented texture: 1920x1080 docked, 1280x720 in
    handheld mode, where the final pass scales it to the 1920x1080 swapchain), notes the G-buffer depth (three or more
    colour targets and a D32F depth of their size) and, once the scene is copied, adds the UI attachment to canvas passes. */
-/* Stereo B2: the presented textures (serials, at each present) and the last pass this replay drew into one of them, whatever
-   the picture mode (canvas_learn runs only with TOTK_MFX or the ultrawide UI squeeze). */
-static uint64_t g_b2_presented[4]; static int g_b2_npresented;
-static void b2_note_present(const tex_t *t) {
-    for (int i = 0; i < g_b2_npresented; i++) if (g_b2_presented[i] == t->serial) return;
-    g_b2_presented[g_b2_npresented < 4 ? g_b2_npresented++ : (int)(t->serial % 4)] = t->serial;
-}
-static void b2_note_pass(MTL4RenderPassDescriptor *pd) {
-    if (!g_eye_pass || R.rt.n < 1 || !R.rt.color[0]) return;
-    if (g_eye_region == (uint32_t)g_eye_pass && pd.colorAttachments[0].texture) { g_b2_scene[g_eye_pass] = pd.colorAttachments[0].texture; g_b2_scene_pass[g_eye_pass] = g_stat_pass; }
-    for (int i = 0; i < g_b2_npresented; i++) if (g_b2_presented[i] == R.rt.color[0]->serial) {
-        g_b2_swap = pd.colorAttachments[0].texture;
-        g_b2_image=vr_native_image(R.rt.color[0],&R.rt.cview[0],R.rt.has_cview[0]);
-        if (atomic_load(&g_b2_passlog) > 0) MLOG("[vr] b2pass: eye %d pass %llu region %u into presented texture serial %llu (%lux%lu, load %lu, %d colour targets), mtl %p",
-            g_eye_pass, (unsigned long long)g_stat_pass, g_eye_region, (unsigned long long)R.rt.color[0]->serial, (unsigned long)g_b2_swap.width, (unsigned long)g_b2_swap.height,
-            (unsigned long)pd.colorAttachments[0].loadAction, R.rt.n, (__bridge void *)g_b2_swap);
-        return; }
-}
 static void canvas_learn(MTL4RenderPassDescriptor *pd) {
     const tex_t *t0 = R.rt.n > 0 ? R.rt.color[0] : NULL;
     id<MTLTexture> c0 = t0 ? pd.colorAttachments[0].texture : nil;
@@ -5482,7 +5673,6 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
         if (c0 && dt && nc >= 3) { size_t k = strlen(g_fl_passes); if (k < sizeof g_fl_passes - 24) snprintf(g_fl_passes + k, sizeof g_fl_passes - k, " %d:%lux%lu/%d", g_fl_npass, (unsigned long)c0.width, (unsigned long)c0.height, nc); g_fl_npass++; }
     }
     if (taa_pass(pd) == 2) g_mfx.want_cam = 1;   // TOTK_TAA: the G-buffer pass found; its first draw gives the camera
-    if (g_b2_retake) { g_vr_cam_taken = 0; g_b2_retake = 0; }   // stereo B2: a new eye pass asks for the camera again
     if (mfx_enabled()) mfx_pass_setup(pd);   // TOTK: MetalFX scene / UI attachments, G-buffer depth
     else if (!g_vr_cam_taken && vr_wants_camera() && g_vr_camtake) {   // VR head look: this frame's camera, from the G-buffer pass's first draw (as MetalFX finds it)
         const tex_t *t0 = R.rt.n > 0 ? R.rt.color[0] : NULL; id<MTLTexture> c0 = t0 ? pd.colorAttachments[0].texture : nil, dt = pd.depthAttachment.texture;
@@ -5492,7 +5682,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) {
         }
     }
     else if (uw_ratio()) canvas_learn(pd);   // key 4: the canvas the UI is squeezed in
-    b2_note_pass(pd);   // stereo B2: the left pass's picture
+    if (g_eye_pass) eye_note_pass(pd);   // stereo replay: this eye's picture
     g_enc = enc_r_begin(pd);
     args_dirty_all();
     g_stat_pass++;
@@ -6179,10 +6369,6 @@ static NvShader *shader_load(NSString *pc, int stage) {
     return o;
 }
 
-static int stage_of(NSString *zh) {
-    if ([zh isEqualToString:@"顶点"]) return 0; if ([zh isEqualToString:@"像素"]) return 1; if ([zh isEqualToString:@"计算"]) return 5;
-    if ([zh isEqualToString:@"外壳"]) return 3; if ([zh isEqualToString:@"域"]) return 4; return -1;
-}
 #define NVN_RT_RANGE_RO_IMPL 1
 // 私有续用只接受明确RO的B反射，sbuf缺rw不把默认0当证明；不改变既有反射/翻译链。
 // Private continuation accepts only B reflection that is explicitly RO; a missing rw on sbuf does not let the default 0 count as proof; does not change the existing reflection / translation chain.
@@ -6454,7 +6640,7 @@ void mtl_prog_release(prog_t *p) { if (p->serial) serial_del(p->serial); }
 // and no live texture was found at its storage yet, so every serial-table step re-checks it (see tex_by_id).
 typedef struct { tex_t t; int ok; view_t v; int has_v; void *view; uint64_t view_id, view_rid, view_ser, view_dirty;
     uint64_t indexed_serial, used; int view_prev, view_next; uint8_t view_pkg, dead_pending;
-    uint8_t view_tt; void *view_parent; } treg_t;   // used (TOTK): last submission that resolved this id
+    uint8_t view_tt, image_ready; void *view_parent, *image_view; uint64_t prompt_revision; } treg_t;   // used (TOTK): last submission that resolved this id
 /* TOTK: view_tt / view_parent: textureType and parentTexture of view, read once when it is stored (a Metal texture never
    changes either). view_parent is only compared, never messaged; the view retains its parent while it is stored. */
 static treg_t *g_treg; static int g_ntreg;
@@ -6483,7 +6669,8 @@ static void treg_clear_view_locked(int tid) {
     treg_t *r = &g_treg[tid];
     treg_unlink_locked(tid);
     if (r->view) { defer_obj_unref((__bridge id)r->view); CFRelease(r->view); r->view = NULL; }
-    r->view_id = r->view_rid = r->view_ser = r->view_dirty = 0; r->view_pkg = r->dead_pending = 0; r->view_tt = 0; r->view_parent = NULL;
+    if (r->image_view) { defer_obj_unref((__bridge id)r->image_view); CFRelease(r->image_view); r->image_view = NULL; }
+    r->view_id = r->view_rid = r->view_ser = r->view_dirty = 0; r->view_pkg = r->dead_pending = 0; r->view_tt = r->image_ready = 0; r->view_parent = NULL;
 }
 // 贴图号 → 序号的无锁副本（回放热路径只要序号：写回前瞻索引、纯清除前提的绑定集合）：贴图号 20 位，固定 1M 项（BSS，只占碰过的页），
 // 登记时 release 写、读端 relaxed 原子读，不进 g_rmu（原 h_ser 每次查表加解锁，营地每帧数千次）
@@ -6777,6 +6964,13 @@ static void *tex_by_id_p(int tid) {   // 调用方持 g_rmu | Caller holds g_rmu
     { int pn = bound_tex_pool_n(); if (pn && tid >= pn) { if (!g_stat_tex_oob++) MLOG("池外贴图号 %d（绑定的池容量 %d）按空槽处理：读出 0", tid, pn); return NULL; } }
     if (tid < 0 || tid >= g_ntreg || !g_treg[tid].ok) { RED_ONCE(10, "贴图号 %d 未登记", tid); return NULL; }
     treg_t *rp = &g_treg[tid];
+    if (TOTK_PROMPT_ICONS_ON && rp->t.d.format == NVN_FORMAT_R8) {
+        uint64_t revision = totk_prompt_revision();
+        if (rp->prompt_revision != revision) {
+            treg_clear_view_locked(tid);
+            rp->prompt_revision = revision;
+        }
+    }
     rp->used = g_sub_serial;   // TOTK: the fast path below never reaches tex_mtl; pkg_evict_sweep reads this
     if (totk_life_on() && totk_life_match(&rp->t)) life_use(tid, &rp->t, "registered");
     uint64_t sg = g_ser_gen, dg = nvn_dirty_now();   // 先取代号再查：期间若有变更，下次必走慢路 | Take the generations first and then look up: if a change happens in between, the next time must take the slow path
@@ -6824,13 +7018,13 @@ static void *tex_by_id_p(int tid) {   // 调用方持 g_rmu | Caller holds g_rmu
             pf = base.pixelFormat == MTLPixelFormatDepth32Float_Stencil8 ? MTLPixelFormatX32_Stencil8 : base.pixelFormat == MTLPixelFormatStencil8 ? MTLPixelFormatStencil8 :
                  (uint32_t)MTLPixelFormatInvalid;
             if (pf == MTLPixelFormatInvalid) { RED_ONCE(101, "stencil view of a texture in Metal format %lu with no stencil plane: depth sampled", (unsigned long)base.pixelFormat); pf = (uint32_t)base.pixelFormat; }
-            else if (pf != base.pixelFormat && !(base.usage & MTLTextureUsagePixelFormatView)) { base = tex_upgrade_pfv(&rp->t, base, (MTLPixelFormat)pf); if (g_tex_prepare_split) return NULL; sg = g_ser_gen; }
+            else if (pf != base.pixelFormat && !(base.usage & MTLTextureUsagePixelFormatView)) { base = tex_upgrade_usage(&rp->t, base, MTLTextureUsagePixelFormatView); if (g_tex_prepare_split) return NULL; sg = g_ser_gen; }
         }
         { uint32_t upf; int ubpp; if (r.v.set_format && bc1_fmt(r.v.format) && pf_astc4(base.pixelFormat)) pf = (uint32_t)bc1_astc_pf(r.v.format);   // TOTK: BC1 view of a transcoded (ASTC) texture
           else if (r.v.set_format && tc_pf(r.v.format) != MTLPixelFormatInvalid && tc_pf(r.t.d.format) == base.pixelFormat) pf = (uint32_t)tc_pf(r.v.format);   // TOTK: view of a BC2/3/4/5/7 texture stored transcoded (tex_tc)
           else if (r.v.set_format && bc_unpack(r.v.format, &upf, &ubpp)) pf = upf; }   // 无 BC：BC 视图跟底图一样换成解压后的格式 | No BC: a BC view is switched to the decompressed format just like the base texture
         if (r.v.set_format && tex_need_pfv(base.pixelFormat, (MTLPixelFormat)pf) && !(base.usage & MTLTextureUsagePixelFormatView)) {
-            base = tex_upgrade_pfv(&rp->t, base, (MTLPixelFormat)pf);
+            base = tex_upgrade_usage(&rp->t, base, MTLTextureUsagePixelFormatView);
             if (g_tex_prepare_split) return NULL;
             sg = g_ser_gen;
         }
@@ -6858,6 +7052,12 @@ static void *tex_by_id_p(int tid) {   // 调用方持 g_rmu | Caller holds g_rmu
           } }
         v = need_swz ? [base newTextureViewWithPixelFormat:(MTLPixelFormat)pf textureType:tt levels:NSMakeRange(l0, nl) slices:NSMakeRange(s0, ns) swizzle:vsw]
                      : [base newTextureViewWithPixelFormat:(MTLPixelFormat)pf textureType:tt levels:NSMakeRange(l0, nl) slices:NSMakeRange(s0, ns)];
+        /* Metal swizzled views are read-only; image slots need the same subresources without sampling swizzles. */
+        if (v && !(v.usage & MTLTextureUsageShaderWrite) && (base.usage & MTLTextureUsageShaderWrite)) {
+            id<MTLTexture> image = [base newTextureViewWithPixelFormat:(MTLPixelFormat)pf textureType:tt levels:NSMakeRange(l0, nl) slices:NSMakeRange(s0, ns)];
+            if (!image) RED_ONCE(46, "writable texture view creation failed id %d", tid);
+            else { rp->image_view = (void *)CFBridgingRetain(image); atomic_fetch_add_explicit(&g_stat_views, 1, memory_order_relaxed); }
+        }
         atomic_fetch_add_explicit(&g_stat_views, 1, memory_order_relaxed);
         if (!v) { RED_ONCE(11, "贴图视图建不出 id %d", tid); v = base; }
     }
@@ -6900,6 +7100,14 @@ static inline __attribute__((always_inline)) uint64_t tex_fast_rid(int tid, void
     void *t=tex_fast(tid);if(out)*out=t;
     return t?((__bridge id<MTLTexture>)t).gpuResourceID._impl:0;
 }
+/* The same lookups for code that does not hold g_rmu (HDR, MetalFX, finish passes, diagnostics). The table they read
+   (g_treg) is reallocated when a game thread registers a texture past its end (mtl_reg_tex, under g_rmu): read without
+   the lock, the old block could be freed under the reader (2026-11-06, SIGSEGV in hdr_capture at the title's warm-up,
+   when many textures are registered). g_rmu is reentrant per thread, so a caller that holds it already is fine. */
+static inline void *tex_fast_lk(int tid) { registry_lock(); void *p = tex_fast(tid); registry_unlock(); return p; }
+/* The registered view itself, before tex_fast swaps in the HDR shadow: hdr_prepare_draw asks whether this very texture has one. */
+static inline void *tex_raw_lk(int tid) { registry_lock(); void *p = tex_view_valid(tid) ? g_treg[tid].view : tex_by_id_p(tid); registry_unlock(); return p; }
+static inline uint64_t tex_fast_rid_lk(int tid, void **out) { registry_lock(); uint64_t r = tex_fast_rid(tid, out); registry_unlock(); return r; }
 /* A texture bound to a slot its shader reads by integer texel coordinates (refl_mark_fetches) whose Metal copy left out
    the top mip level (mip_drop_of, the iPhone): kept at full size from now on (NvPkg keep_full) and uploaded again at once
    (tex_mtl_p, as for a copy the GPU starts rendering into), so this very draw reads the right texels. Returns whether it
@@ -8361,6 +8569,7 @@ static id<MTLRenderPipelineState> pso_new(MTLRenderPipelineDescriptor *d, NSStri
         par_pre_note(ps != nil);
         if (ps) { par_count(1); return ps; }
         par_miss_note("miss", key, d);
+        par_stale(key);
     } else par_miss_note(atomic_load(&par_filling) ? "fill" : "nofile", key, d);
     if (key && g_par_on) par_count(0);
     ps = [g_dev newRenderPipelineStateWithDescriptor:d error:e];
@@ -8377,6 +8586,7 @@ static id<MTLComputePipelineState> cs_new_(NvShader *cs, MTLComputePipelineDescr
         par_pre_note(ps != nil);
         if (ps) { par_count(1); return ps; }
         d.binaryArchives = nil;
+        par_stale(key);
     }
     if (g_par_on) par_count(0);
     ps = [g_dev newComputePipelineStateWithDescriptor:d options:MTLPipelineOptionNone reflection:nil error:e];
@@ -8530,7 +8740,8 @@ static MTLRenderPipelineDescriptor *pso_desc(const pso_key *k, NvShader *vs, NvS
         int l = merged ? k->lmap[i] : i;
         uint32_t m = l == 0xff ? 0 : (k->chmask >> (4 * l)) & 0xf;
         c.writeMask = (m & 1 ? MTLColorWriteMaskRed : 0) | (m & 2 ? MTLColorWriteMaskGreen : 0) | (m & 4 ? MTLColorWriteMaskBlue : 0) | (m & 8 ? MTLColorWriteMaskAlpha : 0);
-        if (l != 0xff && k->blend_en >> l & 1 && !(hilited && getenv("TOTK_GPU_HILITE_NOBLEND"))) {   /* TOTK diagnostic: highlighted draws can be drawn without blending */
+        /* Metal aborts the process on blending over an integer format, so such an output is written as it comes (probe-gpu-fout). TOTK diagnostic: highlighted draws can be drawn without blending */
+        if (l != 0xff && k->blend_en >> l & 1 && pfmt_class((MTLPixelFormat)k->cfmt[i]) == 'f' && !(hilited && getenv("TOTK_GPU_HILITE_NOBLEND"))) {
             c.blendingEnabled = YES;
             c.sourceRGBBlendFactor = bfac(k->blend[l].src_rgb); c.destinationRGBBlendFactor = bfac(k->blend[l].dst_rgb);
             c.sourceAlphaBlendFactor = bfac(k->blend[l].src_a); c.destinationAlphaBlendFactor = bfac(k->blend[l].dst_a);
@@ -9194,7 +9405,7 @@ static int par_row_have(const pso_skey *sk, int vborder, int fz, NSString *varia
     NSMutableData *b = [NSMutableData dataWithBytes:&ak length:sizeof ak]; [b appendData:[variant dataUsingEncoding:NSUTF8StringEncoding]];
     NSString *key = par_hash(b.bytes, b.length);
     pthread_mutex_lock(&g_par_mu); BOOL have = [g_par_have containsObject:key]; pthread_mutex_unlock(&g_par_mu);
-    return have;
+    return have && !g_par_recheck;   // packaging makes it against the archive (g_par_recheck)
 }
 /* A B row (pso_adopt): the pipeline with its border variants, built from the recipe instead of bound samplers.
    keep 0 (warm_fill_archive): built into the pipeline archive and dropped; 2 when the archive has it already. */
@@ -9462,7 +9673,7 @@ static void warm_filled(void) {
    while playing (14 -> 28 ms per frame, 30 -> 20 fps). The next start goes over the list again; rows already in the
    cache take a few ms each. TOTK_WARM_LIGHT=0 turns it off. */
 static _Atomic int g_world_on;   // set at the first world frame (hle_nvn.c, nvnQueuePresentTexture)
-void mtl_note_world(void) { atomic_store(&g_world_on, 1); }
+void mtl_note_world(void) { atomic_store(&g_world_on, 1); fps_board_start(); }
 static void warm_light(void) {
 #if TARGET_OS_IPHONE
     const char *e = getenv("TOTK_WARM_LIGHT"); if (e && !atoi(e)) return;
@@ -9521,7 +9732,7 @@ static void fill_row(NSString *line, NSMutableDictionary<NSString *, NvShader *>
            state description); a start then reads the list without loading a shader */
         pso_skey ak = sk; memset(&ak.fz_desc, 0, sizeof ak.fz_desc);
         pthread_mutex_lock(&g_par_mu); BOOL have = [g_par_have containsObject:par_hash(&ak, sizeof ak)]; pthread_mutex_unlock(&g_par_mu);
-        if (have) { atomic_fetch_add(&fc->nhave, 1); return; }
+        if (have && !g_par_recheck) { atomic_fetch_add(&fc->nhave, 1); return; }   // packaging makes it against the archive
         NSString *vkey = warm_key(sk.vs, sizeof sk.vs), *fkey = warm_key(sk.fs, sizeof sk.fs);
         NvShader *vs = vkey.length ? warm_shader(dict, vkey, sk.vs_stage) : nil, *fs = fkey.length ? warm_shader(dict, fkey, sk.fs_stage) : nil;
         if (!vs || (fkey.length && !fs)) { atomic_fetch_add(&fc->nfail, 1); return; }
@@ -9531,7 +9742,7 @@ static void fill_row(NSString *line, NSMutableDictionary<NSString *, NvShader *>
     } else if ([c[0] isEqualToString:@"C"] && c.count >= 2 && [c[1] length]) {
         const char *ck = c[1].UTF8String;
         pthread_mutex_lock(&g_par_mu); BOOL have = [g_par_have containsObject:[@"c" stringByAppendingString:par_hash(ck, strlen(ck))]]; pthread_mutex_unlock(&g_par_mu);
-        if (have) { atomic_fetch_add(&fc->nhave, 1); return; }
+        if (have && !g_par_recheck) { atomic_fetch_add(&fc->nhave, 1); return; }
         NvShader *cs = warm_shader(dict, c[1], 5); if (!cs) { atomic_fetch_add(&fc->nfail, 1); return; }
         NSError *er = nil; ps = cs_new(cs, &er);
         if (ps) atomic_fetch_add(&fc->nc, 1);
@@ -9639,8 +9850,15 @@ int mtl_pipeline_archive_tool(int argc, char **argv) {
         if (![NSFileManager.defaultManager isReadableFileAtPath:@(argv[i])]) MDIE("pipeline-archive: cannot read %s", argv[i]);
         [lists addObject:@(argv[i])];
     }
+    const char *recheck = getenv("TOTK_PAR_RECHECK");
+    g_par_recheck = recheck && !strcmp(recheck, "1");
     dispatch_semaphore_t done = dispatch_semaphore_create(0);
     warm_fill_archive(lists, done); dispatch_semaphore_wait(done, DISPATCH_TIME_FOREVER);
+    if (g_par_recheck) {
+        NSUInteger pruned = par_prune_superseded();
+        MLOG("管线存档：按这个运行时核对，%llu 条和存档里的不一样，重新编进新文件；删掉被完全取代的旧文件 %lu 个",
+             (unsigned long long)atomic_load(&g_par_stale), (unsigned long)pruned);
+    }
     printf("{\"render\": %llu, \"compute\": %llu, \"kept\": %llu, \"failed\": %llu, \"seconds\": %.1f, \"write_failed\": %llu, \"arch\": \"%s\"}\n",
            g_fill_last.render, g_fill_last.compute, g_fill_last.have, g_fill_last.failed, g_fill_last.seconds, (unsigned long long)atomic_load(&g_par_write_failed),
            g_dev.architecture.name.UTF8String ?: "");
@@ -9753,17 +9971,9 @@ static void warm_start(void) {
        own list, the rest behind it (before 2026-10-23). */
     const char *bt = getenv("TOTK_WARM_BEFORE_TITLE");
     int before = !(bt && !atoi(bt));
-#if !TARGET_OS_IPHONE
-    /* Mac with a valid archive (user 2026-10-29: "桌面 王国 每次打开 都预热"): nothing is left to compile or save, the wait
-       only read 19,908 libraries and 30,642 pipelines back from disk, 16.7-18.6 s before the title on every start. The
-       title comes now and that goes on behind the menu; the first world frame still waits for all of it (hle_nvn.c,
-       mtl_warm_wait without a limit on the Mac), so play starts with every listed pipeline ready, as before.
-       TOTK_WARM_BEFORE_TITLE=1: wait before the title anyway. */
-    if (!bt && g_par_valid && !g_par_fill_lists && !g_shared_fill) {
-        before = 0;
-        MLOG("预热：管线存档齐全，标题不等预热读完，剩下的在菜单后面读，进世界前等它做完");
-    }
-#endif
+    /* Every game waits before the title on the Mac too, archive complete or not (user 2026-11-11: "所有塞尔达 都是 预热玩 进标题！",
+       then "大金刚和 Pokopia 也是 所有游戏都是"). From 2026-10-29 ("桌面 王国 每次打开 都预热") a complete archive let the title
+       come at once and the warm-up go on behind the menu; Ocarina of Time (games/oot) dropped it the same day. */
     if (before) {
         uint64_t t1 = bp_now();
         while (atomic_load(&g_warm_running)) usleep(5000);
@@ -9934,37 +10144,59 @@ static uint64_t gml_take(void) {
 }
 // useResource 在同一编码器内对同一（资源, 用法, 阶段）是幂等的：记下本渲染编码器已声明过的，重复的跳过（计算编码器每次派发新建，不去重）
 // useResource is idempotent for the same (resource, usage, stage) within one encoder: remember what this render encoder has already declared and skip repeats (a compute encoder is created anew for each dispatch, no dedup)
-/* A mip-chain pass: it renders level n of a texture while its shader samples level n - 1 through a view covering the whole
-   chain (explicit level, linear mip filter). NVIDIA's GPU reads level n - 1 only; Metal may also fetch level n, at weight 0
-   but fetched, and an attached level read through a texture holds no defined data on Apple's GPUs: 0 x NaN is NaN.
+/* A mip-chain pass: it renders level n of a texture while its shader samples another level of it through a view covering the
+   whole chain. NVIDIA's GPU reads that level only. Reading level n - 1 with a linear mip filter, Metal may also fetch level n,
+   at weight 0 but fetched, and an attached level read through a texture holds no defined data on Apple's GPUs: 0 x NaN is NaN.
    Donkey Kong Bananza's environment cube got NaN texels that spread through reflections and bloom (bright blotches with
    black specks). So when the sampled texture is an attachment of the open pass and its view's levels include the attached
-   level and start below it, the draw samples a view of the levels below the attached one (same base, so the shader's
-   level numbers keep their meaning). A pass rendering the view's base level, and layered views, are left as they are.
-   From seedds/nxnative's fb_prepare (MIT; docs/reference/rendering.md there, "Mip-chain pass sampling the level it renders"). */
+   level, the draw samples a view without it:
+   - A sampler that pins one level gets that level alone, on whichever side of the attached level it lies. An upsample renders
+     level n from level n + 1 this way; in a view ending at level n - 1 Metal clamped the read to level n - 1, a sharper level
+     the chain added up in place of the wide ones (Tears of the Kingdom's glow: fat marks in a tight, blocky halo).
+   - Any other sampler gets the levels below the attached one (same base, so the shader's level numbers keep their meaning).
+     Rendering the view's base level leaves it nothing to read, so that view stays as it is; so do layered views.
+   From seedds/nxnative's fb_prepare and fb_pinned_level (MIT; docs/reference/rendering.md there, "Mip-chain pass sampling the
+   level it renders" and "Upsample pass reading the level above the one it renders"). */
 static void rt_sub(const p_set_rt *r, int k, uint64_t *ser, int *lv, int *sl);
-static id<MTLTexture> mip_feedback_view(id<MTLTexture> t, uint64_t serial) {
+// The levels (from, count) a draw samples when it renders level lv of a view of base + n levels, its sampler pinning level pin of the view (-1: none); 0: the view stays as it is
+static int mip_feedback_levels(int base, int n, int lv, int pin, int *from, int *count) {
+    if (lv < base || lv >= base + n) return 0;
+    if (pin >= n) pin = n - 1;   // past the view's levels: its last one, where the sampler's clamp ends
+    if (pin >= 0 && base + pin != lv) { *from = base + pin; *count = 1; return 1; }
+    *from = base; *count = lv - base;
+    return lv > base;
+}
+// The level a draw's sampler pins through texture slot reg (combined handle's sampler sid), from the view's base, or -1. Only a combined handle's sampler (the shader's SAMPT binding of the same
+// slot) is known here: with a mip filter, a minimum and a maximum LOD that are the same whole number pin every fetch to that level, whatever LOD the shader asks for. g_rmu is held (encode_args)
+static int mip_pinned_level(const NvShader *sh, unsigned reg, int sid) {
+    int combined = 0; for (int j = 0; j < sh->rf.nb && !combined; j++) combined = sh->rf.b[j].kind == NVN_RB_SAMPT && sh->rf.b[j].reg == reg;
+    if (!combined || sid <= 0 || sid >= g_nsreg || !g_sreg_ok[sid]) return -1;
+    const samp_par *p = &g_sreg[sid];
+    if (p->minf < 2 || p->lod_min != p->lod_max || p->lod_min < 0 || p->lod_min > 15 || p->lod_min != floorf(p->lod_min)) return -1;   // minf 0, 1: no mip filter, the base level
+    return (int)p->lod_min;
+}
+static id<MTLTexture> mip_feedback_view(id<MTLTexture> t, uint64_t serial, const NvShader *sh, unsigned reg, int sid) {
     id<MTLTexture> root = t.parentTexture ? t.parentTexture : t;
     NSUInteger base = t.parentTexture ? t.parentRelativeLevel : 0, n = t.mipmapLevelCount;
     if (n < 2) return nil;
     for (int k = 0; k < R.rt.n && k < 8; k++) {
         if (!R.rt.color[k]) continue;
-        uint64_t ser = 0; int lv = 0, sl = 0; rt_sub(&R.rt, k, &ser, &lv, &sl);
-        if (ser != serial || lv <= (int)base || (NSUInteger)lv >= base + n) continue;
+        uint64_t ser = 0; int lv = 0, sl = 0, from, count; rt_sub(&R.rt, k, &ser, &lv, &sl);
+        if (ser != serial || !mip_feedback_levels((int)base, (int)n, lv, mip_pinned_level(sh, reg, sid), &from, &count)) continue;
         MTLTextureType ty = t.textureType;
         NSUInteger slices = ty == MTLTextureTypeCube ? 6 : ty == MTLTextureTypeCubeArray ? t.arrayLength * 6 : t.arrayLength;
         if (ty == MTLTextureType3D) slices = 1;
         NSUInteger first = t.parentTexture ? t.parentRelativeSlice : 0;
         static NSMutableDictionary *cache; if (!cache) cache = [NSMutableDictionary dictionary];
-        NSString *key = [NSString stringWithFormat:@"%p/%lu/%lu/%lu/%lu/%lu/%lu", (__bridge void *)root, (unsigned long)base, (unsigned long)(lv - base),
+        NSString *key = [NSString stringWithFormat:@"%p/%d/%d/%lu/%lu/%lu/%lu", (__bridge void *)root, from, count,
                          (unsigned long)ty, (unsigned long)t.pixelFormat, (unsigned long)first, (unsigned long)slices];
         id<MTLTexture> v = cache[key];
         if (!v) {
             if (cache.count > 512) [cache removeAllObjects];
-            v = [root newTextureViewWithPixelFormat:t.pixelFormat textureType:ty levels:NSMakeRange(base, (NSUInteger)lv - base) slices:NSMakeRange(first, slices)];
-            if (!v) { RED_ONCE(100, "mip-chain feedback view failed (levels %lu+%d)", (unsigned long)base, lv - (int)base); return nil; }
+            v = [root newTextureViewWithPixelFormat:t.pixelFormat textureType:ty levels:NSMakeRange((NSUInteger)from, (NSUInteger)count) slices:NSMakeRange(first, slices)];
+            if (!v) { RED_ONCE(100, "mip-chain feedback view failed (levels %d+%d)", from, count); return nil; }
             res_add(v); cache[key] = v;
-            static int once; if (!once++) MLOG("[totk] a mip-chain pass samples the texture it renders level %d of: the draw reads levels %lu..%d only", lv, (unsigned long)base, lv - 1);
+            static int once; if (!once++) MLOG("[totk] a mip-chain pass samples the texture it renders level %d of: the draw reads levels %d..%d only", lv, from, from + count - 1);
         }
         return v;
     }
@@ -10409,7 +10641,7 @@ static void bind_trace(NvShader *sh, int nvn_stage) {
             continue; }
         if (b->kind != NVN_RB_TEX && b->kind != NVN_RB_IMG && b->kind != NVN_RB_TBUF) continue;
         uint64_t h = b->kind == NVN_RB_IMG ? (b->reg < 32 ? S.img[nvn_stage][b->reg] : 0) : (b->reg < 128 ? S.tex[nvn_stage][b->reg] : 0);
-        int tid = (int)(h & 0xfffff); void *tv = NULL; if (tid) (void)tex_fast_rid(tid, &tv);
+        int tid = (int)(h & 0xfffff); void *tv = NULL; if (tid) (void)tex_fast_rid_lk(tid, &tv);
         o += snprintf(line + o, sizeof line - o, " %s%d=id%d/ser%llu/mem%p/%ux%u", b->kind == NVN_RB_IMG ? "img" : b->kind == NVN_RB_TBUF ? "tbuf" : "tex", b->reg, tid,
                       tid && tid < g_ntreg ? (unsigned long long)g_treg[tid].t.serial : 0ull, tid && tid < g_ntreg ? (void *)g_treg[tid].t.mem : NULL,
                       tid && tid < g_ntreg ? g_treg[tid].t.d.width : 0u, tid && tid < g_ntreg ? g_treg[tid].t.d.height : 0u);
@@ -10498,6 +10730,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
         }
         if (b->kind == NVN_RB_CBUF) {
             const p_bind_buf *u = reg < 16 ? &S.ubo[nvn_stage][reg] : NULL;
+            if (g_eye_pass == 1 && g_eseg_n && u && u->addr) eseg_ubo(u->addr, u->size, nvn_stage, reg);   // stereo replay: does this segment use an eye matrix
             cbc_ent *ce = NULL; cbc_ctx cx; int ce_hit = 0;   // TOTK_CBUF_CACHE
             if (cbc && u && u->addr && !(nvn_stage == 0 && reg == 0 && (ui_mat_on() || g_vr_ui_ray_draw)) && !(g_vr_collapse_draw && nvn_stage == 0 && reg == 2)) {
                 cbc_ctx_now(&cx); ce = &g_cbc[cbc_slot(u->addr, u->size)];
@@ -10525,7 +10758,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
                     char original[129],transform[129];const uint8_t *a=(const uint8_t *)input,*b=(const uint8_t *)g_vr_ui_ray_map.clip;
                     for(int j=0;j<64;j++){snprintf(original+2*j,3,"%02x",a[j]);snprintf(transform+2*j,3,"%02x",b[j]);}
                     PD("H %llu eye=%d cb=%#llx gpu=%#llx shader=%s tex0=%#llx input=%s transform=%s",
-                        g_stat_pass,g_eye_pass,(unsigned long long)u->addr,(unsigned long long)address,sh->key,(unsigned long long)S.tex[1][0],original,transform);
+                        g_stat_pass,0,(unsigned long long)u->addr,(unsigned long long)address,sh->key,(unsigned long long)S.tex[1][0],original,transform);
                 }
                 gpu=address;atomic_fetch_add(&g_vr_ui_ray_bindings,1);
             }
@@ -10568,11 +10801,12 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
             int tid = reg < 128 ? (int)(S.tex[nvn_stage][reg] & 0xfffff) : 0;
             void *tv = NULL; uint64_t trid = tid ? tex_fast_rid(tid, &tv) : 0; __unsafe_unretained id<MTLTexture> t = (__bridge id<MTLTexture>)tv;
             if (nvn_stage == 1 && reg == 0 && !strncmp(sh->key, "0ac9a54938974396", 16) && getenv("DM_NVN_FLASHHDR")) g_flash_hdr_source = t;
+            if (g_eye_pass == 1 && g_eseg_n && t && tid < g_ntreg) eseg_tex(EKEY(&g_treg[tid].t));   // stereo replay: what this segment samples
             if (t && tid < g_ntreg) use_rec("tex", (uint64_t)g_treg[tid].t.mem, g_treg[tid].t.L.size, tid, &g_treg[tid].t);
             if (t && passdump() && tid < g_ntreg) PD("R %llu st%d ser=%llu mem=%p sz=%llu", g_stat_pass, nvn_stage, g_treg[tid].t.serial, (void *)g_treg[tid].t.mem, (unsigned long long)g_treg[tid].t.L.size);
             if (t && tid < g_ntreg) tp_note_fs(sh->key, g_treg[tid].t.serial, &g_treg[tid].t);   // TOTK: DM_NVN_TEXPNG_FS
             if (bl) PD("B %llu st%d tex reg%d tid=%d %s ser=%llu nvnfmt=%#x vfmt=%#x fmt=%lu %lux%lux%lu view_lv=%lu+%lu view_sl=%lu array=%lu target=%lu", g_stat_pass, nvn_stage, reg, tid, t ? "实" : "哑", t && tid < g_ntreg ? g_treg[tid].t.serial : 0,
-                       tid < g_ntreg ? g_treg[tid].t.d.format : 0, tid < g_ntreg && g_treg[tid].has_v && g_treg[tid].v.set_format ? g_treg[tid].v.format : 0ull,
+                       tid < g_ntreg ? g_treg[tid].t.d.format : 0, tid < g_ntreg && g_treg[tid].has_v && g_treg[tid].v.set_format ? g_treg[tid].v.format : 0u,
                        (unsigned long)t.pixelFormat, (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.depth,
                        (unsigned long)(t.parentTexture ? t.parentRelativeLevel : 0), (unsigned long)t.mipmapLevelCount,
                        (unsigned long)(t.parentTexture ? t.parentRelativeSlice : 0), (unsigned long)t.arrayLength, (unsigned long)t.textureType);
@@ -10594,13 +10828,19 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
                    Metal needs a matching texture type in the argument buffer, so bind a cached 1-slice view of the right type. */
                 id<MTLTexture> av = tex_type_view(t, (MTLTextureType)b->dtt);
                 if (av) { t = av; trid = av.gpuResourceID._impl; } }
-            if (t && tid && tid < g_ntreg && R.has_rt) { id<MTLTexture> mv = mip_feedback_view(t, g_treg[tid].t.serial); if (mv) { t = mv; trid = mv.gpuResourceID._impl; } }
+            if (t && tid && tid < g_ntreg && R.has_rt) { id<MTLTexture> mv = mip_feedback_view(t, g_treg[tid].t.serial, sh, reg, b->fetch ? 0 : (int)(S.tex[nvn_stage][reg] >> 20)); /* a slot the shader also reads by integer texel coordinates (read(..., 0)) keeps every level below: a one-level view would move its level 0 */ if (mv) { t = mv; trid = mv.gpuResourceID._impl; } }
             if (g_mfxup_out && (__bridge void *)sh == (__bridge void *)g_mfxup_sh && t == g_mfxup_src) { t = g_mfxup_out; trid = t.gpuResourceID._impl; }   // TOTK_MFX_UPSCALE
             slots[aid] = trid;
             USE(t, MTLResourceUsageRead);
         } else if (b->kind == NVN_RB_IMG) {   // 可写贴图：NVN 图像槽 r（BindImages）↔ D3D u_r | Writable texture: NVN image slot r (BindImages) ↔ D3D u_r
             int tid = reg < 32 ? (int)(S.img[nvn_stage][reg] & 0xfffff) : 0;
             void *tv = NULL; uint64_t trid = tid ? tex_fast_rid(tid, &tv) : 0; __unsafe_unretained id<MTLTexture> t = (__bridge id<MTLTexture>)tv;
+            if (t && g_treg[tid].image_view) { t = (__bridge id<MTLTexture>)g_treg[tid].image_view; trid = t.gpuResourceID._impl; }
+            /* Image stores need the writable companion, not its RGB-only sampling swizzle. */
+            if (tid && hdr_shadow_enabled()) {
+                id<MTLTexture> hdr = hdr_shadow_find(tex_by_id(tid));
+                if (hdr && (hdr.usage & MTLTextureUsageShaderWrite)) { t = hdr; trid = hdr.gpuResourceID._impl; }
+            }
             if (passdump()) PD("W %llu st%d reg%d tid=%d %s ser=%llu", g_stat_pass, nvn_stage, reg, tid, t ? "实" : "哑", t && tid < g_ntreg ? g_treg[tid].t.serial : 0ull);
             if (t && !(t.usage & MTLTextureUsageShaderWrite)) { RED_ONCE(32, "图像槽绑的贴图没有可写用途（贴图号 %d）", tid); t = nil; }
             if (!t) { t = dummy_img(b->dtt, b->dpf); trid = g_dummy_img_rid[b->dtt & 7][b->dpf & 3]; }   // 未绑：D3D 语义写入丢弃——写进专用哑贴图，不污染读出 0 的那套 | Unbound: D3D semantics discard the write - write into a dedicated dummy texture so the set that reads 0 is not polluted
@@ -10873,13 +11113,6 @@ static int ds_scan(const uint8_t *p, ds_st *ds, int depth) {
 //   Needed: at a draw / dispatch it is bound to a texture or image slot of any stage (including ones already bound when the scan starts); used as copy source / copy destination / texture-clear target; drawn before cleared after becoming an attachment again (load)
 // Different levels / layers of the same texture are decided separately (a downsample chain writes level k and reads level k−1); a sampler binding counts as a read of the whole texture (conservative)
 static const uint8_t *g_exec_cur;   // 回放中当前这条操作（含） | The op currently being replayed (inclusive)
-static void b2gw_note(uint64_t a, uint64_t n, const void *ra) {
-    if (atomic_fetch_add(&g_b2gw_n, 1) >= 40) return;
-    op_hdr oh = {0}; if (g_exec_cur) memcpy(&oh, g_exec_cur, sizeof oh);
-    char d[96] = ""; { extern void runtime_describe_address(uint64_t, char *, size_t); runtime_describe_address((uint64_t)(uintptr_t)ra, d, sizeof d); }
-    MLOG("[vr] b2gw: GPU write %#llx+%#llx, eye pass %d region %u, op %u at %p, pass %llu, frame %llu, from %s", (unsigned long long)a, (unsigned long long)n, g_eye_pass, g_eye_region,
-         (unsigned)oh.op, (const void *)g_exec_cur, (unsigned long long)g_stat_pass, (unsigned long long)atomic_load(&g_cur_frame), d);
-}
 static void sd_need(sd_att *t, int why) { if (!t->state) { t->state = 1; t->why = (uint8_t)why; } }   // why：1 绘制作贴图读 2 作附件先画后清 3 拷贝 4 清贴图 5 扫到末尾未定 6 无起点 / 索引不可用 | why: 1 a draw reads it as a texture 2 as an attachment, drawn before cleared 3 copy 4 texture clear 5 scanned to the end undecided 6 no start point / index unavailable
 static int sdx_decide(uint8_t st[SD_ATT_MAX]);   // 写回前瞻判定（索引见 mtl_sub_index） | Store lookahead decision (for the index see mtl_sub_index)
 // ---------- TOTK: layered passes (see g_lay) ----------
@@ -11665,7 +11898,7 @@ static id<MTLFunction> att_fb_take(NvProg *pr, uint64_t *rs, int *n) {
         if (j < 0) return nil;   // the depth attachment
         uint64_t s_; int lv, sl; rt_sub(&R.rt, j, &s_, &lv, &sl);
         if (lv || sl) return nil;
-        int tid = (int)(h & 0xfffff); void *tv_ = NULL; if (tid) tex_fast_rid(tid, &tv_); __unsafe_unretained id<MTLTexture> tv = (__bridge id<MTLTexture>)tv_;
+        int tid = (int)(h & 0xfffff); void *tv_ = NULL; if (tid) tex_fast_rid_lk(tid, &tv_); __unsafe_unretained id<MTLTexture> tv = (__bridge id<MTLTexture>)tv_;
         uint32_t apf = tv.parentTexture ? (uint32_t)tv.parentTexture.pixelFormat : (uint32_t)tv.pixelFormat; uint8_t swz[4];   // as fz_p2_draw
         if (R.rt.has_cview[j] && R.rt.cview[j].set_format && !(nvn_fmt_to_mtl(R.rt.cview[j].format, &apf, swz) && apf)) return nil;
         if (!tv || tv.textureType != MTLTextureType2D || (tv.parentTexture && (tv.parentRelativeLevel || tv.parentRelativeSlice)) || tv.pixelFormat != (MTLPixelFormat)apf) return nil;
@@ -12100,14 +12333,8 @@ static int defer_take(const p_draw *dw, const p_draw_idx *di) {
     defer_snap *z = &g_defer.snap[g_defer.n++]; z->idx = di != NULL; if (dw) z->dw = *dw; if (di) z->di = *di;
     z->sc = R.sc; z->has_sc = R.has_sc; z->S_ = malloc(sizeof S); memcpy(z->S_, &S, sizeof S); for (int k = 0; k < 8; k++) z->pm[k] = (uint8_t)k; g_defer_draws++; return 1;
 }
-static void defer_release(void) { defer_release_one(&g_defer); }
 static void defer_env(void);
 static void defer_reset(void) { defer_clear_all(); g_defer_replaying = 0; defer_env(); }
-static void defer_apply_p_clear(void) {
-    memset(R.clear_c, 0, sizeof R.clear_c); R.clear_d = R.clear_s = 0;
-    for (int j = 0; j < g_defer.q_rt.n; j++) { int i = g_defer.lmap[j]; if (i >= 0 && g_defer.clear_c[i]) { R.clear_c[j] = 1; R.cc[j] = g_defer.cc[i]; } }
-    if (g_defer.clear_d) { R.clear_d = 1; R.cd = g_defer.cd; } if (g_defer.clear_s) { R.clear_s = 1; R.cs = g_defer.cs; }
-}
 static int defer_begin_q(const uint8_t *op) {
     int found = 0, first = -1;
     for (int i = 0; i < 4; i++) if (g_defer_slots[i].active && !g_defer_slots[i].at_q && g_defer_slots[i].q_op == op) { found = 1; if (first < 0) first = i; }
@@ -12552,7 +12779,7 @@ static int fz_p2_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di, uint8_
             {   // 采样的那个视图也得正好是附件那一张（原先只核附件是第 0 级第 0 层，没核着色器绑的视图——同一张贴图按第 k 级 / 第 k 层 / 换格式的视图采样时， | The sampled view must also be exactly the attachment itself (previously only the attachment being level 0 layer 0 was checked, not the view bound by the shader -- when the same texture is sampled through a view of level k / layer k / a changed format,
                 // 证明照样成立，采样会被改成读片上第 0 级 / 原格式，画面就错了）。视图起始级 / 层须为 0、格式须与附件实际格式相同，否则不合并
                 // the proof would still hold, the sampling would be changed to read on-tile level 0 / the original format, and the picture would be wrong). The view's starting level / layer must be 0 and its format must equal the attachment's actual format, otherwise do not merge
-                int tid_ = (int)(h & 0xfffff); void *tv_ = NULL; if (tid_) tex_fast_rid(tid_, &tv_); __unsafe_unretained id<MTLTexture> tv = (__bridge id<MTLTexture>)tv_;
+                int tid_ = (int)(h & 0xfffff); void *tv_ = NULL; if (tid_) tex_fast_rid_lk(tid_, &tv_); __unsafe_unretained id<MTLTexture> tv = (__bridge id<MTLTexture>)tv_;
                 uint32_t apf_ = tv.parentTexture ? (uint32_t)tv.parentTexture.pixelFormat : (uint32_t)tv.pixelFormat; uint8_t swz_[4];
                 if (R.rt.has_cview[j] && R.rt.cview[j].set_format && !(nvn_fmt_to_mtl(R.rt.cview[j].format, &apf_, swz_) && apf_)) apf_ = 0;   // 附件按换格式视图挂：取那个格式；认不出就不合 | The attachment is attached through a format-changing view: take that format; if unrecognized, do not merge
                 MTLPixelFormat apf = (MTLPixelFormat)apf_;
@@ -12962,8 +13189,6 @@ static void mfx_take_camera(void) {
         mfx_note_camera(cam, 84);
         if (taa_active()) taa_note_camera(cam, 84);
         vr_note_camera(cam);   // VR head look: which head pose this frame was rendered with
-        if (g_eye_pass) { static int n; if (n < 40) { n++; float e[3]; for (int j = 0; j < 3; j++) e[j] = -(cam[j] * cam[3] + cam[4 + j] * cam[7] + cam[8 + j] * cam[11]);   // stereo B2: each eye pass's camera
-            MLOG("[vr] stereo B2: %s eye's G-buffer camera at %.4f %.4f %.4f (view t.x %.4f), block at %#llx", g_eye_pass == 1 ? "the left" : "the right", e[0], e[1], e[2], cam[3], (unsigned long long)u->addr); } }
         g_fl_cam_fov = cam[70] * 180 / (float)M_PI;   // diagnostic (TOTK_VR_FRAMELOG): the vertical view, degrees
         { extern float g_vr_cam_pos[3]; extern uint64_t g_vr_cam_pass, g_vr_cam_frame; g_vr_cam_pass = g_stat_pass; g_vr_cam_frame = atomic_load(&g_cur_frame);   // the body gap diagnostic: this frame's camera position, -R^T t of its view matrix (3x4 rows)
           for (int j = 0; j < 3; j++) g_vr_cam_pos[j] = -(cam[j] * cam[3] + cam[4 + j] * cam[7] + cam[8 + j] * cam[11]);
@@ -13070,25 +13295,6 @@ static void vr_palscan(const char *vs) {
    Returns the mesh's number among the player's meshes of this frame's G-buffer pass, or -1. */
 long g_vr_hidemesh; _Atomic long g_vr_meshlog;
 long g_vr_skip_lo, g_vr_skip_hi;   // diagnostic "flag vr_skip_lo / vr_skip_hi": G-buffer draws lo..hi-1 of each frame are left out
-/* diagnostic (vr_meshlog): a draw that is not a skinned mesh of the player, with a vertex uniform block holding a rotation
-   whose translation is within 2.5 m of the player (modulo 10 m): rigid pieces on the player (earrings, eyebrows?) */
-static void vr_rigid_log(const char *vs, uint32_t count, const float p[3]) {
-    static int lines; if (lines > 300) return;
-    static float b[1024];
-    for (int sl = 0; sl < 16; sl++) {
-        const p_bind_buf *u = &S.ubo[0][sl]; if (!u->addr || u->size < 48) continue;
-        size_t n = u->size < sizeof b ? u->size : sizeof b; pend_materialize(u->addr, (uint8_t *)b, n, 0);
-        for (size_t o = 0; o + 12 <= n / 4; o += 4) {
-            const float *f = b + o; float r[3] = {f[3] - p[0], f[7] - p[1], f[11] - p[2]}; int ok = 1;
-            for (int i = 0; i < 3 && ok; i++) { r[i] -= 10 * roundf(r[i] / 10); ok = fabsf(r[i]) < 2.5f; }
-            for (int i = 0; i < 3 && ok; i++) { float l = f[i * 4] * f[i * 4] + f[i * 4 + 1] * f[i * 4 + 1] + f[i * 4 + 2] * f[i * 4 + 2]; ok = l > 0.8f && l < 1.25f; }
-            if (!ok) continue;
-            MLOG("[vr] rigid F%llu pass %llu vs %.16s count %u ubo %d +%zu size %llu at %.2f %.2f %.2f", (unsigned long long)atomic_load(&g_cur_frame), g_stat_pass, vs, count,
-                 sl, o * 4, (unsigned long long)u->size, r[0], r[1], r[2]);
-            lines++; return;
-        }
-    }
-}
 /* diagnostic TOTK_VR_MESHDUMP=<vertex shader key prefix> (with vr_meshlog): that shader's draws in the G-buffer pass, every
    vertex-stage uniform / storage block with its first floats */
 static void vr_mesh_dump(NvShader *v, uint32_t count) {
@@ -14070,7 +14276,7 @@ static int easu_site(__unsafe_unretained NvShader *fs, id<MTLTexture> *src_out, 
     if (!why && ((S.color.blend_en & 1) || BOTW_MFXUP_MASK_BAD || S.ms.a2c || (R.rt.depth && (S.ds.dt || S.ds.st)))) why = 2;
     if (!why && hv && ((cv->set_levels && cv->base_level) || (cv->set_layers && cv->min_layer))) why = 1;   // the canvas's own level 0 / layer 0 (its view names layer 0: still the whole texture)
     int tid = (int)(S.tex[1][0] & 0xfffff);
-    id<MTLTexture> src = !why && tid > 0 ? (__bridge id<MTLTexture>)tex_fast(tid) : nil, dst = src ? attachment_texture(R.rt.color[0], cv, hv) : nil;
+    id<MTLTexture> src = !why && tid > 0 ? (__bridge id<MTLTexture>)tex_fast_lk(tid) : nil, dst = src ? attachment_texture(R.rt.color[0], cv, hv) : nil;
     if (!why && (!src || !dst || src.textureType != MTLTextureType2D || dst.textureType != MTLTextureType2D)) why = 3;
     if (!why && ((S.has_vp && !(S.vp[0][0] == 0 && S.vp[0][1] == 0 && S.vp[0][2] == (float)dst.width && S.vp[0][3] == (float)dst.height)) ||
                  !scissor_full(R.rt.color[0], cv, hv))) why = 4;
@@ -14175,7 +14381,7 @@ static _Atomic uint64_t g_outup_wh, g_outup_last;   // the MetalFX output stage'
 static void scene_size_note(__unsafe_unretained NvShader *fs) {   // the compose shader's slot 0 is this frame's 3D scene
     if (!TAA_COMPOSE(fs)) return;   // TOTK 0ac9a549, Breath of the Wild 1.6.0 d14b1c38 / 1.9.0 f7ee6fe1 (nvn_obj.h; BotW had no bracket)
     int tid = (int)(S.tex[1][0] & 0xfffff); if (tid <= 0) return;
-    id<MTLTexture> src = (__bridge id<MTLTexture>)tex_fast(tid); if (!src) return;
+    id<MTLTexture> src = (__bridge id<MTLTexture>)tex_fast_lk(tid); if (!src) return;
     uint32_t w = (uint32_t)src.width, h = (uint32_t)src.height;
     uint32_t ow = atomic_exchange(&g_scene_w, w), oh = atomic_exchange(&g_scene_h, h);
     if (ow != w || oh != h) MLOG("内部分辨率（合成采样的场景）：%ux%u", w, h);
@@ -14203,7 +14409,7 @@ static int mfxup_draw(NvProg *pr) {
     id<MTLTexture> taa_out = nil;
     if (taa_ready() && TAA_COMPOSE(fs) && R.rt.n && R.rt.color[0]) {
         int tid = (int)(S.tex[1][0] & 0xfffff);
-        id<MTLTexture> src = tid > 0 ? (__bridge id<MTLTexture>)tex_fast(tid) : nil;
+        id<MTLTexture> src = tid > 0 ? (__bridge id<MTLTexture>)tex_fast_lk(tid) : nil;
         if (src) {
             rp_end(); blit_close(); rs_sync();
             taa_out = taa_encode(g_cb, src);
@@ -14242,7 +14448,7 @@ static int mfxup_draw(NvProg *pr) {
 #endif
     if (strncmp(fs->key, "0ac9a54938974396", 16) || !R.rt.n || !R.rt.color[0]) return 0;
     int tid = (int)(S.tex[1][0] & 0xfffff); if (tid <= 0) return 0;
-    id<MTLTexture> src = (__bridge id<MTLTexture>)tex_fast(tid), dst = g_hdr_draw_native ? attachment_texture(R.rt.color[0], &R.rt.cview[0], R.rt.has_cview[0]) : tex_mtl(R.rt.color[0]);   // HDR: its FP16 companion (PR #1129)
+    id<MTLTexture> src = (__bridge id<MTLTexture>)tex_fast_lk(tid), dst = g_hdr_draw_native ? attachment_texture(R.rt.color[0], &R.rt.cview[0], R.rt.has_cview[0]) : tex_mtl(R.rt.color[0]);   // HDR: its FP16 companion (PR #1129)
     if (!src || !dst || src.width >= dst.width || src.height >= dst.height) return 0;
     rp_end(); blit_close(); rs_sync();
     pt_mark(g_cb, 'X', nil);   // TOTK_PASS_GPU: the MetalFX upscale as its own entry
@@ -14342,49 +14548,10 @@ static const uint8_t *vr_native_uniform(unsigned stage,unsigned slot,size_t size
     if(renamed)gpu=renamed;else if(snapshot)gpu=snapshot->gpu+u->addr-snapshot->lo;
     return bound_uniform_bytes(gpu,size,(__bridge id<MTLBuffer>)mb);
 }
-#ifndef GAME_BOTW
-static int vr_totk_ui_layout(NvProg *pr,double vp[4],MTLScissorRect *sc){
-    if(!vr_wants_camera()||!atomic_load(&g_vr_ui_layout_on)||!g_eye_pass||!pr||!pr->sh[0]||
-       !uw_ui_vs(pr->sh[0]->key)||R.rt.n!=1||!R.rt.color[0]||!S.has_vp||S.ds.dt||!(S.chmask.mask&15u))return 0;
-    unsigned bytes=(unsigned)S.ubo[0][0].size;if(bytes!=560&&bytes!=128)return 0;
-    const uint8_t *actual=vr_native_uniform(0,0,bytes);if(!actual)return 0;
-    vr_projection_image image=vr_native_image(R.rt.color[0],&R.rt.cview[0],R.rt.has_cview[0]);
-    float fov[4],rotation[9];if(!vr_projection_graph_get(image,fov)||!vr_projection_graph_rotation(image,rotation))return 0;
-    vr_views headset;if(!vr_link_views(&headset))return 0;unsigned eye=(unsigned)g_eye_pass-1;
-    /* A genuine Quest scene producer owns these exact rays. Inventory's
-       orthographic panes and its independent 30-degree preview never qualify. */
-    for(int j=0;j<4;j++)if(fabsf(tanf(fov[j])-1.06f*tanf(headset.fov[eye][j]))>1e-4f)return 0;
-    double full[4]={S.vp[0][0],S.vp[0][1],S.vp[0][2],S.vp[0][3]};
-    if(bytes==560&&vr_ui_rays_fullscreen((const float *)actual,0)){
-        /* Full-eye restore/blur/dimming remains in image coordinates. */
-        memcpy(vp,full,sizeof full);
-        long x=R.has_sc?MAX(R.sc.x,0):0,y=R.has_sc?MAX(R.sc.y,0):0;
-        long r=R.has_sc?MIN((long)image.width,(long)R.sc.x+R.sc.w):image.width;
-        long b=R.has_sc?MIN((long)image.height,(long)R.sc.y+R.sc.h):image.height;
-        *sc=(MTLScissorRect){(NSUInteger)x,(NSUInteger)y,(NSUInteger)MAX(0,r-x),(NSUInteger)MAX(0,b-y)};return 1;
-    }
-    float w=0,h=0;for(int e=0;e<2;e++){
-        w=fmaxf(w,fmaxf(fabsf(tanf(headset.fov[e][0])),fabsf(tanf(headset.fov[e][1]))));
-        h=fmaxf(h,fmaxf(fabsf(tanf(headset.fov[e][2])),fabsf(tanf(headset.fov[e][3]))));
-    }w*=1.06f;h*=1.06f;
-    float reference[16]={0};reference[0]=1/w;reference[5]=1/h;reference[10]=reference[14]=-1;
-    if(!g_totk_ui_reference_valid){memcpy(g_totk_ui_reference,rotation,sizeof rotation);g_totk_ui_reference_valid=1;}
-    vr_ui_rays map;uint32_t clip[4]={(uint32_t)sc->x,(uint32_t)sc->y,(uint32_t)sc->width,(uint32_t)sc->height},mapped[4];
-    if(!vr_ui_rays_make(reference,fov,rotation,g_totk_ui_reference,0,&map)||
-       !vr_ui_rays_scissor(&map,full,clip,mapped)||!vr_ui_rays_viewport(&map,vp,full)){
-        atomic_fetch_add(&g_vr_ui_ray_missing,1);return 0;
-    }
-    g_vr_ui_ray_map=map;g_vr_ui_ray_draw=1;memcpy(vp,full,sizeof full);
-    *sc=(MTLScissorRect){mapped[0],mapped[1],mapped[2],mapped[3]};atomic_fetch_add(&g_vr_ui_layout_draws,1);
-    if(bytes==128)atomic_fetch_add(&g_vr_ui_text_draws,1);
-    static unsigned logged[2];if(logged[eye]++<4)MLOG("[vr-totk-ui] eye=%u actual orthographic cb=%u; calibrated source rays %.7f %.7f %.7f %.7f, common reference and authored viewport",
-        eye,bytes,fov[0],fov[1],fov[2],fov[3]);return 1;
-}
-#endif
 static int vr_native_ui_layout(NvProg *pr,double vp[4],MTLScissorRect *sc,unsigned width,unsigned height) {
     (void)width;(void)height;g_vr_ui_ray_draw=0;
 #ifndef GAME_BOTW
-    return vr_totk_ui_layout(pr,vp,sc);
+    return 0;   /* Tears of the Kingdom: one picture for both eyes, its UI stays as the game drew it */
 #endif
     if(!atomic_load(&g_vr_ui_layout_on)||!vr_labo_active()||!pr||!pr->sh[0]||
        !vr_native_ui_vertex(pr->sh[0]->key)||R.rt.n!=1||!R.rt.color[0]||!S.has_vp||S.ds.dt||!(S.chmask.mask&15u))return 0;
@@ -14575,6 +14742,57 @@ static id<MTLTexture> vr_native_bound_canvas(uint64_t *serial) {
     registry_lock();int tid=(int)(S.tex[1][0]&0xfffff);
     id<MTLTexture> source=tid>0&&tid<g_ntreg&&g_treg[tid].ok?(__bridge id<MTLTexture>)tex_fast(tid):nil;
     *serial=source?g_treg[tid].t.serial:0;registry_unlock();return source;
+}
+static void eye_note_present(const tex_t *t, const int *crop) {   // the replay thread, at the game's present
+    if (!t) return;
+    g_eye_crop_have = crop && crop[2] > 0 && crop[3] > 0; if (g_eye_crop_have) memcpy(g_eye_crop, crop, sizeof g_eye_crop);
+    for (int i = 0; i < g_eye_npresented; i++) if (g_eye_presented[i] == t->serial) return;
+    g_eye_presented[g_eye_npresented < 4 ? g_eye_npresented++ : (int)(t->serial % 4)] = t->serial;
+}
+static void eye_note_pass(MTL4RenderPassDescriptor *pd) {
+    if (R.rt.n < 1 || !R.rt.color[0]) return;
+    for (int i = 0; i < g_eye_npresented; i++) if (g_eye_presented[i] == R.rt.color[0]->serial) { g_eye_swap = pd.colorAttachments[0].texture; return; }
+}
+/* hle_nvn.c submit_exec, before an eye replay's commit (eye 0 left, 1 right). */
+void mtl_eye_capture(int eye) {
+    if (eye == 0) g_eye_pair_ok = 1;
+    id<MTLTexture> src = g_eye_swap;
+    static uint64_t why[5], calls;   // diagnostic: no presented-texture pass, no eye projection, no command buffer, the left side missing, no source slot
+    if (++calls % 1200 == 0) MLOG("[vr] stereo replay: of %llu eye replays, %llu drew no presented texture, %llu had no eye projection, %llu no command buffer, %llu right eyes without a left, %llu pairs without a source slot; presented serials %d",
+        (unsigned long long)calls, (unsigned long long)why[0], (unsigned long long)why[1], (unsigned long long)why[2], (unsigned long long)why[3], (unsigned long long)why[4], g_eye_npresented);
+    if (!src || !g_eye_have[eye] || !g_cb) { why[!src ? 0 : !g_eye_have[eye] ? 1 : 2]++; g_eye_pair_ok = 0; if (eye == 1) atomic_fetch_add(&g_eye_nopic, 1); return; }
+    NSUInteger x = 0, y = 0, w = src.width, h = src.height;
+    if (g_eye_crop_have && (NSUInteger)(g_eye_crop[0] + g_eye_crop[2]) <= src.width && (NSUInteger)(g_eye_crop[1] + g_eye_crop[3]) <= src.height) {
+        x = (NSUInteger)g_eye_crop[0]; y = (NSUInteger)g_eye_crop[1]; w = (NSUInteger)g_eye_crop[2]; h = (NSUInteger)g_eye_crop[3]; }
+    id<MTLTexture> d = g_eye_sbs;
+    { static int said; if (said < 24) { said++; MLOG("[vr] stereo replay capture: eye %d, picture %lux%lu format %lu crop %d (%lu,%lu %lux%lu), pair ok %d, side-by-side %lux%lu format %lu", eye, (unsigned long)src.width, (unsigned long)src.height, (unsigned long)src.pixelFormat, g_eye_crop_have, (unsigned long)x, (unsigned long)y, (unsigned long)w, (unsigned long)h, g_eye_pair_ok, (unsigned long)(d ? d.width : 0), (unsigned long)(d ? d.height : 0), (unsigned long)(d ? d.pixelFormat : 0)); } }
+    if (!d || d.width != 2 * w || d.height != h || d.pixelFormat != src.pixelFormat) {
+        if (d) { res_remove(d); defer_obj_release(d); }
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:src.pixelFormat width:2 * w height:h mipmapped:NO];
+        td.usage = MTLTextureUsageShaderRead; td.storageMode = MTLStorageModePrivate;
+        d = [g_dev newTextureWithDescriptor:td]; if (!d) MDIE("stereo replay: the side-by-side texture %lux%lu", (unsigned long)(2 * w), (unsigned long)h);
+        d.label = @"stereo replay eyes"; res_add(d); g_eye_sbs = d; g_eye_pair_ok = eye == 0;   // a new texture holds no left picture yet
+        if (!g_eye_pair_ok) { atomic_fetch_add(&g_eye_nopic, 1); return; }
+    }
+    rp_end(); blit_close(); rs_sync();
+    id<MTL4ComputeCommandEncoder> b = blit();
+    enc_b_copy_texture(b, src, 0, 0, MTLOriginMake(x, y, 0), MTLSizeMake(w, h, 1), d, 0, 0, MTLOriginMake(eye ? w : 0, 0, 0));
+    blit_close(); rs_sync();
+    if (eye != 1) return;
+    if (!g_eye_pair_ok) { why[3]++; return; }
+    float rotation[2][9];
+    for (int k = 0; k < 2; k++) for (int i = 0; i < 3; i++) memcpy(rotation[k] + 3 * i, g_eye_view + 4 * i, 3 * sizeof(float));
+    vr_source_native_frame();
+    { extern void vr_source_stereo_view(const float view[12]); vr_source_stereo_view(g_eye_view); }   // the head seq this frame was rendered with
+    int slot = vr_source_encode_stereo(g_cb, d, g_eye_fov, rotation);
+    { static int said; if (said < 12) { said++; MLOG("[vr] stereo replay capture: the pair's source slot %d", slot); } }
+    if (slot >= 0) {
+        static int added; if (!added) { [g_q4 addResidencySet:vr_residency()]; added = 1; }
+        if (!g_vr_native_slots) g_vr_native_slots = [NSMutableArray array]; [g_vr_native_slots addObject:@(slot)];
+        const uint64_t n = atomic_fetch_add(&g_eye_pairs, 1) + 1;
+        if (n == 1 || n % 300 == 0) MLOG("[vr] stereo replay: %llu eye pairs handed to the headset (%lux%lu an eye, rays L %.3f %.3f %.3f %.3f / R %.3f %.3f %.3f %.3f); %llu frames without a pair",
+            (unsigned long long)n, (unsigned long)w, (unsigned long)h, g_eye_fov[0][0], g_eye_fov[0][1], g_eye_fov[0][2], g_eye_fov[0][3], g_eye_fov[1][0], g_eye_fov[1][1], g_eye_fov[1][2], g_eye_fov[1][3], (unsigned long long)atomic_load(&g_eye_nopic));
+    } else { why[4]++; atomic_fetch_add(&g_eye_nopic, 1); }
 }
 static void vr_labo_capture(NvProg *pr) {
     if(!pr||!pr->sh[0]||!pr->sh[1]||!vr_labo_active()||
@@ -15506,6 +15724,25 @@ static void dispatch(const p_dispatch *dp) {
     const uint16_t *tg = cs->rf.tg;
     if (!tg[0]) { RED_ONCE(29, "计算着色器缺线程组大小反射"); return; }
     rp_end();
+    /* A render target may first acquire image usage at dispatch, after its storage was allocated. A dispatch without images
+       takes no lock, and a texture found writable is not asked again until it is registered anew. */
+    int has_img = 0;
+    for (int i = 0; i < cs->rf.nb && !has_img; i++) has_img = cs->rf.b[i].kind == NVN_RB_IMG && cs->rf.b[i].reg < 32 && (S.img[5][cs->rf.b[i].reg] & 0xfffff);
+    if (has_img) {
+        registry_lock();
+        for (int i = 0; i < cs->rf.nb; i++) {
+            const nvn_rbind *b = &cs->rf.b[i];
+            if (b->kind != NVN_RB_IMG || b->reg >= 32) continue;
+            int tid = (int)(S.img[5][b->reg] & 0xfffff);
+            if (!tid || (tid < g_ntreg && g_treg[tid].image_ready)) continue;
+            id<MTLTexture> view = tex_by_id(tid);
+            if (!view || hdr_shadow_find(view)) continue;
+            id<MTLTexture> base = (view.usage & MTLTextureUsageShaderWrite) ? view : tex_mtl(&g_treg[tid].t);
+            if (base && !(base.usage & MTLTextureUsageShaderWrite)) base = tex_upgrade_usage(&g_treg[tid].t, base, MTLTextureUsageShaderWrite);
+            if (base && (base.usage & MTLTextureUsageShaderWrite)) g_treg[tid].image_ready = 1;
+        }
+        registry_unlock();
+    }
     int reuse = disp_reuse_on() && !pg_on();
     /* TOTK_DISP_PREARGS (default on): when this dispatch opens the compute encoder after a streamed render pass, disp_enc
        first waits for the encode stage to finish that pass (rs_sync, ~5% of the replay in the world). The dispatch's
@@ -15525,6 +15762,19 @@ static void dispatch(const p_dispatch *dp) {
     if (atomic_load(&g_draw_log) > 0) MLOG("[uw] F%llu pass %llu dispatch cs %.16s grid %dx%dx%d", (unsigned long long)atomic_load(&g_cur_frame), g_stat_pass, cs->key, dp->x, dp->y, dp->z);
     enc_c_dispatch(ce, MTLSizeMake(dp->x, dp->y, dp->z), MTLSizeMake(tg[0], tg[1], tg[2]));
     if (!reuse) enc_c_end(ce);
+    /* Keep guest copies/readbacks coherent with compute writes, as for render-pass stores. */
+    if (has_img && g_hdr_companion_store && hdr_shadow_enabled()) {
+        registry_lock();
+        for (int i = 0; i < cs->rf.nb; i++) {
+            const nvn_rbind *b = &cs->rf.b[i];
+            if (b->kind != NVN_RB_IMG || b->reg >= 32) continue;
+            int tid = (int)(S.img[5][b->reg] & 0xfffff);
+            if (!tid) continue;
+            id<MTLTexture> original = tex_by_id(tid), hdr = hdr_shadow_find(original);
+            if (hdr) hdr_shadow_copy(hdr, original.parentTexture ?: original);
+        }
+        registry_unlock();
+    }
     bright_lut(cs);   // 3D 画面加亮：游戏算完调色表之后重写 | 3D picture brightening: rewrite after the game finishes computing the color lookup table
     /* TOTK_EXPO_LOG=<file> (diagnostic): after each dispatch of the exposure kernel (ae725063), copy floats 96..127 of its
        storage buffer 0 (statistics; exposure at 108..111) into a shared ring and write them with the frame number once
@@ -15910,7 +16160,7 @@ static void clear_tex(const p_clear_tex *c) {
     if (c->has_view && c->view.set_format) {   // 视图换格式：清除值按视图格式解释（游戏 5 次全是 ui 版配整数视图），在同格式视图上清 | View with changed format: the clear value is interpreted in the view format (all 5 of the game's calls are the ui version with an integer view), and the clear is done on a view of the same format
         uint32_t vpf = 0; uint8_t swz[4];
         if (!nvn_fmt_to_mtl(c->view.format, &vpf, swz) || !vpf) { RED_ONCE(42, "清贴图视图格式 %#x 无对应", c->view.format); return; }
-        if (tex_need_pfv(t.pixelFormat, (MTLPixelFormat)vpf) && !(t.usage & MTLTextureUsagePixelFormatView)) t = tex_upgrade_pfv(c->tex, t, (MTLPixelFormat)vpf);
+        if (tex_need_pfv(t.pixelFormat, (MTLPixelFormat)vpf) && !(t.usage & MTLTextureUsagePixelFormatView)) t = tex_upgrade_usage(c->tex, t, MTLTextureUsagePixelFormatView);
         if (t.pixelFormat != (MTLPixelFormat)vpf) {
             id<MTLTexture> v = [t newTextureViewWithPixelFormat:(MTLPixelFormat)vpf];
             if (!v) { RED_ONCE(43, "清贴图建不出视图：格式 %lu → %u", (unsigned long)t.pixelFormat, vpf); return; }
@@ -16163,6 +16413,11 @@ static int frz_op(unsigned op, const void *a) {   // 返回 1 = 这条操作不�
 }
 
 void mtl_exec(const uint8_t *p) {
+    /* Binding changes also invalidate argument buffers that already hold the
+       previous prompt texture; the ordinary descriptor cache then rebuilds it. */
+    static uint64_t prompt_revision;
+    uint64_t revision = TOTK_PROMPT_ICONS_ON ? totk_prompt_revision() : 0;
+    if (revision != prompt_revision) { prompt_revision = revision; g_reg_gen++; }
     static int inited; if (!inited) { inited = 1; state_reset(); }
     static int dump_all = -1; if (dump_all < 0) dump_all = getenv("DM_NVN_PASSDUMP_ALL") != NULL;
     { static long st_frame = -2, st_ms; if (st_frame == -2) { const char *e = getenv("DM_NVN_STALL"); st_frame = e ? atol(e) : -1; st_ms = e && strchr(e, ':') ? atol(strchr(e, ':') + 1) : 1000; }   // TOTK diagnostic: DM_NVN_STALL=frame:ms sleeps the replay thread once at the start of that frame's replay
@@ -16171,18 +16426,20 @@ void mtl_exec(const uint8_t *p) {
     for (;;) {
         op_hdr h; memcpy(&h, p, sizeof h);
         if (h.size < 8 || (h.size & 7) || h.op >= OP_COUNT_) MDIE("corrupt command record at %p: op %u size %u (call depth %d)", (const void *)p, (unsigned)h.op, (unsigned)h.size, g_ret_n);
-        /* stereo B2: the eye marks; ops for the other eye are skipped. Counter reports and resets are replayed in both
-           passes: later commands of the same pass read what they write (b2be: without them the left eye lost the
-           GPU-driven ground; the right pass, last, leaves its values in memory as a single replay would). Event signals,
-           the CPU's synchronisation with the frame, stay with the right pass: the CPU must not see the frame done early. */
-        if (h.op == OP_EYE) { p_eye e; memcpy(&e, p + 8, sizeof e); g_eye_region = e.mask; p += h.size; continue; }
-        if (g_eye_region != 3 && !(g_eye_region & (g_eye_pass ? (uint32_t)g_eye_pass : 2u))) { p += h.size; continue; }
-        if (g_eye_pass && (h.op == OP_DRAW || h.op == OP_DRAW_IDX)) g_b2_draws[g_eye_pass - 1][g_eye_region == 3 ? 1 : 0]++;   // stereo B2: draws per pass, own marks / shared
-        if (g_eye_pass == 1 && (h.op == OP_SIGNAL_EVENT || (!g_b2_rep && (h.op == OP_REPORT_COUNTER || h.op == OP_RESET_COUNTER)))) { p += h.size; continue; }
+        if (g_eye_pass == 1 && h.op == OP_SIGNAL_EVENT) { p += h.size; continue; }   // stereo replay: the CPU must not see the frame done after the first replay
         g_exec_cur = p;   // 写回前瞻的扫描起点：结束通道的那条操作（含） | Scan start point of the store lookahead: the operation that ends the render pass (inclusive)
         if (p == g_defer_pend) { for (int gi = 0; gi < 4; gi++) if (g_defer_slots[gi].active && g_defer_slots[gi].p_end_op == p) g_defer_slots[gi].in_p = 0; g_defer_pend = NULL; }
         sdx_seq(p);
         if (h.op == OP_SET_RT) rt_toggle_poll();
+        if (g_eye_pass && (g_eseg_n || g_eye_pass == 1) && atomic_load(&g_eye_share)) {   // stereo replay: eye-independent segments (eseg_*)
+            if (h.op == OP_SET_RT) eseg_begin(p, (const p_set_rt *)(const void *)(p + 8));
+            if (g_eye_pass == 1) { eseg_op(h.op, p + 8);
+                if (g_hoist_n) for (int hi = 0; hi < g_hoist_n; hi++) if (g_hoist_skip[hi] == p) { eseg_keep(2); break; }
+                if (g_frz_on || g_frz_state || g_dm_rt_ab == 1 || defer_has_active() || defer_has_in_p()) eseg_keep(4); }
+            else if (g_eye_skip && (h.op == OP_DRAW || h.op == OP_DRAW_IDX || h.op == OP_CLEAR_COLOR || h.op == OP_CLEAR_DS)) {
+                int taken = 0; if (g_hoist_n) for (int hi = 0; hi < g_hoist_n; hi++) if (g_hoist_skip[hi] == p) { taken = 1; break; }
+                if (!taken) { p += h.size; continue; } }
+        }
         if ((g_frz_on || g_frz_state || g_dm_rt_ab == 1) && frz_op(h.op, p + 8)) { p += h.size; continue; }
         if (trace) PD("o cmd=%p pass=%llu op=%u size=%u", p, g_stat_pass, (unsigned)h.op, (unsigned)h.size);
         if (g_cg_pending && !cg_op_safe(h.op)) { g_cg.reason[1]++; cg_flush(); }   // TOTK: cube-face-set groups pend only across state / binding ops (nvn_cube_group.h)
@@ -16460,7 +16717,7 @@ static void shot_body(id<MTLTexture> src, const char *path, int screen, const in
         cb_commit(cb); cb_wait(cb);
         read = out;
     }
-    if (read.pixelFormat == MTLPixelFormatRG11B10Float || read.pixelFormat == MTLPixelFormatRGBA16Float) {   // HDR targets (stereo B2's scene shots): drawn into BGRA8 as they are (no tone mapping)
+    if (read.pixelFormat == MTLPixelFormatRG11B10Float || read.pixelFormat == MTLPixelFormatRGBA16Float) {   // HDR targets: drawn into BGRA8 as they are (no tone mapping)
         MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:read.width height:read.height mipmapped:NO];
         d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead; d.storageMode = MTLStorageModePrivate;
         id<MTLTexture> out = [g_dev newTextureWithDescriptor:d]; id<MTLCommandBuffer> cb = out ? q_cb() : nil;
@@ -16754,6 +17011,16 @@ int front_display_link_hz(void);   /* runtime/frontend_ios.m */
    the main display) is what builds without the Mac frontend link, such as probes; frontend.m's definition replaces it. */
 __attribute__((weak)) int front_display_hz(void) { return 0; }
 #endif
+/* The leaderboard's picture settings (runtime/board_upload.h): the resolutions and MetalFX upscale as the FPS box shows
+   them now (fps_overlay's draw below); 0 for a size not known yet. */
+void mtl_board_view(int *out_w, int *out_h, int *scene_w, int *scene_h, int *metalfx) {
+    uint64_t cur = atomic_load(&g_cur_frame), mfx_at = atomic_load(&g_mfxup_last), up_at = atomic_load(&g_outup_last), up = atomic_load(&g_outup_wh);
+    int ow = (int)atomic_load(&g_out_w), oh = (int)atomic_load(&g_out_h);
+    if (up_at && cur - up_at < 30 && up) { ow = (int)(uint32_t)up; oh = (int)(up >> 32); }
+    *out_w = ow; *out_h = oh;
+    *scene_w = (int)atomic_load(&g_scene_w); *scene_h = (int)atomic_load(&g_scene_h);
+    *metalfx = mfx_at && cur - mfx_at < 30;
+}
 int mtl_display_hz(void) {
     if (!front_metal_layer()) return 0;
 #if TARGET_OS_OSX
@@ -17358,8 +17625,8 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     /* TOTK: the FPS box counts game presents per second and, while MetalFX interpolates, the generated frames shown as
        well ("FPS 50+50"): the user found the plain displayed count misleading on the phone ("the number looks good, it
        feels slow"), so both are shown. */
-    if (interp >= 0) { fps_overlay_note_gen(++g_gen_shown, CACurrentMediaTime()); atomic_store(&g_mfxi_last, frame ? frame : 1); }
-    else fps_overlay_note(ticket, CACurrentMediaTime());
+    if (interp >= 0) { double now = CACurrentMediaTime(); fps_overlay_note_gen(++g_gen_shown, now); fps_board_note_gen(now); atomic_store(&g_mfxi_last, frame ? frame : 1); }
+    else { double now = CACurrentMediaTime(); fps_overlay_note(ticket, now); fps_board_note(ticket, now); }
     if (g_use != USE_OFF && g_use != USE_DONE) use_tick();
     if (bootprof() && (g_present_n == 1 || g_present_n % 120 == 0)) {
         if (g_present_n == 1) g_bp_first_present = bp_now() - g_bp_t0;
@@ -17576,8 +17843,9 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     if (!present_encode_m4(cb, src, dr.texture, interp >= 0 ? NULL : crop, alloc_i)) { [cb endCommandBuffer]; [g_q4 signalDrawable:dr]; if (grab) grab(NULL); return 0; }   // the interpolated frame has the canvas size: no swapchain crop
     /* TOTK_VR_CONTROL (stage 1, totk_vr.m): a copy of this game frame's picture for the headset, in the same command buffer;
        published from the feedback handler below. */
-    if (crop && interp < 0) { memcpy(g_b2_crop, crop, sizeof g_b2_crop); g_b2_crop_have = 1; }   // stereo B2: the left picture takes the same region
     const int *vr_crop = crop; id<MTLTexture> vr_src = interp < 0 ? vr_picture(cb, src, &vr_crop) : nil;   // the MetalFX picture modes: MetalFX's, twice as large
+    { static int shown; if (vr_src && shown < 3) { shown++; MLOG("[vr] present picture %d: src %lux%lu (window %lux%lu), crop %s %d,%d %dx%d", shown, (unsigned long)vr_src.width, (unsigned long)vr_src.height,
+          (unsigned long)src.width, (unsigned long)src.height, vr_crop ? "have" : "none", vr_crop ? vr_crop[0] : 0, vr_crop ? vr_crop[1] : 0, vr_crop ? vr_crop[2] : 0, vr_crop ? vr_crop[3] : 0); } }
     int vr_slot = interp < 0 ? vr_source_encode(cb, vr_src, vr_crop, ticket) : -1;
     if (vr_slot >= 0) { static int added; if (!added) { [g_q4 addResidencySet:vr_residency()]; added = 1; } }
     BOOL grab_hdr=dr.texture.pixelFormat==MTLPixelFormatRGBA16Float;
@@ -18018,8 +18286,6 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
     int discard = atomic_load(&g_present_discard), islot = mfx_enabled() && t ? mfx_present_frame(t, period, discard) : -1;
     if (mfx_latch() && !mfx_enabled()) { g_mfx.scene_done = g_mfx.ui_cleared = g_mfx.depth_done = g_mfx.want_cam = 0; BOTW_MFX_FRAME_RESET() }   // key 2 / flag mfx_interp: the next frame is fully on or off
     if (t && !mfx_enabled() && uw_ratio()) uw_note_present(t);   // key 4: the canvas search (TOTK_MFX does it in mfx_present_frame)
-    if (t) b2_note_present(t);   // stereo B2: which textures the game presents
-    if (t && atomic_load(&g_b2_passlog) > 0) { MLOG("[vr] b2pass: present serial %llu, mtl %p", (unsigned long long)t->serial, (__bridge void *)tex_mtl(t)); atomic_fetch_sub(&g_b2_passlog, 1); }
     mtl_wb_eager();
     g_uw_ui = 0;
     if (atomic_load(&g_uw_log) > 0) atomic_fetch_sub(&g_uw_log, 1);
@@ -18067,6 +18333,7 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
     pq_item *it = &g_pq[g_pq_in % PQ]; *it = (pq_item){*t, period, atomic_load(&g_cur_frame), {0}, CACurrentMediaTime(), islot, 0, 0, ring};
     if (crop) memcpy(it->crop, crop, sizeof it->crop);   // 当帧状态随票号入队，不在出图线程晚读可变window | The current frame's state is enqueued with the ticket number, rather than reading the mutable window late on the present thread
     uint64_t tk = ++g_pq_in;
+    eye_note_present(t, crop);   // stereo replay: which textures the game presents, and the picture's rectangle
     if(vr_projection_tracking())vr_image_projection(vr_native_image(t,NULL,0));
     vr_present_queued(tk);   // VR head look: this frame's head pose goes with its ticket (the present thread copies it later)
     [g_native_eye_frames removeAllObjects]; /* No incomplete/cross-canvas eye can leak into another game frame. */
@@ -19362,6 +19629,91 @@ int mtl_probe_drv_c0(void) {
     return checked;
 }
 
+/* Image writes must reach HDR companions and their guest-format originals; sampling must still return alpha one. */
+static int probe_hdr_image_dispatch(void) {
+    g_hdr_companion_store = 1;
+    NSString *msl = @"#include <metal_stdlib>\nusing namespace metal;\n"
+        "struct Args { texture2d<float, access::write> image [[id(0)]]; constant float4* colour [[id(1)]]; };\n"
+        "kernel void main0(constant Args& a [[buffer(0)]], uint2 p [[thread_position_in_grid]])"
+        "{ a.image.write(a.colour[0], p); }\n";
+    NSError *e = nil; id<MTLLibrary> lib = totk_msl_library(msl, &e);
+    if (!lib) MDIE("HDR image dispatch probe kernel: %s", e.localizedDescription.UTF8String);
+    NvShader *cs = [NvShader new]; cs->fn = [lib newFunctionWithName:@"main0"]; cs->stage = 5; cs->src = msl;
+    snprintf(cs->key, sizeof cs->key, "probe-hdr-image-dispatch");
+    cs->ae = [cs->fn newArgumentEncoderWithBufferIndex:0]; cs->arg_len = cs->ae.encodedLength;
+    NvProg *program = [NvProg new]; program->sh[5] = cs;
+    prog_t pg = {0}; pg.serial = 0xfffffd20; serial_put(pg.serial, program);
+    int checked = 0, saved_hdr = atomic_load(&g_hdr_frame_enabled); const prog_t *saved_prog = S.prog;
+    uint8_t saved_push[NVN_PUSH_SIZE]; memcpy(saved_push, S.push[1], sizeof saved_push);
+    const float colour[4] = {0.25f, 0.5f, 0.75f, 0.0f}; memcpy(S.push[1], colour, sizeof colour);
+    for (int mode = 0; mode < 5; mode++) {
+        /* HDR with/without companions, SDR, and swizzled SDR with late/predeclared image usage. */
+        NSDictionary *push = mode == 4 ? @{@"kind": @"cbuf", @"reg": @24, @"arg_id": @1}
+                                      : @{@"kind": @"drvcb", @"bank": @24, @"arg_id": @1};
+        NSDictionary *reflection = @{@"route": @"B", @"bindings": @[
+            @{@"kind": @"img", @"reg": @0, @"arg_id": @0, @"msl_type": @"texture2d<float, access::write>"}, push]};
+        char err[256];
+        if (nvn_refl_from_json(reflection, &cs->rf, err, sizeof err)) MDIE("Image dispatch probe reflection: %s", err);
+        if (cs->rf.b[1].kind != NVN_RB_CBUF || cs->rf.b[1].reg != NVN_PUSH_BANK) MDIE("Image dispatch probe lost push constant binding");
+        checked++;
+        cs->rf.tg[0] = cs->rf.tg[1] = cs->rf.tg[2] = 1;
+        atomic_store(&g_hdr_frame_enabled, mode < 2);
+        tex_t t = {0}; t.serial = 0xfffffd30 + mode;
+        t.d.width = t.d.height = 4; t.d.depth = t.d.levels = 1; t.d.target = 1;
+        t.d.format = 0x3f; t.d.flags = mode == 3 ? 0 : NVN_TEXTURE_FLAGS_IMAGE;
+        t.d.swizzle_r = 2; t.d.swizzle_g = 3; t.d.swizzle_b = 4; t.d.swizzle_a = 5;
+        if (mode >= 3) t.d.swizzle_a = 1;
+        MTLTextureDescriptor *d = tex_desc(&t, 0);
+        id<MTLTexture> base = [g_dev newTextureWithDescriptor:d]; if (!base) MDIE("HDR image dispatch probe texture");
+        if (mode == 3) {
+            if (base.usage & MTLTextureUsageShaderWrite) MDIE("Late image usage probe started writable");
+            checked++;
+        }
+        res_add(base); serial_put(t.serial, base); mtl_reg_tex(1, &t, NULL);
+        op_hdr end = {OP_END, 8}; mtl_sub_begin(); mtl_exec((const uint8_t *)&end);
+        id<MTLTexture> companion = mode ? nil : hdr_shadow_make(base);
+        if (!mode && !companion) MDIE("HDR image dispatch probe companion missing");
+        S.img[5][0] = 1; p_dispatch dp = {4, 4, 1, 0}; S.prog = &pg; dispatch(&dp);
+        id<MTLBuffer> raw = probe_buf(4096);
+        if (companion) enc_b_copy_texture_buffer(blit(), companion, 0, 0, MTLOriginMake(0, 0, 0), MTLSizeMake(4, 4, 1), raw, 0, 32, 128);
+        registry_lock(); id<MTLTexture> sampled = (__bridge id<MTLTexture>)tex_fast(1); registry_unlock();
+        if (!sampled || (companion && (sampled.parentTexture != companion || sampled.swizzle.alpha != MTLTextureSwizzleOne)))
+            MDIE("HDR image dispatch probe lost RGB-only sampling view");
+        if (mode >= 3 && sampled.swizzle.alpha != MTLTextureSwizzleOne) MDIE("SDR image dispatch probe lost sampling swizzle");
+        checked++;
+        id<MTLTexture> current = tex_mtl(&t);
+        if (mode == 3) {
+            if (current == base || !(current.usage & MTLTextureUsageShaderWrite)) MDIE("Late image usage probe did not upgrade storage");
+            checked++;
+        }
+        base = current;
+        enc_b_copy_texture_buffer(blit(), base, 0, 0, MTLOriginMake(0, 0, 0), MTLSizeMake(4, 4, 1), raw, 256, 16, 64);
+        mtl_sub_commit(); mtl_finish();
+        if (companion) {
+            const uint16_t *pixels = raw.contents;
+            const uint16_t want[4] = {0x3400, 0x3800, 0x3a00, 0};
+            for (int i = 0; i < 64; i++) {
+                if (pixels[i] != want[i % 4]) MDIE("HDR image dispatch probe raw component %d: %04x != %04x", i, pixels[i], want[i % 4]);
+                checked++;
+            }
+        }
+        /* R11G11B10F: five exponent bits, six/six/five mantissa bits. */
+        const uint32_t want = (13u << 6) | ((14u << 6) << 11) | (((14u << 5) + 16) << 22);
+        const uint32_t *pixels = (const uint32_t *)((const uint8_t *)raw.contents + 256);
+        for (int i = 0; i < 16; i++) {
+            if (pixels[i] != want) MDIE("HDR image dispatch probe mode %d guest pixel %d: %08x != %08x", mode, i, pixels[i], want);
+            checked++;
+        }
+        S.img[5][0] = 0;
+        mtl_reg_tex(1, NULL, NULL); serial_del(t.serial);
+        defer_obj_release(base); defer_obj_release(raw);
+    }
+    atomic_store(&g_hdr_frame_enabled, saved_hdr); S.prog = saved_prog;
+    memcpy(S.push[1], saved_push, sizeof saved_push); args_dirty_all();
+    serial_del(pg.serial);
+    return checked;
+}
+
 /* TOTK probe: back-to-back dispatches through the production dispatch() share one compute encoder and stay ordered. Two
    kernels with the translated shaders' interface alternate 16 times in one submission over 2^20 elements: K1 does
    s0[i] += i + 1, K2 does s1[i] += s0[i], so s1[i] ends at (i + 1) * 16 * 17 / 2 only if every dispatch sees the previous
@@ -19416,6 +19768,7 @@ int mtl_probe_dispatch_chain(void) {
     if (neg == 1) MLOG("dispatch-chain probe: without the barrier the values still came out right (the race did not show this time)");
     for (int k = 0; k < 2; k++) serial_put(pg[k].serial, nil);
     mtl_pool_del(s0); mtl_pool_del(s1); free(s0); free(s1); g_disp_probe_nobar = 0;
+    if (!neg) checked += probe_hdr_image_dispatch();
     return checked;
 }
 
@@ -19534,6 +19887,7 @@ int mtl_probe_layer_merge(void) {
     return checked + 5 * 4;
 }
 
+#include "nvn_integer_blend_probe.h"
 /* probe-gpu-fout: a colour output reaches its render target as the bits the code wrote, whatever type the MSL declares
    it with (fn_retype_outputs): a float output writing the bits of (7, 200, 3, 1) into RGBA8_UI gives those integers, a
    uint output writing the bits of (1, 0.5, 0.25, 1) into RGBA8_UNORM gives (255, 128, 64, 255). TOTK_PROBE_NEGATIVE=17
@@ -19583,7 +19937,7 @@ int mtl_probe_fragment_output_types(void) {
         }
         res_remove(texture);
     }
-    return checked;
+    return checked + integer_blend_probe(vs);
 }
 /* probe-gpu-vin: a vertex input reads the bits NVN's vertex fetch gives for the bound format, whatever type the MSL
    declares it with (vs_vin). Three inputs of a translated-style shader: declared float with RGBA8_UI bound (integer
@@ -20018,14 +20372,15 @@ void botw_dead_forget(const uint64_t *serials, size_t n) {
 }
 /* Key 2 (MetalFX frame interpolation): the scene copy is taken before the first UI draw into the canvas, and in this game
    the canvas is also drawn into early in the frame, before the scene (cleared, a few draws); only a draw after the upscale
-   draw 0af88d51 (or after MetalFX replaced it, mfxup_dock) counts as UI. Reset every game frame (BOTW_MFX_FRAME_RESET). */
+   draw bd7ffdd4 (or after MetalFX replaced it, mfxup_dock) counts as UI. Handheld composes directly into the canvas
+   instead: that compose is the scene, and only the following draws are UI. Reset every game frame (BOTW_MFX_FRAME_RESET). */
 static int g_botw_scene_ready;
 void botw_mfx_scene_ready(void) { g_botw_scene_ready = 1; }
 void botw_mfx_frame_reset(void) { g_botw_scene_ready = 0; }
 int botw_mfx_ui_draw(void *prog) {
     NvProg *pr = (__bridge NvProg *)prog;
     if (!pr->sh[1]) return 0;
-    if (!strncmp(pr->sh[1]->key, BOTW_MFXUP_KEY, 65)) { g_botw_scene_ready = 1; return 0; }
+    if (!strncmp(pr->sh[1]->key, BOTW_MFXUP_KEY, 65) || TAA_COMPOSE(pr->sh[1])) { g_botw_scene_ready = 1; return 0; }
     return g_botw_scene_ready;
 }
 /* A frame with no UI draw (the idle camera hides the HUD) never reaches the scene copy: the first draw into a presented
@@ -20212,20 +20567,15 @@ static void late_land(late_job **jobs, int m, NSArray<id<MTLBuffer>> *bufs) { @a
         pthread_mutex_lock(&g_late_mu);
         if (!c->cancel && !late_dirty(c)) go = c->busy = 1;   // the CPU has not written these bytes since the rendering
         pthread_mutex_unlock(&g_late_mu);
-        if (go && wb_target_lock(t)) {   /* g_mu first, as for the game thread's write-backs: the pool cannot be finalized during
-                                            the write (#764), and this thread never waits for g_mu while holding pages the dirty
-                                            tracker marks busy (a g_mu holder faulting on one of them would wait on it).
-                                            botw_late_drop waits for a busy job before its pool goes away. */
-            void *tok = nvn_dirty_tracked(t->mem, t->L.size) ? nvn_dirty_gpu_write_begin(t->mem, t->L.size) : NULL;
-            if (!tok) dm_guest_write_prepare(t->mem, t->L.size);
+        void *tok;
+        if (go && wb_target_begin(t, &tok)) {
             const uint8_t *src = (const uint8_t *)bufs[(NSUInteger)i].contents; unsigned layers = t->L.layers ? t->L.layers : 1; size_t off = 0; landed = 1;
             for (unsigned l = 0; l < t->d.levels && landed; l++) for (unsigned y = 0; y < layers && landed; y++) {
                 size_t lp; size_t ln = wb_level_size(t, l, &lp, NULL, NULL);
                 if (nvn_swizzle(&t->d, l, y, src + off, lp, t->mem)) { RED_ONCE(LATE_RED, "late write-back: unsupported layout"); landed = 0; }
                 off += ln; }
             if (landed && en && (post = malloc(en))) { memcpy(post, t->mem, c->hn); memcpy(post + c->hn, t->mem + c->t0, c->tn); }
-            nvn_dirty_gpu_write_end(tok);
-            pthread_mutex_unlock(&g_mu);
+            wb_target_end(tok);
         }
         pthread_mutex_lock(&g_late_mu);
         c->busy = 0;
@@ -20409,12 +20759,13 @@ int botw_wb_from_stage(void *ev) {
     const uint8_t *src; @autoreleasepool { src = (const uint8_t *)((__bridge id<MTLBuffer>)e->stage).contents; }
     size_t off = 0;
     unsigned layers = t->L.layers ? t->L.layers : 1; int ok = 1;
-    if (!wb_target_lock(t)) return WB_POOL_GONE;
+    void *tok;
+    if (!wb_target_begin(t, &tok)) return WB_POOL_GONE;
     for (unsigned l = 0; l < t->d.levels && ok; l++) for (unsigned y = 0; y < layers && ok; y++) {
         size_t lp; size_t n = wb_level_size(t, l, &lp, NULL, NULL);
         ok = !nvn_swizzle(&t->d, l, y, src + off, lp, t->mem); off += n; g_wb_bytes += n;
     }
-    pthread_mutex_unlock(&g_mu);
+    wb_target_end(tok);
     if (++g_wb_from_stage == 1 || g_wb_from_stage % 5000 == 0) MLOG("[writeback] %llu written back from the submission's own copy (%llu copies staged)", (unsigned long long)g_wb_from_stage, (unsigned long long)g_wb_staged);
     return ok;
 }
@@ -20488,6 +20839,7 @@ int botw_wb_newer(const void *mem, uint64_t gen) {
 #include "nvn_sampler_border_probe.h"
 #include "nvn_texels_region_probe.h"
 #include "nvn_writeback_probe.h"
+#include "nvn_pipeline_archive_identity_probe.h"
 /* probe-gpu-pipeline-archive (2026-10-26): the warm-up's way of writing the pipeline archive. 96 pipelines (12 colour
    formats x 8 write masks) are built on 4 threads and added like the warm-up adds them (par_add, each thread its own
    batch, par_flush_thread), one key twice from two threads; then the folder is read back as a later start reads it,
@@ -20643,8 +20995,9 @@ int mtl_probe_pipeline_archive(void) {
     pthread_mutex_lock(&g_par_mu); par_load_dir(&files); pre = par_load_prebuilt(g_dev); pthread_mutex_unlock(&g_par_mu);
     if (pre || g_par_have.count) MDIE("pipeline archive probe: files stamped for another GPU were taken (%lu)", (unsigned long)pre);
     unsetenv("TOTK_SHADER_SEED_DIR"); atomic_store(&g_par_pre_hit, 0); atomic_store(&g_par_pre_miss, 0);
+    int identity_checks = par_probe_identity_lock();
     [NSFileManager.defaultManager removeItemAtPath:dir error:nil];
-    return cleanup_checks + atomic_load(&built) + from_archive + 2 * N + 3;
+    return cleanup_checks + atomic_load(&built) + from_archive + 2 * N + 3 + identity_checks;
 }
 
 /* seed-shaders <corpus> (loader.c; docs/ns2-port.md): every shader a Switch 2 game ships, as
@@ -20663,7 +21016,7 @@ void runtime_shader_seed(const char *path, const char *list) { @autoreleasepool 
     /* Offline translation does not run the game's device setup. The build passes the mode observed in that setup;
        NVN's default alone is insufficient for games that explicitly select near=0 (Pokopia). */
     offline_depth_mode(getenv("TOTK_SEED_DEPTH_MODE"));
-    NSData *d = [NSData dataWithContentsOfFile:@(path)];
+    __attribute__((objc_precise_lifetime)) NSData *d = [NSData dataWithContentsOfFile:@(path)];   // the listed jobs below keep pointers into it
     if (!d || d.length < 12 || memcmp(d.bytes, "NS2SHC01", 8)) MDIE("seed-shaders: %s is not a shader corpus (scripts/ns2_shader_corpus.py)", path);
     const uint8_t *p = (const uint8_t *)d.bytes + 12, *end = (const uint8_t *)d.bytes + d.length;
     uint32_t n; memcpy(&n, (const uint8_t *)d.bytes + 8, 4);
@@ -20699,13 +21052,28 @@ void runtime_shader_seed(const char *path, const char *list) { @autoreleasepool 
         char key[65]; shader_key_of(ctl, code, kn, key);
         totk_rt_variant(@(key), stage, ctl, code, answers, rt_local(ctl, stage), 1);
         [keys addObject:@(key)];
-        for (NSDictionary *a in listed[@(key)]) { totk_rt_variant(@(key), stage, ctl, code, a, rt_local(ctl, stage), 1); [listed_jobs addObject:@[@(key), a]]; listed_n++; }
+        for (NSDictionary *a in listed[@(key)]) { [listed_jobs addObject:@[@(key), a, @(stage), [NSValue valueWithPointer:ctl], [NSValue valueWithPointer:code]]]; listed_n++; }
     }
     MLOG("[seed] %u shaders in %s: %lu queued for translation (already translated ones answer at once), %u of other stages left out (no translation chain), %u unreadable",
          n, path, (unsigned long)keys.count, other_stage, bad);
-    for (int left, said = 0; (left = totk_rt_pending()) > 0; ) {
-        usleep(500000);
-        if (++said % 20 == 0) MLOG("[seed] %d translations left (%.0f s)", left, (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1e9);
+    void (^drain)(void) = ^{
+        for (int left, said = 0; (left = totk_rt_pending()) > 0; ) {
+            usleep(500000);
+            if (++said % 20 == 0) MLOG("[seed] %d translations left (%.0f s)", left, (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1e9);
+        }
+    };
+    drain();
+    /* The background queue holds one job per shader: a request for a shader that already has one waiting is dropped. So the
+       listed states go in rounds, each after the last has drained, all shaders in parallel, until every state is translated
+       or a round adds none (the ones left are translation failures, counted below). */
+    for (long was = -1, now; ; was = now) {
+        now = 0; for (NSArray *j in listed_jobs) if (totk_rt_variant_cached(j[0], j[1])) now++;
+        if (now == (long)listed_jobs.count || now <= was) break;
+        for (NSArray *j in listed_jobs) if (!totk_rt_variant_cached(j[0], j[1])) {
+            const uint8_t *ctl = [j[3] pointerValue], *code = [j[4] pointerValue];
+            totk_rt_variant(j[0], [j[2] intValue], ctl, code, j[1], rt_local(ctl, [j[2] intValue]), 1);
+        }
+        drain();
     }
     unsigned ok = 0; NSMutableArray *missing = [NSMutableArray array];
     for (NSString *k in keys) { if (totk_rt_variant_cached(k, answers)) ok++; else if (missing.count < 8) [missing addObject:k]; }
@@ -20714,4 +21082,14 @@ void runtime_shader_seed(const char *path, const char *list) { @autoreleasepool 
     if (ok != keys.count) MLOG("[seed] [RED] %lu shaders could not be translated: their draws translate them again in the game (and fail the same way)", (unsigned long)(keys.count - ok));
     if (list) { unsigned lok = 0; for (NSArray *j in listed_jobs) if (totk_rt_variant_cached(j[0], j[1])) lok++;
         MLOG("[seed] the shader list's bind states: %u of %u translated (%lu shaders of the list are in the corpus)", lok, listed_n, (unsigned long)listed.count); }
+    /* The seed is what this run checked or made (prepare_ns2_seed.py reads the file): a cached translation this runtime would
+       ask for differently was made again (totk_shader_rt.m seed_verified), and one no request of this run reached stays out. */
+    const char *vout = getenv("TOTK_SEED_VERIFIED_OUT");
+    if (vout && *vout) {
+        uint64_t kept = 0, dropped = 0; NSArray<NSString *> *v = totk_rt_seed_verified(&kept, &dropped);
+        NSString *text = v.count ? [[v componentsJoinedByString:@"\n"] stringByAppendingString:@"\n"] : @"";
+        if (![text writeToFile:@(vout) atomically:YES encoding:NSUTF8StringEncoding error:nil]) MDIE("seed-shaders: cannot write %s", vout);
+        MLOG("[seed] requests checked: %lu variants for this runtime, %llu cached ones kept, %llu made again", (unsigned long)v.count,
+             (unsigned long long)kept, (unsigned long long)dropped);
+    }
 }}

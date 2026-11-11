@@ -24,6 +24,7 @@
 #include "nvn_protos.h"
 #include "nvn_count.h"
 #include "nvn_tex.h"
+#include "totk_prompt_icons.h"
 #include "nvn_hmap.h"
 #include "nvn_mtl.h"
 #include "nvn_pace.h"
@@ -153,7 +154,6 @@ void mtl_args_stats(uint64_t *enc, uint64_t *reuse);
 // ---------- Device ----------
 // TOTK translation thread (see "translation thread" below)
 static uint64_t fence_now(int *token);
-static int fence_wait(uint64_t k, uint64_t timeout_ns);
 static int fence_wait_to(uint64_t k, uint64_t kg, uint64_t timeout_ns);
 static void x_drain(void);
 static void replay_enter(void), replay_leave(void);   // the replay section (below)
@@ -282,6 +282,7 @@ NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBu
 }
 NVN(nvnMemoryPoolFinalize, void, NVNmemoryPool *p) {
     pool_t *o = (pool_t *)p;
+    totk_prompt_remove_pool(o->mem, (size_t)o->size);
     /* The same condition nvnMemoryPoolInitialize registered the pool under: an empty pool (size 0) was given no
        buffer and no dirty range, so its teardown is a no-op — a removal by address could otherwise hit a live
        neighbour's range when the game's allocator handed the empty pool an address next to one (#1367). */
@@ -722,7 +723,7 @@ NVN(nvnSyncInitialize, NVNboolean, NVNsync *s, NVNdevice *d) { (void)d; *(sync_t
 NVN(nvnSyncFinalize, void, NVNsync *s) { ((sync_t *)s)->magic = 0; }
 // 围栏 = 「此前提交到队列的命令全部完成」：记下最近一次提交的栅栏值
 // Fence = "all commands previously submitted to the queue have completed": record the fence value of the most recent submit
-// TOTK: with the translation thread a fence is a submit count (bit 2 of fenced), see fence_now / fence_wait.
+// TOTK: with the translation thread a fence is a submit count (bit 2 of fenced), see fence_now / fence_wait_to.
 /* TOTK_SYNC_CHAIN=<n>[:<from frame>] (diagnostic): guest call chains of the first n fence placements and of the first n waits that block,
    to find the game code that makes frame N+1 wait for frame N on the GPU (see the 2026-10-15 timeline). */
 static void guest_chain(const char *what);
@@ -921,7 +922,6 @@ void runtime_describe_address(uint64_t a, char *out, size_t n);
 NVN(nvnCommandBufferSetMemoryCallback, void, NVNcommandBuffer *c, PFNNVNCOMMANDBUFFERMEMORYCALLBACKPROC cb) { CB(c)->cb = cb;
     if (ctl_log_left()) { char w[96] = ""; runtime_describe_address((uint64_t)(uintptr_t)cb, w, sizeof w); LOG("[ctl] SetMemoryCallback cb=%p fn=%s", (void *)c, w); } }
 NVN(nvnCommandBufferSetMemoryCallbackData, void, NVNcommandBuffer *c, void *d) { CB(c)->cb_data = d; }
-static uint8_t *align8(uint8_t *p) { return (uint8_t *)(((uintptr_t)p + 7) & ~(uintptr_t)7); }
 // 诊断 DM_NVN_CMDSTAT=1：每 300 帧记一行命令录制的用量——每帧录了多少字节 / 多少条、游戏每次给多大一段命令内存、每帧补内存回调几次、宿主补段几次、
 // 各类命令的条数与字节（找「我们的记录比真机命令大多少」）。只计数，不改录制 / 回放
 // Diagnostic DM_NVN_CMDSTAT=1: every 300 frames log one line of command recording usage -- how many bytes / records were recorded per frame, how large a command memory segment the game gives each time, how many out-of-memory callbacks per frame, how many host-supplied segments,
@@ -941,7 +941,6 @@ static void cs_dump(void) {   // 每帧调一次（出图处） | Called once pe
     int on = g_cs.on; memset(&g_cs, 0, sizeof g_cs); g_cs.on = on; g_cs.frame0 = f; pthread_mutex_unlock(&g_cs_mu);
 }
 static __thread uint32_t t_rec_hist[OP_COUNT_]; static __thread uint32_t t_rec_n;
-static __thread uint64_t t_rec_eyes, t_rec_tdraws;   // TOTK stereo B2: eye marks / draws the recording inlined from the handles it called (inline_recording)
 static void put_hdr(uint8_t *p, uint32_t op, uint32_t size) { op_hdr h = {op, size}; memcpy(p, &h, sizeof h); if (op) { cs_op(op, size); if (op < OP_COUNT_) t_rec_hist[op]++; } }
 // TOTK: records are written into a growable host buffer per command buffer, never into game command memory.
 // Games hand the same command memory to several command buffers recording concurrently (budgeted for real NVN
@@ -1049,7 +1048,7 @@ NVN(nvnCommandBufferBeginRecording, void, NVNcommandBuffer *c) {
 #endif
     o->rec_start = o->cmd_used;
     uint8_t *p = cmd_alloc(o, 8); put_hdr(p, OP_BEGIN, 8); o->hw_used -= 8;   /* BEGIN/END records have no hardware equivalent */
-    o->hw_start = o->hw_used; memset(t_rec_hist, 0, sizeof t_rec_hist); t_rec_eyes = 0; t_rec_tdraws = 0;
+    o->hw_start = o->hw_used; memset(t_rec_hist, 0, sizeof t_rec_hist);
 }
 // TOTK: an NVN command handle lives in the command buffer's control memory; games reuse command memory
 // for later recordings while still calling earlier handles (observed: temporary command buffers sharing one
@@ -1085,52 +1084,15 @@ static pthread_mutex_t g_copy_mu = PTHREAD_MUTEX_INITIALIZER;
 /* The opaque handle points past this host-only validation and accounting prefix. */
 #define COPY_MAGIC 0x59504f43444d43ull   /* "CMDCOPY" */
 /* One layout for both games (the Android port's fields -- the UBO index, the piece markers, serial / pinned / cb for the
-   predecode -- are set for every copy by flatten_recording; `used` is Breath of the Wild's NVN 53 lifetime mark). */
+   predecode -- are set for every copy by flatten_recording; `used` is Breath of the Wild's NVN 53 lifetime mark). The copy
+   is one allocation sized from the recorded bytes, filled one contiguous segment run at a time. */
 typedef struct { uint64_t magic; _Atomic uint64_t used_at; uint64_t made_at; uint32_t body_bytes, last_size, idx_off, nidx, ubo_off, nubo, ncall, nmark;   /* nmark: piece markers inside (copies of other recordings) */
                  uint64_t serial; _Atomic uint32_t pinned; uint32_t pad2_; uint64_t cb;   /* cb: the command buffer object it was recorded on */   /* serial: unique per copy (plan key); pinned: the translation thread's predecode reads the body (nvn_vulkan_plan.inc) */
-                 _Atomic uint32_t used; uint32_t pad3_;   // used: called or submitted at least once (NVN 53 lifetime, release_copies; Breath of the Wild)
-                 uint64_t vr_record, rec_cb, eyes, tdraws; _Atomic uint64_t vr_refs, vr_twin; } copy_prefix;   // zeldaVR stereo B2 (below): vr_record, vr_refs and vr_twin (ownership), rec_cb (the command buffer that recorded it), eyes (OP_EYE marks in the body), tdraws
-/* B2 retains completed render-stage summaries through uniform capture and
-   pairing. The matching right recording then owns its immutable left twin
-   until the right recording itself is retired. No submit-age lifetime guess. */
-static int copy_kept(const cmd_copy *c);
-#define COPY_KEEP_INIT(c) ((c)->vr_record = 0, (c)->rec_cb = 0, (c)->eyes = 0, (c)->tdraws = 0, (c)->vr_refs = 0, (c)->vr_twin = 0)
+                 _Atomic uint32_t used; uint32_t pad3_; } copy_prefix;   /* used: called or submitted at least once (NVN 53 lifetime, release_copies; Breath of the Wild) */
 static _Atomic uint64_t g_copy_serial;
 static void plan_offer(uint8_t *copy);   /* below, with the translation thread */
 static _Atomic uint64_t g_copy_bytes;   /* live recording-copy bytes (logged with the copy count) */
 static copy_prefix *copy_of(NVNcommandHandle h) { copy_prefix *c = (copy_prefix *)(uintptr_t)h - 1; return c; }
-#ifndef GAME_BOTW
-/* A B2 stage or a right-eye recording owns this immutable copy. The game's
-   control-memory token can disappear independently of those host consumers. */
-void hle_vr_copy_tag(uint64_t handle,uint32_t frame,unsigned phase){
-    copy_prefix *copy=copy_of((NVNcommandHandle)handle);
-    if(!handle||copy->magic!=COPY_MAGIC)die("VR tagged an invalid recording");
-    copy->vr_record=((uint64_t)frame<<32)|phase;
-}
-uint64_t hle_vr_copy_record(uint64_t handle){
-    copy_prefix *copy=copy_of((NVNcommandHandle)handle);
-    if(!handle||copy->magic!=COPY_MAGIC)die("VR read an invalid recording identity");
-    return copy->vr_record;
-}
-void hle_vr_copy_retain(uint64_t handle){
-    copy_prefix *copy=copy_of((NVNcommandHandle)handle);
-    if(!handle||copy->magic!=COPY_MAGIC)die("VR retained an invalid command copy %#llx",(unsigned long long)handle);
-    atomic_fetch_add_explicit(&copy->vr_refs,1,memory_order_relaxed);
-}
-void hle_vr_copy_release(uint64_t handle){
-    copy_prefix *copy=copy_of((NVNcommandHandle)handle);
-    if(!handle||copy->magic!=COPY_MAGIC||!atomic_fetch_sub_explicit(&copy->vr_refs,1,memory_order_release))die("VR command-copy ownership underflow");
-}
-void hle_vr_copy_bind(uint64_t right,uint64_t left){
-    copy_prefix *copy=copy_of((NVNcommandHandle)right);
-    if(!right||right==left||copy->magic!=COPY_MAGIC||copy->vr_twin)die("VR command-copy twin ownership invalid");
-    hle_vr_copy_retain(left);copy->vr_twin=left;
-}
-uint64_t hle_vr_copy_twin(uint64_t right){
-    copy_prefix *copy=copy_of((NVNcommandHandle)right);
-    return right&&copy->magic==COPY_MAGIC?copy->vr_twin:0;
-}
-#endif
 /* The copy also carries an index of the ops the submit call has to visit (uniform binds for the uniform capture, texture /
    image / sampler binds for the deferred binds, calls), appended after OP_END: the submit call, on the frame's critical
    path, read the whole recording twice to find them (TOTK, 2026-10-23: ~0.3 ms of a 0.8 ms submit). Offsets are from
@@ -1216,7 +1178,7 @@ static uint8_t *flatten_recording(const uint8_t *p, size_t hint) {
             if (n + ubo_bytes > cap) { cap = n + ubo_bytes; out = realloc(out, cap); if (!out) die("command copy allocation"); }
             if (ubo_bytes) { ubo_ranges_sort(t_ubo, t_ubo_n); memcpy(out + n, t_ubo, ubo_bytes); }
             n += ubo_bytes;
-            copy_prefix *c = (copy_prefix *)out; c->magic = COPY_MAGIC; c->used_at = 0; c->made_at = g_submits; c->used = 0; c->pad3_ = 0; COPY_KEEP_INIT(c);
+            copy_prefix *c = (copy_prefix *)out; c->magic = COPY_MAGIC; c->used_at = 0; c->made_at = g_submits; c->used = 0; c->pad3_ = 0;
             c->idx_off = idx_ok && ops_end - sizeof(copy_prefix) <= UINT32_MAX ? (uint32_t)(ops_end - sizeof(copy_prefix)) : 0; c->nidx = c->idx_off ? nidx : 0;
             c->ubo_off = ubo_at - sizeof(copy_prefix) <= UINT32_MAX ? (uint32_t)(ubo_at - sizeof(copy_prefix)) : 0; c->nubo = c->ubo_off ? t_ubo_n : 0; c->ncall = ncall; c->nmark = nmark;
             c->serial = atomic_fetch_add(&g_copy_serial, 1) + 1; atomic_store(&c->pinned, 0); c->pad2_ = 0; c->cb = 0;
@@ -1263,9 +1225,6 @@ static void retired_sweep(void) {
     g_nretired = k;
 }
 static void copy_free(copy_prefix *pf) {
-#ifndef GAME_BOTW
-    if(pf->vr_twin){hle_vr_copy_release(pf->vr_twin);pf->vr_twin=0;}
-#endif
     uint64_t after = async_replay() ? xsub_pushed() : 0;
     if (!after || after <= xsub_replayed()) { g_copy_bytes -= malloc_size(pf); free(pf); return; }
     if (g_nretired == g_cretired) {
@@ -1297,13 +1256,6 @@ static void copy_drop(copy_bucket *b, uint32_t i, int by_token) {   /* g_copy_mu
     if (by_token) g_copy_drop_token++; else g_copy_drop_readd++;
     if (!b->n && !b->empty) { b->empty = 1; g_cbk_empty++; }
 }
-static int copy_kept(const cmd_copy *c) {
-#ifdef GAME_BOTW
-    (void)c; return 0;
-#else
-    return atomic_load_explicit(&((const copy_prefix *)(c->copy-sizeof(copy_prefix)))->vr_refs,memory_order_acquire)!=0;
-#endif
-}
 static void release_copies(uintptr_t lo, uintptr_t hi) {
     if (hi <= lo) return;
     pthread_mutex_lock(&g_copy_mu);
@@ -1319,7 +1271,6 @@ static void release_copies(uintptr_t lo, uintptr_t hi) {
                in the same frame (boot37 / boot38). Once used, a recycled chunk retires it. */
             if (!((const copy_prefix *)(c->copy - sizeof(copy_prefix)))->used) { i++; continue; }
 #endif
-            if (copy_kept(c)) { i++; continue; }   /* stereo B2: a left-eye twin still to be inlined */
             copy_drop(b, i, 0);
         }
     }
@@ -1400,16 +1351,11 @@ NVN(nvnCommandBufferEndRecording, NVNcommandHandle, NVNcommandBuffer *c) {
     if (reclog_limit() && (int)t_rec_n < reclog_limit()) { char line[1024]; size_t n = 0; t_rec_n++;
         for (unsigned i = 1; i < OP_COUNT_ && n < sizeof line - 24; i++) if (t_rec_hist[i]) n += snprintf(line + n, sizeof line - n, " op%u×%u", i, t_rec_hist[i]);
         LOG("[rec] #%u cb=%p ours=%zu hw=%zu%s", t_rec_n, (void *)c, o->cmd_used - o->rec_start - 16, hw_before - o->hw_start, line); }
-    const uint32_t rec_draws = t_rec_hist[OP_DRAW] + t_rec_hist[OP_DRAW_IDX];
     uint64_t flat_t0 = now_ns();
     uint8_t *copy = flatten_recording(o->seg, o->cmd_used - o->rec_start);
     totk_tl(TL_REC_END, (uint64_t)(o->cmd_used - o->rec_start), (uint64_t)(uintptr_t)copy);   /* when, on which thread, and which handle (TOTK_TIMELINE) */
     { static _Atomic uint64_t n, ns, bytes; uint64_t k = atomic_fetch_add(&n, 1) + 1; atomic_fetch_add(&ns, now_ns() - flat_t0); atomic_fetch_add(&bytes, o->cmd_used - o->rec_start);
       if (k % 3000 == 0) { LOG("[nvn] EndRecording: flatten %.3f ms a call, %.1f KiB recorded a call (%llu calls)", atomic_load(&ns) / 3000e6, atomic_load(&bytes) / 3000.0 / 1024, (unsigned long long)k); atomic_store(&ns, 0); atomic_store(&bytes, 0); } }
-#ifndef GAME_BOTW
-    { copy_prefix *cp = (copy_prefix *)(uintptr_t)copy - 1; cp->vr_record = 0; cp->rec_cb = (uint64_t)(uintptr_t)c; cp->eyes = t_rec_eyes + t_rec_hist[OP_EYE]; cp->tdraws = t_rec_tdraws + rec_draws; }   // B2: exact recording owner metadata; references are held by actual consumers
-#endif   // zeldaVR stereo B2: draws per render run, and which run a handle is (game_patches_v143.c; empty elsewhere)
-    { extern void runtime_b2_rec(uint32_t draws, uint64_t handle); runtime_b2_rec(rec_draws, (uint64_t)(uintptr_t)copy); }
     if (call_stats_on()) call_stats_end(c, copy);
     /* Finalizing the recorder does not retire its handle; only reusing the backing control region does. */
 #ifdef GAME_BOTW
@@ -1556,9 +1502,6 @@ static void inline_recording_body(NVNcommandBuffer *c, NVNcommandHandle hd) {
        remain deferred; source handle retirement cannot affect the caller.
        CMDSTAT retains the record-by-record path and its exact counters. */
     const copy_prefix *meta = copy_of(hd);
-#ifndef GAME_BOTW
-    t_rec_eyes += meta->eyes; t_rec_tdraws += meta->tdraws;   // stereo B2: the caller's body now holds the callee's eye marks and draws too
-#endif
     if (inline_bulk_on() && !cs_on() && meta->body_bytes && meta->last_size) {
         cmd_t *o = CB(c);
         uint8_t *dst = cmd_alloc(o, meta->body_bytes);
@@ -1586,43 +1529,13 @@ NVN(nvnCommandBufferCopyCommands, void, NVNcommandBuffer *c, int n, const NVNcom
     for (int i = 0; i < n; i++) inline_recording(c, h[i]);
 #endif
 }
-static void *rec(NVNcommandBuffer *c, uint32_t op, size_t payload);   /* below: a record in the command buffer (stereo B2's OP_EYE marks) */
-#ifndef GAME_BOTW
-/* zeldaVR stereo B2: the command buffers whose recordings the game submits to the queue itself (its frame's primary
-   command buffers, the final assembly among them), noted at each submit. Only their calls are paired with the first run
-   (CallCommands): a call nested in another recording (a render job's summary calling its segments, possibly a recording
-   kept from an earlier frame) is inlined as it is, so eye marks never nest (the left eye's twin itself holds none). */
-static _Atomic uint64_t g_b2_top[8];
-static void b2_top_note(NVNcommandHandle h) {
-    const copy_prefix *cp = copy_of(h); if (cp->magic != COPY_MAGIC || !cp->rec_cb) return;
-    for (int i = 0; i < 8; i++) { uint64_t v = atomic_load_explicit(&g_b2_top[i], memory_order_relaxed); if (v == cp->rec_cb) return;
-        if (!v) { uint64_t z = 0; if (atomic_compare_exchange_strong(&g_b2_top[i], &z, cp->rec_cb)) { LOG("[vr] stereo B2: command buffer %#llx submits its recordings itself (a frame's primary command buffer)", (unsigned long long)cp->rec_cb); return; } if (z == cp->rec_cb) return; } }
-}
-uint64_t hle_copy_tdraws(uint64_t h) { const copy_prefix *cp = copy_of((NVNcommandHandle)h); return h && cp->magic == COPY_MAGIC ? cp->tdraws : 0; }   // stereo B2 diagnostic: draws in a recording, inlined ones included
-static int b2_top(const NVNcommandBuffer *c) {
-    for (int i = 0; i < 8; i++) { uint64_t v = atomic_load_explicit(&g_b2_top[i], memory_order_relaxed); if (!v) return 0; if (v == (uint64_t)(uintptr_t)c) return 1; }
-    return 0;
-}
-#endif
 NVN(nvnCommandBufferCallCommands, void, NVNcommandBuffer *c, int n, const NVNcommandHandle *h) {
     if (cmdlog_env()) for (int i = 0; i < n; i++) LOG("[cmd] CallCommands cb=%p handle=%#llx", (void *)c, (unsigned long long)h[i]);
     life_call(c, n, h, "call");
 #ifdef GAME_BOTW
     for (int i = 0; i < n; i++) inline_recording(c, botw_handle_copy(h[i]));
 #else
-    { extern void runtime_b2_called(int n, const uint64_t *h, uint64_t caller); runtime_b2_called(n, (const uint64_t *)h, (uint64_t)(uintptr_t)c); }   // zeldaVR stereo B2: which run's recordings the frame calls
-    /* zeldaVR stereo B2 (game_patches_v143.c; nothing elsewhere): a second-run (right eye) recording the frame's final
-       assembly calls is inlined with its first-run (left eye) twin behind it, each between OP_EYE marks, so the replay can
-       draw each eye's frame from the same submission; or (a check) the twin alone in its place. */
-    { extern uint64_t runtime_b2_twin(uint64_t h); extern int runtime_b2_stereo(void);
-      for (int i = 0; i < n; i++) {
-          const uint64_t t = b2_top(c) ? runtime_b2_twin((uint64_t)h[i]) : 0;
-          if (t && runtime_b2_stereo()) {
-              ((p_eye *)rec(c, OP_EYE, sizeof(p_eye)))->mask = 2; inline_recording(c, h[i]);
-              ((p_eye *)rec(c, OP_EYE, sizeof(p_eye)))->mask = 1; inline_recording(c, (NVNcommandHandle)t);
-              ((p_eye *)rec(c, OP_EYE, sizeof(p_eye)))->mask = 3;
-          } else inline_recording(c, t ? (NVNcommandHandle)t : h[i]);
-      } }
+    for (int i = 0; i < n; i++) inline_recording(c, h[i]);
 #endif
 }
 NVN(nvnCommandBufferSignalEvent, void, NVNcommandBuffer *c, const NVNevent *e, NVNeventSignalMode m, NVNeventSignalLocation loc, int flags, uint32_t v) {
@@ -1797,7 +1710,7 @@ static void pin_scan(size_t buckets) {   /* g_copy_mu and g_pin_mu held */
     for (; k < end; k++, i = 0) {
         copy_bucket *b = &g_cbk[k]; if (!b->used) continue;
         while (i < b->n) {
-            if (!copy_kept(&b->v[i]) && b->v[i].token && !copy_token_intact(&b->v[i])
+            if (b->v[i].token && !copy_token_intact(&b->v[i])
 #ifdef GAME_BOTW
                 && !botw_mark_gone_keep(&b->v[i])
 #endif
@@ -2544,7 +2457,6 @@ NVN(nvnVertexStreamStateSetDivisor, void, NVNvertexStreamState *s, int d) { ST(v
 static _Atomic uint64_t g_sub_wall_ns, g_sub_cpu_ns, g_sub_instr;   // 提交（不含出图）的墙钟 / 本线程 CPU 时间 / 本线程退休指令数（逐帧取走） | Wall clock / this thread's CPU time / this thread's retired instruction count for submit (excluding present) (taken away per frame)
 static _Atomic uint64_t g_cum_sub_instr, g_cum_sub_cpu_ns;   // 同上累计（每 300 帧汇总「翻译」行取差，真机经日志口读：每次绘制指令数 / 每帧提交 CPU） | Cumulative versions of the above (the 「翻译」(translation) summary row every 300 frames takes the difference; on a real device read through the log port: instructions per draw / submit CPU per frame)
 extern int thread_selfcounts(int type, void *buf, size_t nbytes);   // 本线程累计 {指令, 周期}（libSystem 私有接口，Mac / iOS 都有） | This thread's cumulative {instructions, cycles} (libSystem private interface, present on both Mac and iOS)
-static uint64_t thr_instr(void) { uint64_t c[2] = {0, 0}; thread_selfcounts(1, c, sizeof c); return c[0]; }
 // 提交路径的补充读数（真机 Metal 4 指令数 −18% 而提交 CPU 时间 +49%，要分清是内核态、执行效率还是被降频）：
 // 本线程周期数（同一接口的第二项）、内核态 CPU 时间（THREAD_BASIC_INFO）、墙钟
 // Supplementary readings for the submit path (on a real device Metal 4 instruction count is -18% while submit CPU time is +49%; need to tell apart kernel mode, execution efficiency, or frequency throttling):
@@ -2834,7 +2746,6 @@ static uint64_t fence_now(int *token) {
     pthread_mutex_lock(&g_xq_mu); uint64_t k = g_xsub_in; pthread_mutex_unlock(&g_xq_mu); *token = 1; return k;
 }
 // Waits for a token: the submit has been translated, then the Metal fence it ended with. 1 = reached.
-static int fence_wait(uint64_t k, uint64_t timeout_ns) { return fence_wait_to(k, k, timeout_ns); }
 // Submit k must be translated; the GPU wait is for the fence of submit kg <= k (TOTK_SYNC_LAG).
 static int fence_wait_to(uint64_t k, uint64_t kg, uint64_t timeout_ns) {
     uint64_t t0 = now_ns();
@@ -2895,9 +2806,6 @@ NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h)
 #endif
     totk_tl(TL_SUB_IN, (uint64_t)n, 0);
     { uint64_t now = __atomic_add_fetch(&g_submits, 1, __ATOMIC_RELAXED); for (int i = 0; i < n; i++) copy_touch(h[i], now); }
-#ifndef GAME_BOTW
-    { extern int runtime_b2_stereo(void); if (runtime_b2_stereo()) for (int i = 0; i < n; i++) b2_top_note(h[i]); }   // zeldaVR stereo B2: the frame's primary command buffers
-#endif
     if (totk_life_on()) { int k = 0; for (int i = 0; i < n; i++) k += totk_life_handle_has(h[i]); totk_life_log("submit n=%d followed=%d", n, k); }
     ((queue_t *)q)->submits++;
     /* TOTK: what the console reads at the submit call is read here, on the game thread, before the submission may be handed
@@ -2951,44 +2859,30 @@ static void submit_exec(int n, const uint64_t *h, void *ucap) {
     /* TOTK diagnostic (TOTK_WATCH_ADDR): submissions in progress, and their start / end times, to line up guest writes with replay */
     atomic_fetch_add(&dm_submit_busy, 1);
     { static int wl = -1; if (wl < 0) wl = getenv("TOTK_WATCH_ADDR") != NULL; if (wl) LOG("[sub] F%llu start t_us=%llu", (unsigned long long)g_frame_pub, (unsigned long long)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000)); }
-    /* zeldaVR stereo B2 (game_patches_v143.c; never elsewhere): a submission whose frame carries both eyes' recordings
-       (stereo marks written since the last one) is replayed for the left eye first, its picture handed to the headset
-       and its CPU-visible effects left out (nvn_mtl.m), then as always for the right eye, whose picture the present
-       hands over. */
-    extern uint64_t runtime_b2_stereo_marks(void); extern void mtl_eye_pass(int e); extern void mtl_eye_capture(int eye); extern void mtl_eye_done(int left, int last); extern void vr_b2_present_eye(int eye);
-    /* stereo by content: a submission is replayed per eye when one of its recordings holds eye marks (the frame's final
-       assembly with both eyes' recordings), never because marks were written somewhere meanwhile (b2ao: the previous
-       frame's submission, without marks, was taken for a stereo one every other frame and took the left capture) */
-    int b2 = 0; const uint64_t b2_mk = runtime_b2_stereo_marks();
-#ifndef GAME_BOTW
-    for (int i = 0; i < n && !b2; i++) { const copy_prefix *cp = copy_of((NVNcommandHandle)h[i]); b2 = cp->magic == COPY_MAGIC && cp->eyes; }
-#endif
-    void *b2_left = NULL; extern int mtl_b2_right_first(void); const int b2_rfirst = b2 && mtl_b2_right_first();   // functions, not nvn_mtl.m data: probes that link this file alone resolve no data of it at load
-    if (b2) {
-        { static int said; if (!said++) LOG("[vr] stereo B2: the first stereo submission (%llu marks so far): replayed for the left eye, then the right", (unsigned long long)b2_mk); }
-        /* the left eye's uniforms: the submission's own capture (the submit call's, or one taken now when the replay runs
-           inside the submit call) with the first run's bytes over them (captured between the runs, game_patches_v143.c;
-           the second run writes the same blocks): nothing of the left pass reads live memory the game may be rebuilding */
-        extern void *runtime_b2_left_cap(void); extern void *mtl_ucap_overlay(const void *base, const void *over); extern void mtl_ucap_free(void *c); extern void *mtl_sub_capture_ubos(const uint64_t *h, int n);
-        void *over = runtime_b2_left_cap(), *own = ucap ? NULL : mtl_sub_capture_ubos((const uint64_t *)h, n);
-        extern int mtl_b2_submit_uniforms_only(void); b2_left = mtl_ucap_overlay(ucap ? ucap : own, mtl_b2_submit_uniforms_only() ? NULL : over);
-        mtl_ucap_free(over); mtl_ucap_free(own);
-    }
-    if(b2){extern void vr_b2_pair_begin(void);vr_b2_pair_begin();}
-    for (int pass = 0; pass < (b2 ? 2 : 1); pass++) {
-        const int left = b2 && (pass == 0) != b2_rfirst;   // stereo: the left eye's pass (first unless b2order)
-        if(b2){extern void vr_b2_eye_begin(void);vr_b2_eye_begin();}
-        if (b2) mtl_eye_pass((left ? 1 : 2) | (pass ? 4 : 0));
+    /* Stereo by replay (nvn_mtl.m g_eye_pass, vr开发.md section 23): the same recordings and the same uniform bytes once
+       per eye, the left eye first. */
+    extern int mtl_stereo_replay(void); extern void mtl_eye_pass(int e); extern void *mtl_ucap_dup(const void *base); extern void *mtl_sub_capture_ubos(const uint64_t *h, int n);
+    extern int mtl_ucap_eye(void *cap, int eye); extern int mtl_stereo_project(void); extern void mtl_ucap_free(void *c); extern void mtl_eye_capture(int eye);
+    int stereo = mtl_stereo_replay(); const int project = stereo && mtl_stereo_project();
+    /* each replay consumes a capture: with two replays the submission's own (taken now when the replay runs inside the
+       submit call) goes to the second and a copy of it to the first */
+    void *base = stereo ? (ucap ? ucap : mtl_sub_capture_ubos((const uint64_t *)h, n)) : ucap, *first = stereo ? mtl_ucap_dup(base) : NULL;
+    /* a submission without the world camera's block (menus, the title, loading, a frame's other submissions) has no eyes
+       to make: it is replayed once, as without stereo */
+    if (project && mtl_ucap_eye(first, 0) <= 0) { mtl_ucap_free(first); first = NULL; stereo = 0; }
+    for (int pass = 0; pass < (stereo ? 2 : 1); pass++) {
+        if (stereo) mtl_eye_pass(pass + 1);
+        void *cap = stereo && pass == 0 ? first : base;
+        if (stereo && project && pass == 1) (void)mtl_ucap_eye(cap, 1);   // the right eye's projection into the second replay's uniforms
         mtl_sub_begin();
-        mtl_sub_snapshot_ubos_cap((const uint64_t *)h, n, left ? b2_left : ucap);   // TOTK: uniforms as of the submit call (ucap: bytes captured there)
+        mtl_sub_snapshot_ubos_cap((const uint64_t *)h, n, cap);   // TOTK: uniforms as of the submit call (cap: bytes captured there)
         mtl_sub_index((const uint64_t *)h, n);
         for (int i = 0; i < n; i++) { mtl_exec_rest((const uint64_t *)h + i + 1, n - i - 1); mtl_exec((const uint8_t *)h[i]); }
         mtl_exec_rest(NULL, 0);
-        if (left) mtl_eye_capture(0);
+        if (stereo && project) mtl_eye_capture(pass);   // this eye's picture, before the commit
         mtl_sub_commit();
-        if (b2) mtl_eye_done(left, pass == 1);
     }
-    if (b2) { mtl_eye_pass(0); vr_b2_present_eye(1); }
+    if (stereo) mtl_eye_pass(0);
     atomic_fetch_sub(&dm_submit_busy, 1);
     { static int wl = -1; if (wl < 0) wl = getenv("TOTK_WATCH_ADDR") != NULL; if (wl) LOG("[sub] F%llu end t_us=%llu", (unsigned long long)g_frame_pub, (unsigned long long)(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000)); }
     uint64_t dw = now_ns() - t0;
@@ -3151,6 +3045,13 @@ static int game_hold_fps(void) {
     if (runtime_game_fps_limit() == 30 || phone_holds_30()) return 30;
     int m = mfx_hold_fps(mfx_enabled());
     return m ? m : atomic_load(&g_fps_lock);
+}
+/* The leaderboard's pacing (runtime/board_upload.h): interp is the interpolation mode as the game's held rate (1: on
+   without a held rate, 0: off); lock is the rate the game is held at without interpolation (0: not held). */
+void nvn_board_pacing(int *lock, int *interp) {
+    int m = mfx_enabled(), hold = mfx_hold_fps(m);
+    *interp = m == MFX_OFF ? 0 : hold ? hold : 1;
+    *lock = m == MFX_OFF ? game_hold_fps() : 0;
 }
 static int uncapped_now(void) { int m = mfx_enabled(); return g_uncapped && !game_hold_fps() && (m == MFX_OFF || m == MFX_MAX); }
 /* A held rate on a display whose rate is not a multiple of it (30 on the user's 100 Hz): the game is paced by our own clock

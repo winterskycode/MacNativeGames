@@ -27,14 +27,24 @@ is no seed of those games here: an issue titled for one of them gives it every r
 Breath of the Wild's, and their default variants are not dropped. Rows pasted into the issue text (a fenced TSV block)
 are read like an attached file.
 
+The apps also send their rows over HTTPS to the shader inbox (MacNativeGamesWeb/shader-inbox, a project of its own: a Vercel function and a database), which
+keeps each row once per game with the installs and game versions that sent it. --inbox <url> merges the rows it holds
+for every game here exactly as an issue titled for that game (the app names its game, so nothing is guessed); --mark-inbox
+<ref> (with --apply, after the lists are committed) tells the inbox those rows are done, as --close closes the issues.
+The inbox's admin token is read from SHADER_INBOX_TOKEN; --no-issues leaves GitHub out.
+
 usage: collect_shader_issues.py --seed <seed folder> ... [--keys <game>=<file> ...] [--repo owner/name] [--issue N ...]
-                                [--drop-unknown] [--apply] [--close]
-needs: the GitHub CLI (gh), signed in."""
+                                [--inbox <url>] [--no-issues] [--drop-unknown] [--apply] [--close] [--mark-inbox <ref>]
+needs: the GitHub CLI (gh), signed in (not with --no-issues)."""
 import argparse
+import importlib.util
 import json
+import os
 import re
+import tempfile
 import subprocess
 import sys
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -54,11 +64,31 @@ SEEDED = tuple(GAMES)   # the games whose prepared seeds name every shader key (
 OTHER = {'odyssey': ('Super Mario Odyssey', '超级马力欧 奥德赛', ('SMO', 'Odyssey')),
          'ssbu': ('Super Smash Bros. Ultimate', '任天堂明星大乱斗 特别版', ('SSBU',)),
          'wonder': ('Super Mario Bros. Wonder', '超级马力欧兄弟 惊奇', ('Wonder',)),
-         'mvdk': ('Mario vs. Donkey Kong', '马力欧 vs. 大金刚', ('MvDK',))}
+         'mvdk': ('Mario vs. Donkey Kong', '马力欧 vs. 大金刚', ('MvDK',)),
+         'dkb': ('Donkey Kong Bananza', '大金刚 Bananza', ('Bananza', 'DKB')),
+         'pokopia': ('Pokémon Pokopia', '宝可梦 Pokopia', ('Pokopia',)),
+         'oot': ('Ocarina of Time', '塞尔达传说 时之笛', ('OcarinaOfTime', 'OOT'))}
 OTHER_LABEL = 'shader-list-other'   # .github/ISSUE_TEMPLATE/shader-list-other.yml
 for _game, (_name, _zh, _) in OTHER.items():
     GAMES[_game] = (TOTK.parent / _game / 'assets/shader_list.tsv', OTHER_LABEL, f'Shader list ({_name}')
     TITLES[_game], TITLES_ZH[_game] = _name, _zh
+# Games whose own shader_list.py merges a file into their list (its "merge"): Ocarina of Time's list has rows this script does
+# not know (M, mesh pipelines) and keeps the bind state (A row) of every pipeline it names, which only a whole file gives, so
+# an issue sent for it is merged file by file as "shader_list.py merge <list> <file>" does (2026-11-09: #1980-#1991, 6,049
+# rows, merged so by hand in issue order: every warm row found its bind state).
+OWN_SCRIPT = {'oot': TOTK.parent / 'oot/scripts/shader_list.py'}
+
+
+def load_list(game, path):
+    """A game's list, read by its own shader_list.py when it has one (OWN_SCRIPT), else by this one's."""
+    if game not in OWN_SCRIPT:
+        return ShaderList.load(path)
+    spec = importlib.util.spec_from_file_location(f'{game}_shader_list', OWN_SCRIPT[game])
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.ShaderList.load(path)
+
+
 FIELD_GAME = re.compile(r'^### Game / 游戏\s*\n+([^\n#][^\n]*)', re.M)   # the form's game field
 LEGACY_TITLE = re.compile(r'\((\w+) [\d.]+\)\s*$')   # "... shaders from Mac (Wonder 1.2.1)": the launcher before its own title
 REPO = 'ly05010419/MacNativeGames'
@@ -159,20 +189,25 @@ def list_keys(shared):
     return {key for key, _ in shared.variants} | {s for row in shared.warm if row[0] in 'RBT' for s in pipeline_shaders(row)}
 
 
-def route(rows, pipes, keys):
-    """({game: (variant rows, pipeline rows)}, (unknown variant rows, unknown pipeline rows)): each row goes to the game
-    whose keys hold its shaders; a pipeline whose shaders are not all one game's is unknown."""
-    def game_of(shaders):
-        found = {g for s in shaders for g, k in keys.items() if s in k}
-        return found.pop() if len(found) == 1 and all(any(s in k for k in keys.values()) for s in shaders) else None
-    games, unknown = {}, (set(), [])
+def route(rows, pipes, keys, shared=None):
+    """({game: (variant rows, pipeline rows)}, (unknown variant rows, unknown pipeline rows)): each row goes to the one game
+    whose keys hold every shader it names; a row no game holds all of is unknown. A row more than one game holds all of
+    goes to shared ((variant rows, pipeline rows)) when given, else to unknown: Tears of the Kingdom and Breath of the Wild
+    share shaders, and such a row is theirs, never a row of the game a file's unknown rows are given to (2026-11-10:
+    1,880 Breath of the Wild pipelines whose shaders both lists hold had gone to Ocarina of Time)."""
+    held = unknown = (set(), [])
+    if shared is not None:
+        held = shared
+    def holders(shaders):
+        return [g for g, k in keys.items() if all(s in k for s in shaders)]
+    games = {}
     for row in rows:
-        g = game_of([row[0]])
-        (games.setdefault(g, (set(), []))[0] if g else unknown[0]).add(row)
+        h = holders([row[0]])
+        (games.setdefault(h[0], (set(), []))[0] if len(h) == 1 else held[0] if h else unknown[0]).add(row)
     for row in pipes:
         shaders = pipeline_shaders(row)
-        g = game_of(shaders) if shaders else None
-        (games.setdefault(g, (set(), []))[1] if g else unknown[1]).append(row)
+        h = holders(shaders) if shaders else []
+        (games.setdefault(h[0], (set(), []))[1] if len(h) == 1 else held[1] if h else unknown[1]).append(row)
     return games, unknown
 
 
@@ -252,46 +287,123 @@ def titled_game(issue):
     return 'totk'
 
 
-def merge_issue(issue, lists, keys, seeds, token, drop_unknown):
-    """Merge one issue's files into lists: (report line, {game: (rows, new rows)} or None when it stays open)."""
-    urls = issue_urls(issue)
-    rows, pipes, dropped, problems = set(), [], 0, []
+def named_game(issue):
+    """The seeded game an issue's title names (its label or prefix, or the game in the title), or None for a title that
+    names none. A row not in that game's list is new to it, whether or not a seed still at hand knows its shader."""
+    title = issue['title']
+    if titled_game(issue) == 'botw' or re.search(r'\b(?:BotW|Breath of the Wild)\b', title, re.I):
+        return 'botw'
+    return 'totk' if re.search(r'\b(?:TOTK|Tears of the Kingdom)\b', title, re.I) else None
+
+
+def issue_texts(issue, token):
+    """(label for the report, the texts of its files and pasted rows, download problems) of an issue."""
+    urls, texts, problems = issue_urls(issue), [], []
     for url in urls:
         try:
-            text = download(url, token)
-            got, bad = contribution_rows(text)
-            rows |= got; dropped += bad
-            pipes += [row for row in contribution_pipelines(text) if row not in pipes]
+            texts.append(download(url, token))
         except (OSError, ValueError) as error:
             problems.append(f'{url}: {error}')
     pasted = inline_text(issue)
     if pasted:
-        rows |= contribution_rows(pasted)[0]
-        pipes += [row for row in contribution_pipelines(pasted) if row not in pipes]
-    games, (unknown_rows, unknown_pipes) = route(rows, pipes, keys)
-    titled = titled_game(issue)
+        texts.append(pasted)
+    label = (f"#{issue['number']} {issue['author']['login']} ({titled_game(issue)}): {len(urls)} file(s)"
+             + (', pasted rows' if pasted else ''))
+    return label, texts, problems
+
+
+def merge_own(issue, game, shared, token):
+    """An issue sent for a game with its own merge (OWN_SCRIPT): merge_own_texts of its files and pasted rows."""
+    return merge_own_texts(*issue_texts(issue, token), game, shared)
+
+
+def merge_own_texts(label, texts, problems, game, shared):
+    """Texts sent for a game with its own merge (OWN_SCRIPT): each through the game's shader_list.py, as its "merge"
+    command. (report line, {game: (rows, new rows)} or None when they stay open)."""
+    size = lambda: len(shared.variants) + len(shared.warm) + len(shared.locators)
+    rows = new = refused = 0
+    for text in texts:
+        before, refused_before = size(), shared.refused
+        with tempfile.NamedTemporaryFile('w', suffix='.txt', delete=False) as f:
+            f.write(text)
+        try:
+            shared.add_rows(f.name, 'm')
+        finally:
+            os.unlink(f.name)
+        rows += sum(1 for line in text.splitlines() if line and not line.startswith('#'))
+        new += size() - before
+        refused += shared.refused - refused_before
+    line = (label
+            + (f'; {game} {rows} rows ({new} new' + (f', {refused} warm rows naming bind states no file gives' if refused else '')
+               + ')' if rows else '; nothing') + ''.join(f'\n  {p}' for p in problems))
+    return line, {game: (rows, new)} if rows and not problems else None
+
+
+def merge_issue(issue, lists, keys, seeds, token, drop_unknown):
+    """Merge one issue's files into lists: (report line, {game: (rows, new rows)} or None when it stays open)."""
+    label, texts, problems = issue_texts(issue, token)
+    return merge_texts(label, texts, problems, titled_game(issue), named_game(issue), lists, keys, seeds, drop_unknown)
+
+
+def merge_texts(label, texts, problems, titled, named, lists, keys, seeds, drop_unknown):
+    """Merge contribution texts sent for the game titled (named: the seeded game they surely belong to, or None) into lists:
+    (report line, {game: (rows, new rows)} or None when they stay open)."""
+    if titled in OWN_SCRIPT:
+        return merge_own_texts(label, texts, problems, titled, lists[titled])
+    rows, pipes, dropped = set(), [], 0
+    for text in texts:
+        got, bad = contribution_rows(text)
+        rows |= got; dropped += bad
+        pipes += [row for row in contribution_pipelines(text) if row not in pipes]
+    shared_rows = (set(), [])   # rows two games hold all the shaders of: left out, never given to another game below
+    games, (unknown_rows, unknown_pipes) = route(rows, pipes, keys, shared_rows)
     # No seed of the other games: in an issue titled for one, what is no seeded game's is its own; in one titled plainly
     # "Shader list:" whose known rows name exactly one other game (a file comes from one game's install, and the
-    # seeds name every Tears of the Kingdom and Breath of the Wild shader), the rest is that game's too.
+    # seeds name every Tears of the Kingdom and Breath of the Wild shader), the rest is that game's too. An issue whose
+    # title names Tears of the Kingdom or Breath of the Wild owns its unrouted rows in the same way (the seeds at hand do
+    # not cover every version). A file comes from one game's install, so when a title names no game and the rows that are
+    # known are all one game's, the rest is that game's too; only a file with no known row, or with two games' rows,
+    # leaves them unknown.
     others = [g for g in games if g in OTHER]
-    owner = titled if titled in OTHER else others[0] if len(others) == 1 else None
+    single = others[0] if len(others) == 1 else next(iter(games)) if not others and len(games) == 1 else None
+    owner = titled if titled in OTHER else named or single
     if owner and (unknown_rows or unknown_pipes):
         own = games.setdefault(owner, (set(), []))
         own[0].update(unknown_rows); own[1].extend(unknown_pipes)
         unknown_rows, unknown_pipes = set(), []
     per_game, parts = {}, []
+    # A game with its own merge (OWN_SCRIPT) takes its lines of these texts through that merge, as an issue titled for it
+    # does: Ocarina of Time keeps the bind state (A row) of every warm row and refuses one no file gives. Its rows reach
+    # here from a plainly titled file: until ca3c4ad6 Ocarina of Time wrote the contribution file Tears of the Kingdom and
+    # Breath of the Wild share, so one player's file holds rows of each (2026-11-10: #2000, #2005, #2007).
+    for game in [g for g in games if g in OWN_SCRIPT]:
+        g_rows, g_pipes = games.pop(game)
+        variant_keys, pipe_rows = {key for key, _ in g_rows}, set(g_pipes)
+        own_texts = []
+        for text in texts:
+            lines = [line for line in text.splitlines()
+                     if (line.startswith('V\t') and line.split('\t')[1] in variant_keys)
+                     or (line[:2] in ('R\t', 'B\t', 'T\t') and warm_row(line.split('\t')) in pipe_rows)]
+            if lines:
+                own_texts.append('\n'.join(lines) + '\n')
+        own_line, own = merge_own_texts('', own_texts, [], game, lists[game])
+        per_game.update(own or {})
+        keys[game] |= list_keys(lists[game])
+        parts.append(own_line.lstrip('; '))
     for game, (g_rows, g_pipes) in games.items():
         shared = lists[game]
         builtin = {r for r in g_rows if any(builtin_serves(s, *r) for s in seeds.get(game, []))}
         new = (g_rows - builtin) - shared.variants
         for key, deps in g_rows - builtin:
             shared.add_variant(key, deps)
-        refused = []
-        if game in SEEDED:   # the list keeps the bind state of every variant its pipelines name (shader_list.py A rows)
+        if game in SEEDED:   # the bind states of the variants a seed serves (no V row): the list keeps them as A rows
             for _, deps in builtin:
                 answers = listed_answers(deps)
                 shared.answers[answers_suffix(answers)] = answers
-            refused = [row for row in g_pipes if not shared.knows(row)]
+        # Every game's list keeps the bind state of every variant its pipelines name (shader_list.py A rows): a row naming
+        # one no file gave stops packaging in resolve (2026-11-11, #2020: two such rows in Pokopia's list, when only the
+        # seeded games were checked).
+        refused = [row for row in g_pipes if not shared.knows(row)]
         new_pipes = [row for row in g_pipes if row not in shared.warm and row not in refused]
         for row in new_pipes:
             shared.add_warm(row, 'm')
@@ -303,13 +415,74 @@ def merge_issue(issue, lists, keys, seeds, token, drop_unknown):
                      + (f', {len(refused)} naming bind states the file does not give: an older game version wrote it' if refused else '')
                      + ')')
     unknown = len(unknown_rows) + len(unknown_pipes)
-    line = (f"#{issue['number']} {issue['author']['login']} ({titled}): {len(urls)} file(s)" + (', pasted rows' if pasted else '')
-            + '; ' + ('; '.join(parts) or 'nothing')
+    line = (label + '; ' + ('; '.join(parts) or 'nothing')
             + (f'; {dropped} lines dropped' if dropped else '')
+            + (f'; {len(shared_rows[0]) + len(shared_rows[1])} rows two games share (left out)' if shared_rows[0] or shared_rows[1] else '')
             + (f'; {unknown} rows of shaders neither game has' + (' (left out)' if drop_unknown else ' (issue stays open)')
                if unknown else '') + ''.join(f'\n  {p}' for p in problems))
     closable = (rows or pipes) and not problems and (drop_unknown or not unknown)
     return line, per_game if closable else None
+
+
+INBOX_PAGE = 5000   # rows per export request (the inbox's lib/handlers.js allows up to 20,000)
+
+
+def inbox_call(base, token, path, payload=None):
+    """One call to the shader inbox's admin API: its data, or ValueError with the server's reason."""
+    request = urllib.request.Request(f"{base.rstrip('/')}{path}", method='POST' if payload is not None else 'GET',
+                                     data=json.dumps(payload).encode() if payload is not None else None,
+                                     headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'})
+    try:
+        with urllib.request.urlopen(request, timeout=120) as reply:
+            answer = json.loads(reply.read())
+    except urllib.error.HTTPError as error:
+        try:
+            reason = json.loads(error.read()).get('error')
+        except ValueError:
+            reason = None
+        raise ValueError(f'{path}: HTTP {error.code} {reason or error.reason}') from error
+    if not answer.get('success'):
+        raise ValueError(f"{path}: {answer.get('error')}")
+    return answer['data']
+
+
+def inbox_pending(base, token, game):
+    """Every row of a game the inbox holds and no merge has taken yet: [{id, kind, body, players, versions, platforms}]."""
+    rows, after = [], 0
+    while True:
+        data = inbox_call(base, token, f'/v1/export?game={game}&after={after}&limit={INBOX_PAGE}')
+        rows += data['rows']
+        if not data['next']:
+            return rows
+        after = data['next']
+
+
+def merge_inbox(base, token, lists, keys, seeds, drop_unknown):
+    """The inbox's rows of every game here, each game's merged as an issue titled for it: [(report line, game, row ids
+    taken)]; a game whose rows stay open (a download problem, or unknown rows without --drop-unknown) takes none."""
+    done = []
+    for game in sorted(GAMES, key=lambda g: (g not in OTHER, g)):   # other games' first, as issues: they teach their keys
+        try:
+            pending = inbox_pending(base, token, game)
+        except (OSError, ValueError) as error:
+            done.append((f'inbox {game}: {error}', game, []))
+            continue
+        if not pending:
+            continue
+        players = max(r['players'] for r in pending)
+        label = f"inbox {game}: {len(pending)} rows (most-sent row from {players} installs)"
+        text = ''.join(r['body'] + '\n' for r in pending)
+        line, per_game = merge_texts(label, [text], [], game, game if game in SEEDED else None, lists, keys, seeds,
+                                     drop_unknown)
+        done.append((line, game, [r['id'] for r in pending] if per_game is not None else []))
+    return done
+
+
+def merged_report(merged):
+    """The issues a merge took, as replies.py words its thanks: number, titled game, {game: [rows, new rows]}. The replies come
+    from this one merge, so their counts are the merge's (a second pass could route a few rows differently)."""
+    return [{'number': issue['number'], 'titled': titled_game(issue), 'per_game': {g: list(v) for g, v in per_game.items()}}
+            for issue, per_game in merged]
 
 
 def save_list(game, shared):
@@ -339,9 +512,20 @@ def main():
     ap.add_argument('--drop-unknown', action='store_true', help='leave out rows of shaders neither game has, and close')
     ap.add_argument('--apply', action='store_true', help='write the merged rows to the shared lists')
     ap.add_argument('--close', action='store_true', help='with --apply: comment on each merged issue and close it')
+    ap.add_argument('--report', type=Path, help='write the merged issues and their counts here (JSON, for replies.py)')
+    ap.add_argument('--inbox', default=os.environ.get('SHADER_INBOX_URL'),
+                    help='the shader inbox (https://...; default $SHADER_INBOX_URL): merge the rows it holds too')
+    ap.add_argument('--no-issues', action='store_true', help='leave the GitHub issues out (the inbox only)')
+    ap.add_argument('--mark-inbox', metavar='REF', help='with --apply: tell the inbox the merged rows are done, naming the '
+                    'merge (the commit of the lists)')
     args = ap.parse_args()
     if args.close and not args.apply:
         ap.error('--close needs --apply')
+    if args.mark_inbox and not (args.apply and args.inbox):
+        ap.error('--mark-inbox needs --apply and --inbox')
+    inbox_token = os.environ.get('SHADER_INBOX_TOKEN', '')
+    if args.inbox and not inbox_token:
+        ap.error('--inbox needs SHADER_INBOX_TOKEN (the inbox\'s INBOX_ADMIN_TOKEN)')
     keys, seeds = {game: set() for game in GAMES}, {}
     try:
         for spec in args.seed + args.keys:
@@ -354,21 +538,28 @@ def main():
     for game, found in keys.items():
         if game in SEEDED:
             print(f'{game}: {len(found)} shader keys' + ('' if found else ' (none given: its rows stay unmerged)'))
-    issues = open_issues(args.repo)
+    issues = [] if args.no_issues else open_issues(args.repo)
     if args.issue:
         issues = [i for i in issues if i['number'] in args.issue]
     issues.sort(key=lambda i: (titled_game(i) not in OTHER, i['number']))   # other games' first: they teach their keys
-    token = subprocess.run(['gh', 'auth', 'token'], capture_output=True, text=True).stdout.strip()
-    lists = {game: ShaderList.load(path) for game, (path, _, _) in GAMES.items()}
+    token = '' if args.no_issues else subprocess.run(['gh', 'auth', 'token'], capture_output=True, text=True).stdout.strip()
+    lists = {game: load_list(game, path) for game, (path, _, _) in GAMES.items()}
     for game in OTHER:
         keys[game] = list_keys(lists[game])
     before = {game: (len(s.variants), sum(1 for row in s.warm if row[0] in 'RBT')) for game, s in lists.items()}
     merged = []
+    inbox = merge_inbox(args.inbox, inbox_token, lists, keys, seeds, args.drop_unknown) if args.inbox else []
+    for line, _, _ in inbox:   # first: rows sure of their game teach the other games' keys to plain-titled issues
+        print(line)
     for issue in issues:
         line, per_game = merge_issue(issue, lists, keys, seeds, token, args.drop_unknown)
         print(line)
         if per_game is not None:   # all default or nothing new: still thanked and closed
             merged.append((issue, per_game))
+    for game, s in lists.items():   # a later source may bring the bind state an earlier one's warm rows name (OoT's own merge)
+        took = s.retry_refused() if hasattr(s, 'retry_refused') else 0
+        if took:
+            print(f'{game}: {took} refused warm rows went in once every source was merged')
     for game, s in lists.items():
         print(f'{game} shared shader list: {before[game][0]} -> {len(s.variants)} variants, '
               f'{before[game][1]} -> {sum(1 for row in s.warm if row[0] in "RBT")} render pipeline rows')
@@ -379,9 +570,16 @@ def main():
         if (len(s.variants), sum(1 for row in s.warm if row[0] in 'RBT')) != before[game]:
             save_list(game, s)
             print(f'written: {GAMES[game][0]}')
+    if args.report:
+        args.report.write_text(json.dumps(merged_report(merged), ensure_ascii=False, indent=1) + '\n')
     for issue, per_game in merged if args.close else []:
         gh('issue', 'comment', str(issue['number']), '--repo', args.repo, '--body', reply_text(per_game, titled_game(issue)))
         gh('issue', 'close', str(issue['number']), '--repo', args.repo)
+    for _, game, ids in inbox if args.mark_inbox else []:
+        for start in range(0, len(ids), 50000):
+            data = inbox_call(args.inbox, inbox_token, '/v1/mark',
+                              {'game': game, 'ids': ids[start:start + 50000], 'ref': args.mark_inbox})
+            print(f"inbox {game}: {data['marked']} rows marked done ({args.mark_inbox})")
 
 
 if __name__ == '__main__':

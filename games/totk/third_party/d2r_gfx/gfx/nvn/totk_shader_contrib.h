@@ -6,15 +6,15 @@
 // (nvn_mtl.m pso_contribute; user 2026-10-22), their shaders named as a build names them (totk_contrib_listed_name).
 // Each row is written once to the player's contribution file (TOTK_SHADER_CONTRIB, set by app/launcher.m and
 // ios/Sources/main.m; unset in development runs, which then write nothing) as a shader-list V, R or B row: shader keys,
-// bind states and pipeline descriptors, no game data. Every TOTK_CONTRIB_STEP new rows of any kind the Mac launcher asks
-// the player, before the game starts, to send the file in a GitHub issue (an iPhone / iPad never asks during play: while
-// it is connected, ios/tools/shader_contrib_watch.py asks on the Mac); scripts/collect_shader_issues.py merges what
-// arrives. Header-only: the runtime and the Mac launcher share it.
+// bind states and pipeline descriptors, no game data. Once the file holds TOTK_CONTRIB_STEP new rows, the Mac launcher and
+// the iPhone / iPad app ask once, before the game starts, whether to contribute them automatically over HTTPS
+// (totk_contrib_upload.h; a switch in Settings changes it later); scripts/collect_shader_issues.py --inbox merges what
+// arrives, as it merges GitHub issues sent by hand. Header-only: the runtime and the Mac launcher share it.
 // The file holds only what still has to be sent (user 2026-11-01: every issue used to carry the whole file, 83% of its
 // shaders and 99% of its pipelines already in the list): before the reminder counts it, rows the app's own seed and warm
-// lists serve leave it (totk_contrib_prune, once per app), and rows sent automatically leave it after the issue is made
-// (contrib_submit.h). Both go to a hidden done file beside it, which the game and ios/tools/shader_contrib_watch.py read
-// as rows they have, so neither writes them again.
+// lists serve leave it (totk_contrib_prune, once per app), and rows the inbox took leave it (totk_contrib_upload.h
+// totk_inbox_send). Both go to a hidden done file beside it, which the game reads as rows it has, so it never writes or
+// sends them again.
 #pragma once
 #import <Foundation/Foundation.h>
 #include <CommonCrypto/CommonDigest.h>
@@ -124,9 +124,8 @@ static inline int totk_contrib_lock(NSString *path, int flags) {
 }
 /* Appends one row (a whole line without its newline), once: not when the file or its done file has it. Not thread-safe:
    the runtime calls it under its translation lock; the file's lock (flock) keeps it apart from totk_contrib_retire in
-   another process (the launcher, shader_contrib_watch.py). TOTK_CONTRIB_GAME (the iPhone / iPad app: "TOTK 1.4.3") adds a
-   "# Game: " line, once per file and game, so the Mac that sends a device's file names the game and version in the issue
-   (ios/tools/shader_contrib_watch.py). */
+   another process (the launcher). TOTK_CONTRIB_GAME (the iPhone / iPad app: "TOTK 1.4.3") adds a "# Game: " line, once per
+   file and game, so a device's file sent by hand in an issue names the game and version. */
 static inline void totk_contrib_add_line(NSString *line) {
     static NSString *path, *gameLine; static NSMutableSet<NSString *> *rows; static int off, tagged;
     if (off) return;
@@ -317,6 +316,25 @@ static inline NSString *totk_contrib_seed_name(NSString *name, NSArray<NSDiction
     return nil;
 }
 
+/* The shader names a pipeline row's key carries (vs, fs: the first two 80-byte fields, hex), empty ones left out; nil when
+   the key is not one. */
+static inline NSArray<NSString *> *totk_contrib_key_names(NSString *row) {
+    enum { NAME = 80 };
+    NSArray<NSString *> *f = [row componentsSeparatedByString:@"\t"];
+    if (f.count < 2 || f[1].length < 4 * NAME) return nil;
+    NSMutableArray<NSString *> *names = [NSMutableArray array];
+    for (NSUInteger at = 0; at < 2; at++) {
+        char bytes[NAME + 1] = {0};
+        for (NSUInteger i = 0; i < NAME; i++) {
+            unsigned b; if (sscanf([[f[1] substringWithRange:NSMakeRange((at * NAME + i) * 2, 2)] UTF8String], "%2x", &b) != 1) return nil;
+            bytes[i] = (char)b;
+        }
+        NSString *name = @(bytes);
+        if (name.length) [names addObject:name];
+    }
+    return names;
+}
+
 /* A pipeline row (R / B / T) with the two shaders its key names (nvn_pso_skey.h pso_skey: char vs[80], fs[80] lead the
    544 bytes, hex here) renamed as the app's warm lists name them (shader_list.py rename_warm); nil when a name cannot be
    told or the key is not one. */
@@ -351,7 +369,9 @@ static inline NSString *totk_contrib_seed_row(NSString *row, NSMutableDictionary
    build's pso_manifest.tsv are renamed so). Such rows were written by an older app, or another player's file brought
    them into the list since; the game would not write them now, and an issue carrying them adds nothing. A shader the
    seed does not have (another game version's) and a name the seed cannot tell stay: only what is certainly there
-   leaves. Called by the Mac launcher before its reminder counts the file and by the iPhone / iPad app before the game
+   leaves. A V row stays while a pipeline row left in the file names its variant: the merge needs the bind state behind
+   that name to take the pipeline row (2026-11-11: 79 OoT rows were refused, naming two bind states no upload carried,
+   their V rows pruned here as the seed served them). Called by the Mac launcher before its reminder counts the file and by the iPhone / iPad app before the game
    starts. Returns the rows moved. */
 static inline NSUInteger totk_contrib_prune(NSString *path, NSString *seedDir, NSString *listDir) {
     NSString *app = path ? totk_contrib_app(seedDir, listDir) : nil, *mark = path ? totk_contrib_side(path, @"pruned") : nil;
@@ -361,6 +381,7 @@ static inline NSUInteger totk_contrib_prune(NSString *path, NSString *seedDir, N
     // with this build's names and one with the portable ones become the same)
     NSMutableDictionary *seed = [NSMutableDictionary dictionary];
     NSMutableDictionary<NSString *, NSDictionary *> *states = [NSMutableDictionary dictionary];   // portable name -> deps
+    NSMutableDictionary<NSString *, NSString *> *named = [NSMutableDictionary dictionary];        // served V row -> its name
     NSMutableSet<NSString *> *rows = totk_contrib_read(path), *known = [rows mutableCopy];
     [known unionSet:totk_contrib_read(totk_contrib_side(path, @"done"))];   // a V row moved before still names its state
     for (NSString *row in known) @autoreleasepool {
@@ -379,7 +400,11 @@ static inline NSUInteger totk_contrib_prune(NSString *path, NSString *seedDir, N
         id deps = vs ? [NSJSONSerialization JSONObjectWithData:[f[2] dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil] : nil;
         if (![deps isKindOfClass:NSDictionary.class]) continue;
         NSDictionary *answers = totk_contrib_answers(deps);
-        for (NSDictionary *v in vs) if (totk_deps_match(totk_contrib_deps_of(v), answers)) { [served addObject:row]; break; }
+        for (NSDictionary *v in vs) if (totk_deps_match(totk_contrib_deps_of(v), answers)) {
+            [served addObject:row];
+            named[row] = [totk_contrib_listed_name(f[1], deps) stringByAppendingString:@"_b"];
+            break;
+        }
     }
     for (NSString *name in pipes.count ? @[@"pso_title.tsv", @"pso_manifest.tsv", @"pso_list.tsv"] : @[]) {
         FILE *f = fopen([listDir stringByAppendingPathComponent:name].fileSystemRepresentation, "r");
@@ -393,6 +418,10 @@ static inline NSUInteger totk_contrib_prune(NSString *path, NSString *seedDir, N
         }
         free(line); if (f) fclose(f);
     }
+    NSMutableSet<NSString *> *still = [NSMutableSet set];   // the names the pipeline rows staying in the file carry
+    for (NSString *row in named.count ? rows : [NSSet set])
+        if (![row hasPrefix:@"V\t"] && ![served containsObject:row]) [still addObjectsFromArray:totk_contrib_key_names(row) ?: @[]];
+    for (NSString *row in named) if ([still containsObject:named[row]]) [served removeObject:row];
     NSUInteger moved = totk_contrib_retire(path, served);
     if (moved == served.count) [app writeToFile:mark atomically:YES encoding:NSUTF8StringEncoding error:nil];   // else again next time
     return moved;

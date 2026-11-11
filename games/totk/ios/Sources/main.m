@@ -16,6 +16,7 @@
 #include "settings_map.h"
 #include "ns2_resolution.h"
 #include "totk_shader_contrib.h"   // totk_contrib_prune
+#include "totk_contrib_upload.h"   // the shader inbox: asked once, sent while playing
 #import "touch_pad.h"
 #import "start_screen.h"
 
@@ -109,6 +110,7 @@ static void cloud_folder_apply(void) {
 }
 /* Key 1's settings panel is Mac only (runtime/frontend.m). */
 void runtime_settings_toggle(void) {}
+void runtime_settings_page(int page) { (void)page; }
 #if !TARGET_OS_VISION
 static void apply_display_settings(void);   // below, next to the pane helpers it uses
 #endif
@@ -164,7 +166,40 @@ static void apply_display_settings(void);   // below, next to the pane helpers i
         [self offerCloudFolder];
         return;
     }
+    if ([self offerShaderUpload]) return;
     [self prepareAndStart];
+}
+/* The Settings switch "自动贡献着色器" (Settings.bundle TOTK_CONTRIBUTE_SHADERS) and the start-up question share one
+   choice (totk_contrib_upload.h): once the switch has a value, it decides; an answer to the question sets the switch. */
+static NSString *const ContributeKey = @"TOTK_CONTRIBUTE_SHADERS";
+static void contrib_settings_sync(NSString *contrib) {
+    id v = [NSUserDefaults.standardUserDefaults objectForKey:ContributeKey];
+    if (!v) return;
+    BOOL on = [v boolValue];
+    NSString *now = totk_inbox_choice(contrib);
+    if (!now || [now isEqualToString:@"auto"] != on) totk_inbox_choose(contrib, on);
+}
+/* The one question about the shader contribution (totk_contrib_upload.h, the same as the Mac's app/launcher.m
+   contrib_ask), before the game starts, at the first start where
+   the player has not chosen yet (no row threshold, user 2026-11-10). The game starts after the answer. NO when there is nothing to ask. (The file is pruned of
+   what the app serves in prepareAndStart, so the first count after a new build can be a little high.) */
+- (BOOL)offerShaderUpload {
+    NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    NSString *contrib = [docs stringByAppendingPathComponent:@"shader-list-contribution.txt"];
+    contrib_settings_sync(contrib);
+    NSUInteger rows = totk_inbox_should_ask(contrib);
+    if (!rows) return NO;
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:totk_inbox_prompt_title()
+        message:totk_inbox_prompt_text() preferredStyle:UIAlertControllerStyleAlert];
+    __weak TOTKGameController *weakSelf = self;
+    NSArray<NSString *> *answers = totk_inbox_prompt_answers();
+    for (NSUInteger i = 0; i < answers.count; i++)
+        [a addAction:[UIAlertAction actionWithTitle:answers[i] style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
+            (void)x; totk_inbox_answer(contrib, (totk_inbox_answer_t)i);
+            [NSUserDefaults.standardUserDefaults setBool:i == TOTK_INBOX_AUTO forKey:ContributeKey];   // the Settings switch shows it
+            [weakSelf prepareAndStart]; }]];
+    [self presentViewController:a animated:YES completion:nil];
+    return YES;
 }
 /* No sync folder yet: offer one before the game reads its save, so it syncs from this start. "Not now" asks again at the
    next start (as does cancelling the picker); "Don't ask again" never (Settings › Choose folder still works). */
@@ -653,7 +688,12 @@ static void apply_settings(void) {
     NSString *contrib = [docs stringByAppendingPathComponent:@"shader-list-contribution.txt"];
     totk_contrib_prune(contrib, seedDir, seedDir);
     setenv("TOTK_SHADER_CONTRIB",contrib.fileSystemRepresentation,1);
-    // ... with the game and version it came from, so the Mac that sends it names them in the issue (shader_contrib_watch.py)
+    contrib_settings_sync(contrib);
+    totk_inbox_start(contrib, @"ios");   // the player chose "Contribute shaders" (offerShaderUpload): sent while playing
+    // The Settings switch turned while the game runs (the app comes back from Settings): on starts, off stops the sending.
+    [NSNotificationCenter.defaultCenter addObserverForName:NSUserDefaultsDidChangeNotification object:nil queue:nil
+        usingBlock:^(NSNotification *n) { (void)n; contrib_settings_sync(contrib); totk_inbox_start(contrib, @"ios"); }];
+    // ... with the game and version it came from, so a file sent by hand in an issue names them
     setenv("TOTK_CONTRIB_GAME",GAME_FOLDER " " TOTK_GAME_VERSION,1);
     setenv("DM_NVN_SHMAP",[seedDir stringByAppendingPathComponent:@"shader_map.tsv"].fileSystemRepresentation,1);
     setenv("DM_MSL_DIR",seedDir.fileSystemRepresentation,1);

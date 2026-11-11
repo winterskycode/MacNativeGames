@@ -949,6 +949,7 @@ void runtime_front_run(void(*callback)(void)){
   if(window.level==NSFloatingWindowLevel){NSRect f=window.frame;[window setFrameOrigin:NSMakePoint(NSMaxX(vis)-f.size.width,NSMaxY(vis)-f.size.height)];}   /* TOTK_WINDOW_FLOAT: top-right corner */
   front_sync_drawable();
   if(assume_focus()){[window orderFrontRegardless];}else{[window makeKeyAndOrderFront:nil];[NSApp activateIgnoringOtherApps:YES];}   /* in front of other apps' windows, keyboard left alone */
+  totk_board_start();   /* the leaderboard's rounds (board_upload.h): nothing is sent unless the player turned 我要上榜 on */
   front_sr_view();
   [NSNotificationCenter.defaultCenter addObserverForName:NSApplicationDidChangeScreenParametersNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n){(void)n;note_window_screen();front_sr_view();}];   /* a refresh rate changed on the same screen */
   dispatch_after(dispatch_time(DISPATCH_TIME_NOW,3*NSEC_PER_SEC),dispatch_get_main_queue(),^{note_occlusion(" 3 s after opening");});
@@ -1030,4 +1031,14 @@ void *runtime_front_override(const char *name){
 #endif
  };
  for(unsigned i=0;i<sizeof(entries)/sizeof(*entries);i++)if(!strcmp(name,entries[i].name))return entries[i].fn;return NULL;
+}
+
+/* A notice from the game's services (runtime/cloud_save.m: the folder's newer save did not load), as a sheet on the
+   game window; the game keeps running behind it. */
+void runtime_front_notice(const char *title,const char *detail){
+ NSString *t=@(title?title:""),*d=@(detail?detail:"");
+ dispatch_async(dispatch_get_main_queue(),^{
+  NSAlert *a=[NSAlert new];a.messageText=t;a.informativeText=d;[a addButtonWithTitle:@(TOTK_UI("好","OK"))];
+  if(window&&window.visible)[a beginSheetModalForWindow:window completionHandler:nil];else [a runModal];
+ });
 }

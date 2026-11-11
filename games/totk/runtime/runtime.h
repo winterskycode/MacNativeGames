@@ -35,6 +35,7 @@ int runtime_app_mode(void);   /* loader.c: 1 when this binary is the Mac app's o
 int runtime_app_launch(int argc, char **argv, char ***boot);   /* app/launcher.m: the player's folders and settings, then -1 to boot */
 void runtime_input_file_start(void);   /* input.c: the TOTK_INPUT_FILE command channel (at start, or after runtime_app_launch) */
 void runtime_cloud_save_start(const char *save_dir, const char *profile_dir);   /* cloud_save.m: save sync through a folder the player chooses (fs_host.c) */
+void runtime_front_notice(const char *title, const char *detail);   /* frontend.m / frontend_ios.m: tell the player (cloud_save.m) */
 void runtime_cloud_save_changed(void);
 void runtime_cloud_save_quit(void);   /* the Mac window closes (frontend.m): uploads what is not uploaded yet */
 /* The Mac's chosen sync folder (TOTK_CLOUD_SAVE_FOLDER) lives in this defaults suite, not the app's own: the app menu
@@ -148,6 +149,7 @@ void runtime_game_slot_acquire(const char *mode);   /* runtime/game_slot.c: one 
 void *runtime_front_override(const char *name);
 int runtime_front_focus(void);
 void runtime_front_hdr_toggle(void);   /* Mac key 8: checked TOTK 1.4.3 HDR / EDR only */
+void runtime_settings_page(int page);   /* tests (input file "settings <page>"): the panel opened on a page, -1 closed (frontend.m; nothing on the phone) */
 void runtime_settings_toggle(void);   /* key 1 (runtime/input.c): the settings panel opens or closes (frontend.m; nothing on the phone) */
 void fps_overlay_set_hud_mode(int mode);   /* gfx/nvn/fps_overlay.h HUD_MODE_*: the panel's overlay choice */
 int fps_overlay_hud_mode(void);

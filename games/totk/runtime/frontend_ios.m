@@ -182,21 +182,23 @@ static void totk_ios_screenshot_picture(void (^cb)(CGImageRef img)) { if (mtl_gr
 
 #if TARGET_OS_IOS || TARGET_OS_VISION
 /* Photos' permission, asked once and waited for here -- the screenshot queue, never the main queue: the player sees the
-   system's prompt the first time (NSPhotoLibraryAddUsageDescription, project.yml) and the answer holds. 1 when adding
-   pictures is allowed; a refusal or a restriction keeps the note's existing reason (SHOT_NO_PHOTOS). */
+   system's prompt the first time (NSPhotoLibraryUsageDescription, project.yml) and the answer holds. Album lookup needs
+   read/write access; limited or previously granted add-only access can still save directly to Photos. Returns 1 when
+   adding pictures is allowed; a refusal or restriction keeps the note's existing reason (SHOT_NO_PHOTOS). */
 static int screenshot_photos_allowed(void) {
-    PHAuthorizationStatus status = [PHPhotoLibrary authorizationStatusForAccessLevel:PHAccessLevelAddOnly];
+    PHAuthorizationStatus status = [PHPhotoLibrary authorizationStatusForAccessLevel:PHAccessLevelReadWrite];
     if (status == PHAuthorizationStatusNotDetermined) {
         dispatch_semaphore_t asked = dispatch_semaphore_create(0);
         __block PHAuthorizationStatus answer = status;
-        [PHPhotoLibrary requestAuthorizationForAccessLevel:PHAccessLevelAddOnly handler:^(PHAuthorizationStatus granted) {
+        [PHPhotoLibrary requestAuthorizationForAccessLevel:PHAccessLevelReadWrite handler:^(PHAuthorizationStatus granted) {
             answer = granted;
             dispatch_semaphore_signal(asked);
         }];
         dispatch_semaphore_wait(asked, dispatch_time(DISPATCH_TIME_NOW, 120 * NSEC_PER_SEC));   /* the player's answer */
         status = answer;
     }
-    return status == PHAuthorizationStatusAuthorized;
+    return status == PHAuthorizationStatusAuthorized || status == PHAuthorizationStatusLimited
+        || [PHPhotoLibrary authorizationStatusForAccessLevel:PHAccessLevelAddOnly] == PHAuthorizationStatusAuthorized;
 }
 #endif
 
@@ -219,8 +221,11 @@ __attribute__((unused)) static int screenshot_save(CGImageRef img, const char *g
     UIImage *picture = [UIImage imageWithCGImage:img];
     if (!picture) { *why = TOTK_UI("无法编码图片", "picture not encoded"); return 0; }
     NSString *title = @(TOTK_SCREENSHOT_ALBUM);   /* the running game's own name: the note and the panel's row say it too */
+    /* An album fetch requires full read access. Limited/add-only grants save the screenshot without reading albums. */
+    BOOL intoAlbum = [PHPhotoLibrary authorizationStatusForAccessLevel:PHAccessLevelReadWrite] == PHAuthorizationStatusAuthorized;
     __block NSError *failure = nil;
     [[PHPhotoLibrary sharedPhotoLibrary] performChangesAndWait:^{
+        if (!intoAlbum) { (void)[PHAssetChangeRequest creationRequestForAssetFromImage:picture]; return; }
         PHAssetCollection *collection = nil;
         PHFetchResult<PHAssetCollection *> *found = [PHAssetCollection fetchAssetCollectionsWithType:PHAssetCollectionTypeAlbum
                                                                                              subtype:PHAssetCollectionSubtypeAny
@@ -237,6 +242,7 @@ __attribute__((unused)) static int screenshot_save(CGImageRef img, const char *g
         /* The album could not be made or written (the library's own checks differ per version): the picture still goes in. */
         fprintf(stderr, "[totk] screenshot: the album was refused (%s); saving to the library itself\n", failure.localizedDescription.UTF8String);
         failure = nil;
+        intoAlbum = NO;
         [[PHPhotoLibrary sharedPhotoLibrary] performChangesAndWait:^{
             (void)[PHAssetChangeRequest creationRequestForAssetFromImage:picture];
         } error:&failure];
@@ -246,7 +252,7 @@ __attribute__((unused)) static int screenshot_save(CGImageRef img, const char *g
         *problem = SHOT_NO_PHOTOS; *why = screenshot_problem_text(*problem);
         return 0;
     }
-    snprintf(album, album_size, "%s", TOTK_SCREENSHOT_ALBUM);
+    snprintf(album, album_size, "%s", intoAlbum ? TOTK_SCREENSHOT_ALBUM : TOTK_UI("照片图库", "Photo Library"));
     return 1;
 }
 #endif
@@ -282,4 +288,20 @@ void *runtime_front_override(const char *name){
  {"_ZN2nn2vi11CreateLayerEPPNS0_5LayerEPNS0_7DisplayE",vi_layer},{"_ZN2nn2vi15GetNativeWindowEPPvPNS0_5LayerE",vi_window},
  {"_ZN2nn2vi20GetDisplayVsyncEventEPNS_2os15SystemEventTypeEPNS0_7DisplayE",vi_vsync}};
  for(unsigned i=0;i<sizeof(entries)/sizeof(*entries);i++)if(!strcmp(name,entries[i].name))return entries[i].fn;return NULL;
+}
+
+/* A notice from the game's services (runtime/cloud_save.m: the folder's newer save did not load), as an alert over the
+   game; the game keeps running behind it. */
+void runtime_front_notice(const char *title,const char *detail){
+ NSString *t=@(title?title:""),*d=@(detail?detail:"");
+ dispatch_async(dispatch_get_main_queue(),^{
+  UIViewController *vc=nil;
+  for(UIScene *s in UIApplication.sharedApplication.connectedScenes)
+   if([s isKindOfClass:UIWindowScene.class])for(UIWindow *w in ((UIWindowScene *)s).windows)if(w.isKeyWindow)vc=w.rootViewController;
+  while(vc.presentedViewController)vc=vc.presentedViewController;
+  if(!vc){fprintf(stderr,"[totk] notice not shown (no window yet): %s\n",t.UTF8String);return;}
+  UIAlertController *a=[UIAlertController alertControllerWithTitle:t message:d preferredStyle:UIAlertControllerStyleAlert];
+  [a addAction:[UIAlertAction actionWithTitle:@(TOTK_UI("好","OK")) style:UIAlertActionStyleDefault handler:nil]];
+  [vc presentViewController:a animated:YES completion:nil];
+ });
 }

@@ -72,6 +72,11 @@ int dm_gfx_aniso_locked(void) { return 0; }
 static int fakeAniso;
 int dm_gfx_aniso(void) { return fakeAniso; }
 void dm_gfx_aniso_set(int n) { fakeAniso = n; }
+static int fakeKeepalive = 1;
+void dm_gfx_keepalive_start(int on) { fakeKeepalive = on != 0; }
+int dm_gfx_keepalive_locked(void) { return 0; }
+int dm_gfx_keepalive(void) { return fakeKeepalive; }
+void dm_gfx_keepalive_set(int on) { fakeKeepalive = on != 0; }
 void dm_gfx_sharpen_set(int pct) { fakeSharpen = pct; }
 int dm_gfx_sharpen(void) { return fakeSharpen; }
 static int fakeFxaaReplaced;   /* Breath of the Wild 1.9.0: MetalFX replaces the FXAA / upscale draw (gfx/nvn/botw_finish.h) */
@@ -187,6 +192,8 @@ static int fakeSettingsCapture;
 void runtime_gamepad_text_capture(int on) { fakeSettingsCapture = !!on; }
 /* The text bar's controller timer (the User page's add opens the bar here): a controller that is never connected. */
 void runtime_gamepad_text_read(RuntimeGamepadState *out) { *out = (RuntimeGamepadState){0}; }
+/* The 排行榜 page (board_tab.h) picks the group of the game's pacing: none here. */
+void nvn_board_pacing(int *lock, int *interp) { *lock = 0; *interp = 0; }
 /* runtime/hid_feedback.c's and gamepad_feedback.m's rumble, strength and gyro switches without a controller. */
 static int fakeFeedback[2] = {1, 1}, fakeFeedbackLocked[2], fakeFeedbackPresent[2] = {1, 1}, fakeGainLocked;
 static float fakeGain = 1;
@@ -234,6 +241,15 @@ static void tick(void) {
     while (!served && limit.timeIntervalSinceNow > 0) [NSRunLoop.currentRunLoop runMode:NSDefaultRunLoopMode beforeDate:limit];
     if (!served) { fprintf(stderr, "the main queue was not served in 20 s\n"); abort(); }
 }
+/* Text entry also crosses a background queue: any number of main-queue passes can finish before it runs. */
+static void wait_for(BOOL (^ready)(void)) {
+    NSDate *limit = [NSDate dateWithTimeIntervalSinceNow:10];
+    while (!ready() && limit.timeIntervalSinceNow > 0) {
+        tick();
+        [NSRunLoop.currentRunLoop runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.001]];
+    }
+    assert(ready());
+}
 static void press(unsigned key) { runtime_input_key_synthetic(key, 1); runtime_input_key_synthetic(key, 0); tick(); }
 static void key_event(unsigned short code, BOOL down) {
     NSEvent *e = [NSEvent keyEventWithType:down ? NSEventTypeKeyDown : NSEventTypeKeyUp location:NSZeroPoint modifierFlags:0
@@ -274,6 +290,27 @@ static void window_is(CGFloat h) {
 static void shaped(double ratio) {
     NSSize now = window.contentView.bounds.size;
     if (fabs(now.width / now.height - ratio) > 0.01) { fprintf(stderr, "window %.0fx%.0f, expected ratio %.3f\n", now.width, now.height, ratio); abort(); }
+}
+static void rows_fit(void) {
+    /* Short windows compress rows, then scroll: check their actual geometry instead of assuming the default height. */
+    assert(NSContainsRect(window.contentView.bounds, settingsPanel.frame));
+    for (NSInteger page = 0; page < SETTINGS_PAGE_BINDINGS; page++) {
+        NSView *view = settingsPanel.pages[(NSUInteger)page], *document = view;
+        assert(NSContainsRect(settingsPanel.bounds, view.frame));
+        if ([view isKindOfClass:NSScrollView.class]) {
+            NSScrollView *scroll = (NSScrollView *)view;
+            assert(scroll.hasVerticalScroller && scroll.documentView);
+            document = scroll.documentView;
+        }
+        CGFloat previousBottom = NSMaxY(document.bounds);
+        for (TOTKSettingRow *r in settingsPanel.allRows) if (r.page == page) {
+            NSView *band = r.control.superview;
+            assert(band && band.superview == document && band.frame.size.height >= 24);
+            assert(NSContainsRect(document.bounds, band.frame));
+            assert(NSMaxY(band.frame) <= previousBottom);   /* no overlapping rows */
+            previousBottom = NSMinY(band.frame);
+        }
+    }
 }
 static NSEvent *key_down(unsigned short code, NSEventModifierFlags flags) {
     return [NSEvent keyEventWithType:NSEventTypeKeyDown location:NSZeroPoint modifierFlags:flags timestamp:0 windowNumber:window.windowNumber
@@ -448,22 +485,23 @@ static void update_probe(void) {
     window = probe_window();
     window.contentView = [[TOTKInputView alloc] initWithFrame:NSMakeRect(0, 0, 1280, 720)];
     settings_show(1); assert(settingsOpen);
-    assert(settingsPanel.tabs.segmentCount == settings_pages() && SETTINGS_PAGE_UPDATE == settings_pages() - 1 && [[settingsPanel.tabs labelForSegment:SETTINGS_PAGE_UPDATE] isEqualToString:@"Update"]);
+    assert(settingsPanel.tabs.segmentCount == settings_pages() && SETTINGS_PAGE_UPDATE < settings_pages() && settings_pages() - 1 == (vr_enabled() ? SETTINGS_PAGE_VR : SETTINGS_PAGE_BOARD) && [[settingsPanel.tabs labelForSegment:SETTINGS_PAGE_UPDATE] isEqualToString:@"Update"] && [[settingsPanel.tabs labelForSegment:SETTINGS_PAGE_BOARD] isEqualToString:@"Performance"]);
     for (TOTKSettingRow *r in settingsPanel.allRows) assert(r.page != SETTINGS_PAGE_UPDATE);
     assert(!spawned[0]);   /* nothing is asked before the page opens */
 
-    /* The display page: the controller past the last row (it used to raise here), the contribute button clicks. Its real
-       action could send a player's list, so the button is pointed at the probe. */
+    /* The display page: the controller past the last row (it used to raise here), the star button clicks. Its real
+       action opens a web page, so the button is pointed at the probe. (Contributing is the shader tab's switch since 585d0734.) */
     assert(settingsPanel.page == SETTINGS_PAGE_DISPLAY);
-    UpdateProbeClicks *clicks = [UpdateProbeClicks new]; NSButton *contribute = settingsPanel.displayButtons[1];
-    contribute.target = clicks; contribute.action = @selector(hit:);
+    UpdateProbeClicks *clicks = [UpdateProbeClicks new]; NSButton *star = settingsPanel.displayButtons[0];
+    star.target = clicks; star.action = @selector(hit:);
     pad_press(PAD_DOWN); assert(g_settings_controller_active);
-    for (int n = 0; n < 20 && settingsPanel.controllerTargets[(NSUInteger)settingsPanel.controllerIndex] != contribute; n++) pad_press(PAD_DOWN);
-    assert(settingsPanel.controllerTargets[(NSUInteger)settingsPanel.controllerIndex] == contribute && contribute.layer.borderWidth == 2);
+    for (int n = 0; n < 20 && settingsPanel.controllerTargets[(NSUInteger)settingsPanel.controllerIndex] != star; n++) pad_press(PAD_DOWN);
+    assert(settingsPanel.controllerTargets[(NSUInteger)settingsPanel.controllerIndex] == star && star.layer.borderWidth == 2);
     pad_press(PAD_A); assert(clicks.hits == 1);
 
-    /* L1 / R1: the page is the last tab; opening it asks the launcher for a check. */
-    pad_press(PAD_L1); assert(settingsPanel.page == SETTINGS_PAGE_UPDATE && settingsPanel.tabs.selectedSegment == SETTINGS_PAGE_UPDATE);
+    /* L1 / R1: back from the first tab past the tabs after it (shaders, VR); only opening the page asks the launcher for a check. */
+    for (int n = 0; n < SETTINGS_PAGES && settingsPanel.page != SETTINGS_PAGE_UPDATE; n++) { assert(!spawned[0]); pad_press(PAD_L1); }
+    assert(settingsPanel.page == SETTINGS_PAGE_UPDATE && settingsPanel.tabs.selectedSegment == SETTINGS_PAGE_UPDATE);
     assert(!strcmp(spawned, "--update-check ") && settingsPanel.rows.count == 0);
     for (NSButton *b in settingsPanel.displayButtons) assert(b.hidden);
     for (NSButton *b in settingsPanel.effectsButtons) assert(b.hidden);
@@ -541,6 +579,7 @@ static void update_probe(void) {
 }
 
 int main(int argc, const char **argv) { @autoreleasepool {
+    setenv("TOTK_BOARD_URL", "http://127.0.0.1:9/v1/board", 1);   /* the 排行榜 page reads no real board in a test */
     if (argc==2 && !strcmp(argv[1],"vr-rows")) {
         /* Exercise production row construction without NSApplication, a game,
            a window, or GPU work. Unsupported settings must not be offered. */
@@ -602,7 +641,7 @@ int main(int argc, const char **argv) { @autoreleasepool {
     runtime_input_key_synthetic(18, 1); runtime_input_key_synthetic(18, 1); tick(); runtime_input_key_synthetic(18, 0); tick();
     assert(settingsOpen && fakeSettingsCapture && settingsPanel && !settingsPanel.hidden && settingsPanel.superview == window.contentView);
     assert(NSContainsRect(window.contentView.bounds, settingsPanel.frame));
-    assert(settingsPanel.allRows.count == 28 + 2*TOTK_V143 + BOTW_V190 + (TOTK_V143 && totk_hdr_available() ? SETTINGS_HDR_ROWS : 0));   /* + the HDR rows (PR #1129) */   /* 17 (anisotropy last on the display page, controller
+    assert(settingsPanel.allRows.count == 29 + 3*TOTK_V143 + BOTW_V190 + (TOTK_V143 && totk_hdr_available() ? SETTINGS_HDR_ROWS : 0));   /* + the HDR rows (PR #1129) */   /* 17 (anisotropy last on the display page, controller
                                                                  background input on the input page), the user page's
                                                                  two, then the effects page: FOV, two distances, shadows,
                                                                  depth of field, FXAA, sharpening and effect switches
@@ -899,6 +938,18 @@ int main(int argc, const char **argv) { @autoreleasepool {
     pick(@"Controller type", @"Switch"); assert(fakePadType == GAMEPAD_TYPE_SWITCH);
     pick(@"Controller type", @"Auto (PlayStation)"); assert(fakePadType == GAMEPAD_TYPE_AUTO);
     fakePadDetected = -1; shows(@"Controller type", @"Auto (no controller)");
+#if TOTK_V143
+    /* Style changes publish immediately and leave controller routing alone. */
+    shows(@"Button prompts", @"Auto");
+    pick(@"Button prompts", @"PlayStation");
+    PromptBindings prompt;
+    runtime_prompt_snapshot(&prompt); assert(prompt.device == PROMPT_PLAYSTATION);
+    assert(fakePadType == GAMEPAD_TYPE_AUTO);
+    pick(@"Button prompts", @"Keyboard / mouse");
+    runtime_prompt_snapshot(&prompt); assert(prompt.device == PROMPT_KEYBOARD);
+    pick(@"Button prompts", @"Auto");
+#endif
+
 
     assert(!switched(@"Controller input in background"));
     flip(@"Controller input in background", YES); assert(fakePadBackground && switched(@"Controller input in background"));
@@ -928,51 +979,48 @@ int main(int argc, const char **argv) { @autoreleasepool {
            [menu(@"User this run").titleOfSelectedItem isEqualToString:@"Local"]);
     shows(@"User (from the next launch)", @"Local");
     assert(settingsPanel.controllerTargets.count == 3);
-    {   /* The panel is as tall as its tallest page below the key bindings, the user page's two rows included. */
+    {   /* All pages fit, including the user page's two rows. */
         NSUInteger perPage[SETTINGS_PAGES] = {0};
         for (TOTKSettingRow *r in settingsPanel.allRows) perPage[r.page]++;
-        NSUInteger tallest = 0;
-        for (NSInteger page = 0; page < SETTINGS_PAGE_BINDINGS; page++) if (perPage[page] > tallest) tallest = perPage[page];
-        assert(settingsPanel.frame.size.height >= SETTINGS_TOP + tallest * SETTINGS_ROW_H + SETTINGS_BOTTOM - 1);
+        rows_fit();
         assert(perPage[SETTINGS_PAGE_USERS] == 2);
     }
     NSButton *addUser = settingsPanel.userButtons[0];
     assert([addUser.title isEqualToString:@"Add User…"] && !addUser.hidden);
     pick(@"User (from the next launch)", @"Zelda");
-    /* the row is made again with Zelda marked (the remake is dispatched); a run loop pass can end before it is
-       served, so wait for it instead of counting passes */
-    for (int i = 0; i < 100 && [menu(@"User (from the next launch)").titleOfSelectedItem isEqualToString:@"Local"]; i++) tick();
+    /* The row is made again with Zelda marked; wait for the dispatched remake. */
+    wait_for(^BOOL{ return ![menu(@"User (from the next launch)").titleOfSelectedItem isEqualToString:@"Local"]; });
     addUser = settingsPanel.userButtons[0];
     assert(fakeUsersActive == 1 && settingsPanel.rows.count == 2 &&
            [menu(@"User (from the next launch)").titleOfSelectedItem isEqualToString:@"Zelda"]);
     assert([menu(@"User this run").titleOfSelectedItem isEqualToString:@"Local"]);   /* this run keeps its user */
     [addUser performClick:nil];
-    for (int i = 0; i < 100 && settingsOpen; i++) tick();   /* the text bar opens; the panel closed */
+    wait_for(^BOOL{ return !settingsOpen; });   /* the text bar opens; the panel closed */
     assert(!settingsOpen && settingsPanel.hidden);
     runtime_front_text_test("type", "Link"); tick();
     runtime_front_text_test("enter", "");
-    for (int i = 0; i < 100 && !settingsOpen; i++) tick();   /* the panel comes back, the user kept */
+    wait_for(^BOOL{ return settingsOpen != 0; });   /* the panel comes back, the user kept */
     assert(settingsOpen && fakeUsersCount == 3 && !strcmp(fakeUsers[2].name, "Link"));
     assert(menu(@"User (from the next launch)").numberOfItems == 3 &&
            [menu(@"User (from the next launch)").titleOfSelectedItem isEqualToString:@"Zelda"]);
     addUser = settingsPanel.userButtons[0];
     [addUser performClick:nil];
-    for (int i = 0; i < 100 && settingsOpen; i++) tick();
+    wait_for(^BOOL{ return !settingsOpen; });
     runtime_front_text_test("esc", "");   /* Escape answers the bar: nothing is added */
-    for (int i = 0; i < 100 && !settingsOpen; i++) tick();
+    wait_for(^BOOL{ return settingsOpen != 0; });
     assert(settingsOpen && fakeUsersCount == 3);
     addUser = settingsPanel.userButtons[0];
     while (fakeUsersCount < RUNTIME_USERS_MAX) assert(runtime_users_add("Filler") >= 0);
     [addUser performClick:nil];
-    for (int i = 0; i < 100 && settingsOpen; i++) tick();   /* the console is full: the bar still asks, the user is not kept */
+    wait_for(^BOOL{ return !settingsOpen; });   /* the console is full: the bar still asks, the user is not kept */
     runtime_front_text_test("type", "Extra"); tick();
     runtime_front_text_test("enter", "");
-    for (int i = 0; i < 100 && !settingsOpen; i++) tick();
+    wait_for(^BOOL{ return settingsOpen != 0; });
     assert(settingsOpen && fakeUsersCount == RUNTIME_USERS_MAX);
     assert([settingsPanel.versionLabel.stringValue containsString:@"At most 8 users"]);
     while (fakeUsersCount > 2) fakeUsersCount--;   /* the two the next checks name */
     pick(@"User (from the next launch)", @"Local");
-    for (int i = 0; i < 100 && ![menu(@"User (from the next launch)").titleOfSelectedItem isEqualToString:@"Local"]; i++) tick();
+    wait_for(^BOOL{ return [menu(@"User (from the next launch)").titleOfSelectedItem isEqualToString:@"Local"]; });
     assert(fakeUsersActive == 0 && [menu(@"User (from the next launch)").titleOfSelectedItem isEqualToString:@"Local"]);
 
     /* Key bindings and the Update page follow the user page in the tabs, so the checks below start on the input page again. */
@@ -981,11 +1029,13 @@ int main(int argc, const char **argv) { @autoreleasepool {
     /* A short window (32:9 on a laptop screen): the rows close up, so the title, the close button and the first row stay in it. */
     NSSize was = window.contentView.bounds.size; press(18); [window setContentSize:NSMakeSize(1728, 486)]; press(18); assert(settingsOpen);
     assert(NSContainsRect(window.contentView.bounds, settingsPanel.frame));
+    rows_fit();
     press(18); [window setContentSize:was]; press(18); assert(settingsOpen);
 #ifdef TOTK_GAME_V143
     /* More effects than fit: both pointer scrolling and controller navigation can reach the top and bottom. */
     press(18);[window setContentSize:NSMakeSize(1728,360)];press(18);[settingsPanel selectPage:SETTINGS_PAGE_EFFECTS];
     assert(NSContainsRect(window.contentView.bounds,settingsPanel.frame));
+    rows_fit();
     NSScrollView *effects=(NSScrollView *)settingsPanel.pages[SETTINGS_PAGE_EFFECTS];
     assert([effects isKindOfClass:NSScrollView.class]&&effects.documentView.bounds.size.height>effects.contentSize.height);
     settingsPanel.controllerIndex=0;
@@ -1021,21 +1071,21 @@ int main(int argc, const char **argv) { @autoreleasepool {
     /* Pages: Display, Input, User and Key bindings; the page shown last opens again. */
     press(18); assert(settingsOpen);
     [settingsPanel selectPage:SETTINGS_PAGE_DISPLAY];
-    assert(settingsPanel.rows.count == 6 && [settingsPanel.rows[0].title isEqualToString:@"Overlay"]);   /* edge smoothing, AO and anisotropy are on the effects page */
-    /* The display page's bottom right: contribute shaders and star the project, after the rows for a controller; the
-       version stays clear of them; a result shows for a moment where the version is. */
-    NSButton *contribute = settingsPanel.displayButtons[1], *starButton = settingsPanel.displayButtons[0];
-    assert([contribute.title isEqualToString:@"Contribute shaders and pipelines"] && [starButton.title isEqualToString:@"⭐ Star the project"]);
-    assert(!contribute.hidden && !starButton.hidden && NSMaxX(contribute.frame) < NSMinX(starButton.frame) && NSMaxX(starButton.frame) <= settingsPanel.frame.size.width - 14);
-    assert(NSMaxX(settingsPanel.versionLabel.frame) <= NSMinX(contribute.frame) && contribute.frame.origin.y < 34 && starButton.frame.origin.y < 34);
-    assert(settingsPanel.controllerTargets.count == 8 && settingsPanel.controllerTargets[6] == contribute && settingsPanel.controllerTargets[7] == starButton);
+    assert(settingsPanel.rows.count == 7 && [settingsPanel.rows[0].title isEqualToString:@"Overlay"]);   /* edge smoothing, AO and anisotropy are on the effects page; the GPU keep-alive switch is on this one */
+    /* The display page's bottom right: star the project, after the rows for a controller (contributing is the shader
+       tab's switch since 585d0734); the version stays clear of it; a result shows for a moment where the version is. */
+    NSButton *starButton = settingsPanel.displayButtons[0];
+    assert(settingsPanel.displayButtons.count == 1 && [starButton.title isEqualToString:@"⭐ Star the project"]);
+    assert(!starButton.hidden && NSMaxX(starButton.frame) <= settingsPanel.frame.size.width - 14);
+    assert(NSMaxX(settingsPanel.versionLabel.frame) <= NSMinX(starButton.frame) && starButton.frame.origin.y < 34);
+    assert(settingsPanel.controllerTargets.count == settingsPanel.rows.count + 1 && settingsPanel.controllerTargets.lastObject == starButton);
     assert(settingsPanel.effectsButtons[0].hidden);   /* "Reset to defaults" only on the effects page */
     NSString *versionText = settingsPanel.versionLabel.stringValue;
     [settingsPanel note:@"Thank you!"]; assert([settingsPanel.versionLabel.stringValue isEqualToString:@"Thank you!"]);
     settingsPanel.versionLabel.stringValue = versionText; settingsPanel.versionLabel.frame = NSMakeRect(18, 9, 230, 16);
     [settingsPanel selectPage:SETTINGS_PAGE_INPUT];
-    assert(contribute.hidden && starButton.hidden);   /* the first page only */
-    assert(settingsPanel.rows.count == 9 && !settingsPanel.pages[SETTINGS_PAGE_INPUT].hidden && settingsPanel.pages[SETTINGS_PAGE_DISPLAY].hidden);   /* the screenshot folder last */
+    assert(starButton.hidden);   /* the first page only */
+    assert(settingsPanel.rows.count == 9 + TOTK_V143 && !settingsPanel.pages[SETTINGS_PAGE_INPUT].hidden && settingsPanel.pages[SETTINGS_PAGE_DISPLAY].hidden);   /* the screenshot folder last */
     assert(settingsPanel.tabs.selectedSegment == SETTINGS_PAGE_INPUT);
     press(18); press(18); assert(settingsOpen && settingsPanel.page == SETTINGS_PAGE_INPUT);
 
