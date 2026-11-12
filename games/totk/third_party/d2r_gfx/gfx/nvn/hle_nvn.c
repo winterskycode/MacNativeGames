@@ -2579,15 +2579,18 @@ static void submit_exec(int n, const uint64_t *h, void *ucap);
 static void present_exec(win_t *o, int idx, double period, const int crop[4], uint64_t frame);
 #ifdef __ANDROID__
 #include <sched.h>
-/* TOTK: pin the translation thread to a fast core (highest cpuinfo_max_freq). It roamed over all eight cores, and every ninth
-   frame (when a heavy game job runs) its work took ~3x the CPU time. It gets one prime core of its own and the Vulkan
-   recording worker the other (fast:0 / fast:1): versus sharing both, still scene -0.4..0.7 ms. TOTK_TRANSLATE_CPUS: "fast:0"
-   (default), "fast", "slow", "all" (every core) or a list like "7" or "0-5" (totk_affinity.h). */
+/* TOTK: pin the translation thread to fast cores (highest cpuinfo_max_freq). It roamed over all eight cores, and every ninth
+   frame (when a heavy game job runs) its work took ~3x the CPU time. It gets the fastest core and the third fastest
+   (fast:0+fast:2; the Vulkan recording worker has the second, fast:1): on the fastest core alone, another thread that
+   landed there held it up for whole frames (translation 20-40 ms instead of 12, the GPU starved: Lookout Landing and
+   Kakariko had 19-36 frames over 33 ms a run on the Odin); with a second core, 2-3 and the average 57.2 -> 58.3 fps.
+   Sharing both prime cores with the recording worker ("fast") took the average down to 50. TOTK_TRANSLATE_CPUS: terms
+   like "fast:0", "fast", "slow", "all" (every core) or a list like "7" or "0-5", joined by "+" (totk_affinity.h). */
 #include "totk_affinity.h"
 extern void dm_android_perf_hint_thread(void) __attribute__((weak));   /* port/android/vk/performance_hint.c (ADPF) */
 static void x_thread_pin(void) {
     if (dm_android_perf_hint_thread) dm_android_perf_hint_thread();
-    int n = totk_pin_self("TOTK_TRANSLATE_CPUS", "fast:0");
+    int n = totk_pin_self("TOTK_TRANSLATE_CPUS", "fast:0+fast:2");
     if (n) LOG("[nvn] translation thread pinned to %d core(s)", n);
 }
 #else
