@@ -3611,6 +3611,10 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     qtrace("present", q, idx, 0); win_t *o = (win_t *)w; o->presents++;
     if (runtime_frametrace_event) runtime_frametrace_event(9);
     totk_tl_frame(o->presents); totk_tl(TL_PRES_IN, (uint64_t)idx, 0);
+    /* <files>/stall (diagnostic): this present sleeps the milliseconds the file holds, once (checked every 15 presents) */
+    if (!(o->presents % 15)) { const char *d = getenv("TOTK_FILES_DIR"); char path[600]; FILE *sf;
+        if (d && snprintf(path, sizeof path, "%s/stall", d) > 0 && (sf = fopen(path, "r"))) { int ms = 0; if (fscanf(sf, "%d", &ms) != 1) ms = 0; fclose(sf); unlink(path);
+            LOG("[stall] present %llu sleeps %d ms", (unsigned long long)o->presents, ms); if (ms > 0 && ms < 10000) usleep((useconds_t)ms * 1000); } }
     if (runtime_frame_step_update) runtime_frame_step_update(now_ns());
     if (movie_host_tick) movie_host_tick();
     game_work_tick(o->presents);
