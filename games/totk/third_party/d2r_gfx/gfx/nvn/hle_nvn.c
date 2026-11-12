@@ -2979,7 +2979,23 @@ static void find_game_sys(void) {
         if (f0 == fp) return; fp = f0;
     }
 }
+/* TOTK_CTL_TRACE=1 (diagnostic, 1.4.3, needs TOTK_SURVEY=1 for the system object): one line per present with the time
+   since the previous one and the game's frame controller at sys + 0x200: current and candidate ticks (+0x40 / +0x44),
+   frozen (+0x58). Layout as AurelioB/totk-android's frame_controller.h (MIT). */
+static void game_controller_trace(uint64_t frame) {
+#ifdef TOTK_GAME_V143
+    static int on = -1; if (on < 0) { const char *e = getenv("TOTK_CTL_TRACE"); on = e && !strcmp(e, "1"); }
+    if (!on || !g_game_sys) return;
+    static uint64_t last; uint64_t now = now_ns(); double dt = last ? (now - last) / 1e6 : 0; last = now;
+    const volatile uint32_t *c = (const volatile uint32_t *)(uintptr_t)(g_game_sys + 0x200);
+    LOG("[ctl] f=%llu dt=%.2f cur=%u cand=%u min=%u max=%u frozen=%u", (unsigned long long)frame, dt, c[0x40 / 4], c[0x44 / 4],
+        c[0], c[1], *(const volatile uint8_t *)(uintptr_t)(g_game_sys + 0x200 + 0x58));
+#else
+    (void)frame;
+#endif
+}
 static void game_work_tick(uint64_t frame) {
+    game_controller_trace(frame);
     if (!g_game_sys) return;
     static double win[300]; static int n; static uint64_t over33;
     int64_t t = *(volatile int64_t *)(uintptr_t)(g_game_sys + 0x118); double ms = t / 19200.0;

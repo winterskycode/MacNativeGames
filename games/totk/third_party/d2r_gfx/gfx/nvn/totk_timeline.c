@@ -62,6 +62,8 @@ void totk_tl(int kind, uint64_t a, uint64_t b) {
 }
 uint64_t totk_tl_commit_id(void) { return atomic_fetch_add(&g_commit, 1) + 1; }
 
+/* runtime/threads.c: the game's threads by host id (absent in the graphics tests) */
+void runtime_threads_table(FILE *f) __attribute__((weak));
 static void tl_write(void) {
     FILE *f = fopen(g_out, "w");
     if (!f) { fprintf(stderr, "[timeline] cannot write %s\n", g_out); return; }
@@ -76,6 +78,7 @@ static void tl_write(void) {
         fprintf(f, "%llu\t%s\t%u\t%llu\t%llu\t%llu\n", (unsigned long long)e->t, e->kind < sizeof names / sizeof *names ? names[e->kind] : "?",
                 e->tid, (unsigned long long)e->frame, (unsigned long long)e->a, (unsigned long long)e->b);
     }
+    if (runtime_threads_table) runtime_threads_table(f);
     fclose(f);
     fprintf(stderr, "[timeline] wrote %llu events to %s\n", (unsigned long long)n, g_out);
 }

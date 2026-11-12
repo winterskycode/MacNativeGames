@@ -193,6 +193,7 @@ static void patch_realtime(Module *m){
    is stepped below 0 like any last step. Site from totk-pc-recomp (MIT, recomp/patches-v143.txt). */
 static void patch_switch_cooldown(Module *m){
     const char *e=getenv("TOTK_REALTIME");if(e&&!strcmp(e,"0"))return;
+    const char *f=getenv("TOTK_COOLDOWN_FIX");if(f&&!strcmp(f,"0")){fprintf(stderr,"[totk] 1.4.3 equipment-switch cooldown: left as the game has it (TOTK_COOLDOWN_FIX=0)\n");return;}
     /* movi v1.2s, #0x34, lsl #24 (FLT_EPSILON in both lanes) -> movi v1.2s, #0 */
     enum { SITE=0x2b036c, ORIGINAL=0x0f016681, REPLACEMENT=0x0f000401 };
     uint32_t got;memcpy(&got,m->base+SITE,4);

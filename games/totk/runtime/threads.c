@@ -387,6 +387,13 @@ static int eff_prio(const thr_t *o) {
     return p;
 }
 static int totk_ap_on(void);
+/* The re-signal throttle (AP_RESIGNAL_NS) is per tenure: a thread given a core may be signalled at once, whenever it
+   was last signalled. A stamp carried over from the signal that took its previous core makes a better thread that wakes
+   within 2 ms of it wait that out, and a low-priority thread that keeps retaking a core can then hold it most of the
+   time: SceneLowPriority (58) on core 2 during its name lookups, with ModuleSystemWorker2 (44) waiting for the core many
+   times a frame while the main thread waits for the worker's mutex (one ~33 ms frame in 34 on the Odin 3).
+   TOTK_AP_TENURE_RESET=0 keeps the stamp. */
+static int tenure_reset(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_AP_TENURE_RESET"); v = !(e && !strcmp(e, "0")); } return v; }
 #endif
 /* Complete waits at the grant, including BotW threads queued by wake_queue before core_take.
    Holding G; core_since is already sampled by the scheduler, so disabled collection adds no clocks. */
@@ -456,7 +463,8 @@ static void core_grant(int c) {   // holding G: give free core c to the best wai
         if (core_allowed(*p, c) && (!b || (*p)->prio < b->prio || ((*p)->prio == b->prio && (*p)->cseq < b->cseq))) { b = *p; bp = p; }
 #endif
     if (!b) { for (thr_t *w = g_core_wait; w; w = w->cnext) if (core_migrate(w)) break; return; }   // no waiter may use c: perhaps an owner may
-    *bp = b->cnext; b->cnext = NULL; b->cqueued = 0; b->cur_core = c; b->core_since = now_ns(); core_wait_complete(b, b->core_since); g_core_owner[c] = b; tev_signal(b);
+    /* a new tenure: the re-signal throttle (AP_RESIGNAL_NS) restarts, so a better thread's first kick reaches the new owner at once */
+    *bp = b->cnext; b->cnext = NULL; b->cqueued = 0; if (tenure_reset()) b->ap_sig_ns = 0; b->cur_core = c; b->core_since = now_ns(); core_wait_complete(b, b->core_since); g_core_owner[c] = b; tev_signal(b);
 }
 static void core_put(thr_t *t) {   // holding G
     if (t->cur_core < 0) return;
@@ -593,6 +601,7 @@ static int g_totk_ap = -1;
 static uint64_t g_ap_kicks, g_ap_taken, g_ap_refused, g_ap_deferred;   // signals sent / cores given up in the handler / owner outside game code / owner with preemption disabled (SVC 0x36 later)
 extern pthread_key_t runtime_keys[8];   // loader.c: [2] holds the game's thread-local region (its tpidrro)
 static void totk_preempt_signal(int sig, siginfo_t *si, void *context);
+static int apt_on(void); static void *apt_dump(void *arg);   /* TOTK_AP_TRACE, below with totk_kick */
 static int totk_ap_on(void) {   // holding G
     if (g_totk_ap < 0) {
         /* On by default on the Mac since 2026-10-25 (user's choice; two short 1.4.3 runs at Lookout Landing: dropped
@@ -613,6 +622,7 @@ static int totk_ap_on(void) {   // holding G
             if (sigaction(SIGUSR2, &a, NULL)) g_totk_ap = 0;
         }
         fprintf(stderr, "[threads] asynchronous preemption of virtual cores (Horizon's rule): %s\n", g_totk_ap ? "on (TOTK_ASYNC_PREEMPT=0 turns it off)" : "off (TOTK_ASYNC_PREEMPT=1 turns it on)");
+        if (g_totk_ap && apt_on()) { pthread_t th; if (!pthread_create(&th, NULL, apt_dump, NULL)) pthread_detach(th); }
     }
     return g_totk_ap;
 }
@@ -673,32 +683,65 @@ static void totk_note_self(thr_t *t) {   // the calling thread, once its slots a
     uintptr_t tp = runtime_host_tsd();   // the slot block (runtime.h): tpidrro_el0 on Darwin, bionic's app slot on Android
     t->tlr16 = tlr; __atomic_store_n(&t->hle_slot, (volatile uintptr_t *)(tp + runtime_hle_tsd_off), __ATOMIC_RELEASE);
 }
+/* TOTK_AP_TRACE=1 (diagnostics): what became of each preemption attempt, per owner (by handle, low byte), printed every
+   5 s for the owners with the most attempts. Waiter side (totk_kick): marked, signalled, not signalled because the owner
+   was in a host function / had preemption disabled / was signalled < AP_RESIGNAL_NS ago. Owner side (the handler):
+   entered, mark already cleared or no core, refused (host code), deferred (preemption disabled), kept the core
+   (totk_should_yield said no), gave the core up. */
+enum { APT_MARK, APT_SIG, APT_SKIP_HOST, APT_SKIP_DIS, APT_SKIP_RECENT, APT_ENTER, APT_STALE, APT_REFUSED, APT_DEFERRED, APT_KEPT, APT_TAKEN, APT_N };
+static _Atomic uint64_t g_apt[256][APT_N];
+static int g_apt_on = -1;
+static int apt_on(void) { if (g_apt_on < 0) { const char *e = getenv("TOTK_AP_TRACE"); g_apt_on = e && !strcmp(e, "1"); } return g_apt_on; }
+#define APT(o, k) do { if (apt_on()) atomic_fetch_add_explicit(&g_apt[(o)->handle & 0xff][k], 1, memory_order_relaxed); } while (0)
+static void *apt_dump(void *arg) {
+    (void)arg;
+    static const char *nm[APT_N] = {"marked", "signalled", "skip-host", "skip-disabled", "skip-recent", "handler", "stale",
+                                    "refused", "deferred", "kept", "taken"};
+    for (;;) {
+        sleep(5);
+        struct { unsigned h; uint64_t v[APT_N]; } top[6] = {{0}};
+        for (unsigned h = 0; h < 256; h++) {
+            uint64_t v[APT_N]; for (int k = 0; k < APT_N; k++) v[k] = atomic_exchange(&g_apt[h][k], 0);
+            if (!v[APT_MARK]) continue;
+            for (int j = 0; j < 6; j++) if (v[APT_MARK] > top[j].v[APT_MARK]) {
+                for (int q = 5; q > j; q--) top[q] = top[q - 1];
+                top[j].h = h; memcpy(top[j].v, v, sizeof v); break; }
+        }
+        for (int j = 0; j < 6 && top[j].v[APT_MARK]; j++) {
+            char line[512]; int n = snprintf(line, sizeof line, "[ap-trace] owner %#x:", 0x1000 | top[j].h);
+            for (int k = 0; k < APT_N; k++) n += snprintf(line + n, sizeof line - n, " %s %llu", nm[k], (unsigned long long)top[j].v[k]);
+            fprintf(stderr, "%s\n", line);
+        }
+    }
+    return NULL;
+}
 static int totk_kick(thr_t *t) {   // holding G, t waiting: mark (and signal) the owners t beats; returns how many
     int n = 0; uint64_t now = 0;
     for (int i = 0; i < NCORE; i++) {
         thr_t *o = g_core_owner[i];
         if (!o || !core_allowed(t, i)) continue;
         if (totk_ap_on() ? eff_prio(o) <= eff_prio(t) : o->prio <= t->prio) continue;   // off: the raw priorities, exactly as before
-        __atomic_store_n(&o->preempt, 1, __ATOMIC_RELEASE); n++;
+        __atomic_store_n(&o->preempt, 1, __ATOMIC_RELEASE); n++; APT(o, APT_MARK);
         if (!totk_ap_on()) continue;
         volatile uintptr_t *slot = __atomic_load_n(&o->hle_slot, __ATOMIC_ACQUIRE);
-        if (slot && !*slot && !core_diag_on()) { g_ap_skip_host++; continue; }   // in a host function: marked, it yields at its next SVC (TOTK_CORE_DIAG: signalled for its pc)
-        if (slot && o->tlr16 && o->tlr16[0x100 / 2]) { o->tlr16[0x102 / 2] = 1; g_ap_skip_disabled++; continue; }   // preemption disabled: SVC 0x36 switches
+        if (slot && !*slot && !core_diag_on()) { g_ap_skip_host++; APT(o, APT_SKIP_HOST); continue; }   // in a host function: marked, it yields at its next SVC (TOTK_CORE_DIAG: signalled for its pc)
+        if (slot && o->tlr16 && o->tlr16[0x100 / 2]) { o->tlr16[0x102 / 2] = 1; g_ap_skip_disabled++; APT(o, APT_SKIP_DIS); continue; }   // preemption disabled: SVC 0x36 switches
         if (!now) now = now_ns();
-        if (o->ap_sig_ns && now - o->ap_sig_ns < AP_RESIGNAL_NS) { g_ap_skip_recent++; continue; }
-        if (defer_on() && g_pend.nkill < 8) { g_pend.kill[g_pend.nkill++] = o->pt; g_ap_kicks++; o->ap_sig_ns = now; }   // sent when G is released
-        else if (!pthread_kill(o->pt, SIGUSR2)) { g_ap_kicks++; o->ap_sig_ns = now; }
+        if (o->ap_sig_ns && now - o->ap_sig_ns < AP_RESIGNAL_NS) { g_ap_skip_recent++; APT(o, APT_SKIP_RECENT); continue; }
+        if (defer_on() && g_pend.nkill < 8) { g_pend.kill[g_pend.nkill++] = o->pt; g_ap_kicks++; o->ap_sig_ns = now; APT(o, APT_SIG); }   // sent when G is released
+        else if (!pthread_kill(o->pt, SIGUSR2)) { g_ap_kicks++; o->ap_sig_ns = now; APT(o, APT_SIG); }
     }
     return n;
 }
 static void totk_preempt_signal(int sig, siginfo_t *si, void *context) {
     (void)sig; (void)si;
     thr_t *t = me_or_null();
-    if (!t || !__atomic_load_n(&t->preempt, __ATOMIC_ACQUIRE) || t->cur_core < 0) return;
+    if (t) APT(t, APT_ENTER);
+    if (!t || !__atomic_load_n(&t->preempt, __ATOMIC_ACQUIRE) || t->cur_core < 0) { if (t) APT(t, APT_STALE); return; }
     uint64_t pc = (uint64_t)UC_PC(((ucontext_t *)context));
     uintptr_t tp = runtime_host_tsd();
     if (!runtime_hle_tsd_off || !*(volatile uintptr_t *)(tp + runtime_hle_tsd_off) || !runtime_guest_code_pc(pc)) {
-        __atomic_fetch_add(&g_ap_refused, 1, __ATOMIC_RELAXED); if (core_diag_on()) { uint64_t fp = (uint64_t)UC_FP(((ucontext_t *)context)), sp = (uint64_t)UC_SP(((ucontext_t *)context)), fp1 = 0;
+        __atomic_fetch_add(&g_ap_refused, 1, __ATOMIC_RELAXED); APT(t, APT_REFUSED); if (core_diag_on()) { uint64_t fp = (uint64_t)UC_FP(((ucontext_t *)context)), sp = (uint64_t)UC_SP(((ucontext_t *)context)), fp1 = 0;
             if (fp >= sp && fp - sp < (1u << 20) && !(fp & 15)) fp1 = ((const uint64_t *)(uintptr_t)fp)[1];   // the caller's return address, when the frame chain looks sane
             ap_note_pc(pc, (uint64_t)UC_LR(((ucontext_t *)context)), fp1); } return; }   // in a host function: its next SVC gives the core up
     /* Horizon's preemption disable (ThreadLocalRegion +0x100 disable_count, +0x102 interrupt_flag): the SDK's spin locks
@@ -708,11 +751,11 @@ static void totk_preempt_signal(int sig, siginfo_t *si, void *context) {
        "Continue" (2026-10-24): the lock holder lost its core to a better thread that then spun with wfe on the lock it
        held, on the same core. The TLR is the game's tpidrro, which the loader keeps in runtime_keys[2]. */
     { volatile uint16_t *tlr = *(uint16_t *volatile *)(tp + (uintptr_t)runtime_keys[2] * 8);
-      if (tlr && tlr[0x100 / 2]) { tlr[0x102 / 2] = 1; __atomic_fetch_add(&g_ap_deferred, 1, __ATOMIC_RELAXED); return; } }
+      if (tlr && tlr[0x100 / 2]) { tlr[0x102 / 2] = 1; __atomic_fetch_add(&g_ap_deferred, 1, __ATOMIC_RELAXED); APT(t, APT_DEFERRED); return; } }
     int saved = errno;
     pthread_mutex_lock(&G);
-    if (t->cur_core >= 0 && totk_should_yield(t)) { core_put(t); core_take(t); g_ap_taken++; }
-    else t->preempt = 0;
+    if (t->cur_core >= 0 && totk_should_yield(t)) { APT(t, APT_TAKEN); core_put(t); core_take(t); g_ap_taken++; }
+    else { t->preempt = 0; APT(t, APT_KEPT); }
     pthread_mutex_unlock(&G);
     errno = saved;
 }
@@ -757,10 +800,11 @@ static void core_take(thr_t *t) {   // holding G; waits until a core in t's mask
     t->cwait_ns = 0;
     if (tlc) totk_tl(TLK_CW_OUT, (uint64_t)t->cur_core, 0);
 #else
-    if (c >= 0) { totk_core_unqueue(t); t->cur_core = c; t->core_since = now_ns(); g_core_owner[c] = t; return; }
+    if (c >= 0) { totk_core_unqueue(t); if (tenure_reset()) t->ap_sig_ns = 0; t->cur_core = c; t->core_since = now_ns(); g_core_owner[c] = t; return; }
     if (!t->cqueued) { t->cseq = ++g_wseq; t->cnext = g_core_wait; g_core_wait = t; t->cqueued = 1; }
     if (core_migrate(t)) return;
-    int reported = 0;
+    int reported = 0, tlc = tl_on();
+    if (tlc) totk_tl(TLK_CW_IN, 0, 0);
     uint64_t ws = runtime_svc_stats_on() ? now_ns() : 0;
     uint64_t spin_t0 = sync_spin_ns() > 0 ? now_ns() : 0;
     while (t->cur_core < 0) {   // the owners it beats are marked (and, with the asynchronous preemption, signalled again every millisecond)
@@ -770,6 +814,7 @@ static void core_take(thr_t *t) {   // holding G; waits until a core in t's mask
         tev_wait(t, NULL, kick ? 1000000 : CORE_DIAG_NS);   // TOTK_CORE_DIAG: one look at the owners once a wait gets long
         if (!reported && core_diag_on() && t->cur_core < 0 && now_ns() - w0 >= CORE_DIAG_NS) { core_wait_report(t, w0); reported = 1; }
     }
+    if (tlc) totk_tl(TLK_CW_OUT, (uint64_t)t->cur_core, 0);
     if (ws) { g_core_wait_n++; g_core_wait_ns += now_ns() - ws; }
     if (spin_t0) { uint64_t d = now_ns() - spin_t0; t->spin_short = (int64_t)d <= 2 * sync_spin_ns(); site_note(t, 1, d); }   /* a short wait: spin next time too */
 #endif
@@ -857,7 +902,10 @@ int runtime_current_core(void) { thr_t *t = me_or_null(); return t ? (t->cur_cor
 static int64_t block(thr_t *t,int kind,int64_t ns) {
     if (ns == 0) return block_inner(t, kind, ns);
     int tl = tl_on();
-    if (tl) { uint64_t k = kind == 2 ? t->wkey : kind == 4 ? t->wh[0] : t->waddr; totk_tl(TLK_GW_IN, (uint64_t)kind << 56 | (k & 0x00ffffffffffffffull), t->last_lr); }
+    /* a mutex wait (kind 1) also carries the owner's handle, low byte, in bits 48-55 (the word holds the owner's handle) */
+    if (tl) { uint64_t k = kind == 2 ? t->wkey : kind == 4 ? t->wh[0] : t->waddr;
+        if (kind == 1 && t->waddr) k = (k & 0xffffffffffffull) | (uint64_t)((__atomic_load_n((const uint32_t *)(uintptr_t)t->waddr, __ATOMIC_RELAXED) & ~WAITERS_BIT) & 0xff) << 48;
+        totk_tl(TLK_GW_IN, (uint64_t)kind << 56 | (k & 0x00ffffffffffffffull), t->last_lr); }
     core_put(t); int64_t r = block_inner(t, kind, ns);
     if (tl) totk_tl(TLK_GW_OUT, (uint64_t)kind, (uint64_t)r);
     core_take(t); return r;
@@ -1708,4 +1756,26 @@ void runtime_svc_stats_add(unsigned num, uint64_t ns) {
       k += snprintf(line + k, sizeof line - k, "; G held, by taking line ms/s:");
       for (int j = 0; j < 6 && top[j] && dh[top[j]] && k < (int)sizeof line - 24; j++) k += snprintf(line + k, sizeof line - k, " %c%d %.1f", top[j] >= 2048 ? 'W' : 'L', top[j] & 2047, dh[top[j]] / 1e6 / s); }
     fprintf(stderr, "%s\n", line);
+}
+
+/* The game's threads, for a timeline file (totk_timeline.c tl_write): host thread id, handle, entry (module + offset),
+   priority, core, and the name the game gave the thread when its argument holds one (nn::os keeps the name in the
+   thread object it passes as the argument: the first run of 3 to 31 printable bytes ending in a NUL in its first 0x200
+   bytes, read through vm_read_overwrite so an argument that is not a pointer reads nothing). */
+void runtime_threads_table(FILE *f) {
+    extern int runtime_module_offset(uint64_t pc, const char **name, uint64_t *off);
+    g_lock();
+    for (thr_t *t = g_all; t; t = t->all) {
+        uint64_t id = 0; if (t->pt) pthread_threadid_np(t->pt, &id);
+        const char *mod = "?"; uint64_t off = t->entry; runtime_module_offset(t->entry, &mod, &off);
+        char buf[0x200], name[32] = ""; vm_size_t got = 0;
+        if (t->arg && !(t->arg & 7) && vm_read_overwrite(mach_task_self(), (vm_address_t)t->arg, sizeof buf, (vm_address_t)buf, &got) == KERN_SUCCESS)
+            for (size_t i = 0; i + 4 <= got && !name[0]; i += 8) {
+                size_t n = 0; while (i + n < got && n < 31 && buf[i + n] >= 0x20 && buf[i + n] < 0x7f) n++;
+                if (n >= 3 && i + n < got && !buf[i + n]) { memcpy(name, buf + i, n); name[n] = 0; }
+            }
+        fprintf(f, "# thread\t%llu\t%#x\t%s+%#llx\tprio %d\tcore %d\t%s\n", (unsigned long long)id, t->handle, mod,
+                (unsigned long long)off, t->prio, t->core, name);
+    }
+    pthread_mutex_unlock(&G);
 }
