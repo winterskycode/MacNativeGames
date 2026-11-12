@@ -3439,7 +3439,8 @@ static int g_cfg_scr = -1;   // the display rate present_cfg chose for (-1: set 
    42-47 fps, also with a time-constraint declaration from the measured frame time; the cause is not known yet. */
 #define UNCAPPED_HZ 240           /* the highest TOTK_UNCAPPED_HZ takes */
 #define UNCAPPED_DEFAULT_HZ 144   /* the Mac's ceiling without TOTK_UNCAPPED_HZ */
-/* TOTK_UNCAPPED_HZ: the uncapped clock's ceiling, 30..240 (default 144 on the Mac), or "display" for the display's refresh
+/* TOTK_UNCAPPED_HZ: the uncapped clock's ceiling, 15..240 (default 144 on the Mac; under 30 for frame generation's x3 and x4,
+   the frame step following the measured frame time down to 15 fps), or "display" for the display's refresh
    rate: the iPhone / iPad default (user 2026-10-17: at most 60 on the iPhone 14's 60 Hz screen, where frames above it are
    never shown and only heat the phone; since 2026-10-23 the phone holds 30, phone_holds_30). The game still does not wait for the display, so a scene slower than the ceiling
    is not held to 60 / 30 steps. */
@@ -3449,12 +3450,12 @@ static int uncapped_cap(int scr) {
     if (!e) e = "display";   // at most the screen's rate (60 on an iPhone 14); TOTK_PHONE_FPS=30 holds 30 (phone_holds_30)
 #endif
     int v = !e ? UNCAPPED_DEFAULT_HZ : !strcmp(e, "display") ? (scr > 0 ? scr : 60) : atoi(e);
-    return v < 30 ? 30 : v > UNCAPPED_HZ ? UNCAPPED_HZ : v;
+    return v < 15 ? 15 : v > UNCAPPED_HZ ? UNCAPPED_HZ : v;
 }
 void nvn_present_config(int hz, int display_mode) { g_hz = g_paced_hz = hz; g_display_mode = display_mode; g_cfg_scr = -1; }
 /* Android in-game overlay (port/android/vk/overlay.h): the frame-rate cap is the uncapped clock's ceiling, changed live. */
 int nvn_frame_cap_get(void) { return g_uncapped && g_hz > 0 ? g_hz : 60; }
-void nvn_frame_cap_set(int hz) { if (!g_uncapped) return; g_hz = hz < 30 ? 30 : hz > UNCAPPED_HZ ? UNCAPPED_HZ : hz; LOG("[nvn] frame-rate cap %d (overlay)", g_hz); }
+void nvn_frame_cap_set(int hz) { if (!g_uncapped) return; g_hz = hz < 15 ? 15 : hz > UNCAPPED_HZ ? UNCAPPED_HZ : hz; LOG("[nvn] frame-rate cap %d (overlay)", g_hz); }
 static void present_cfg(const win_t *o) {
     /* again when the window moved to a display with another refresh rate (mtl_display_hz follows the window) */
     if (g_hz >= 0 && (g_cfg_scr < 0 || mtl_display_hz() == g_cfg_scr)) return;
