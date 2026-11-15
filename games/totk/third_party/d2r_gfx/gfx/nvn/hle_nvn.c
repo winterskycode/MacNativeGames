@@ -174,6 +174,16 @@ NVN(nvnDeviceInitialize, NVNboolean, NVNdevice *d, const NVNdeviceBuilder *b) {
     dev_t_ *o = (dev_t_ *)d; memset(o, 0, sizeof *o);
     o->magic = MAGIC('D', 'E', 'V', 0); o->flags = ((const dev_builder_t *)b)->flags;
     OLOG("DeviceInitialize %p flags=%#x", (void *)d, o->flags);
+    /* TOTK_NVN_PROBES=1: the command recording probes (probe-gfx) in the game, before it records anything; 2..5: only the
+       commands, inline bulk, deferred binds or call reference probe */
+    if (getenv("TOTK_NVN_PROBES")) { int k = atoi(getenv("TOTK_NVN_PROBES"));
+        void dm_nvn_probe_commands(void), dm_nvn_probe_inline_bulk(void), dm_nvn_probe_deferred_binds(void), dm_nvn_probe_call_ref(void);
+        if (k == 1 || k == 2) dm_nvn_probe_commands();
+        if (k == 1 || k == 3) dm_nvn_probe_inline_bulk();
+        if (k == 1 || k == 4) dm_nvn_probe_deferred_binds();
+        if (k == 1 || k == 5) dm_nvn_probe_call_ref();
+        if (k >= 1 && k <= 5) LOG("[nvn] command recording probes passed");
+    }
     return 1;
 }
 NVN(nvnDeviceFinalize, void, NVNdevice *d) { ((dev_t_ *)d)->magic = 0; }
@@ -1195,8 +1205,31 @@ static pthread_mutex_t g_copy_mu = PTHREAD_MUTEX_INITIALIZER;
 typedef struct { uint64_t magic; _Atomic uint64_t used_at; uint64_t made_at; uint32_t body_bytes, last_size, idx_off, nidx, ubo_off, nubo, ncall, nmark;   /* nmark: piece markers inside (copies of other recordings) */
                  uint64_t serial; _Atomic uint32_t pinned; uint32_t pad2_; uint64_t cb;   /* cb: the command buffer object it was recorded on */   /* serial: unique per copy (plan key); pinned: the translation thread's predecode reads the body (nvn_vulkan_plan.inc) */
                  _Atomic uint32_t used; uint32_t hw_bytes;
-                 _Atomic uint32_t walk; uint32_t rec_bytes; void *lists; uint32_t *idx_list; void *ubo_list; } copy_prefix;   /* walk: 0 to do, 1 being walked, 2 done (copy_walk: the op index, uniform ranges, bulk and marker fields); rec_bytes: the body with BEGIN and END; lists: one allocation holding idx_list and ubo_list */   /* used: called or submitted at least once (NVN 53 lifetime, release_copies; Breath of the Wild); hw_bytes: the recording's command memory on hardware (EndRecording), what CopyCommands of it adds (inline_recording) */
+                 _Atomic uint32_t walk; uint32_t rec_bytes; void *lists; uint32_t *idx_list; void *ubo_list;
+                 /* ndefer: deferred binds in the body and in the copies it calls (copy_walk); held: OP_CALL records naming this copy in recordings and copies
+                    not yet freed (call_ref); dropped: released by the game while held, freed with the last hold; call_list:
+                    the offsets of the body's ncall OP_CALL records (in lists); res_sub: the last submission whose deferred-bind
+                    resolution read this copy through a call (resolve_deferred) */
+                 uint32_t ndefer; _Atomic uint32_t held; uint32_t dropped, pad3_; uint32_t *call_list; uint64_t res_sub; } copy_prefix;   /* walk: 0 to do, 1 being walked, 2 done (copy_walk: the op index, uniform ranges, bulk and marker fields); rec_bytes: the body with BEGIN and END; lists: one allocation holding idx_list and ubo_list */   /* used: called or submitted at least once (NVN 53 lifetime, release_copies; Breath of the Wild); hw_bytes: the recording's command memory on hardware (EndRecording), what CopyCommands of it adds (inline_recording) */
 static _Atomic uint64_t g_copy_serial;
+/* CallCommands by reference, counted by the walks of the calling copies (a counter every recording thread incremented
+   at each call was a quarter of the call's time); copies made for deferred binds are rare and counted at the call */
+static _Atomic uint64_t g_call_ref_n, g_call_ref_bytes, g_call_copy_defer, g_call_walks;
+/* copies called by reference by size (powers of two from 64 bytes): calls and bytes */
+static _Atomic uint64_t g_call_hist[2][16];
+static void call_hist_note(uint32_t bytes) {
+    unsigned b = 0; while (b < 15 && (64u << b) < bytes) b++;
+    atomic_fetch_add_explicit(&g_call_hist[0][b], 1, memory_order_relaxed); atomic_fetch_add_explicit(&g_call_hist[1][b], bytes, memory_order_relaxed);
+}
+static void call_stats_walk(uint32_t ncall, uint64_t bytes) {
+    atomic_fetch_add_explicit(&g_call_ref_n, ncall, memory_order_relaxed); atomic_fetch_add_explicit(&g_call_ref_bytes, bytes, memory_order_relaxed);
+    if (atomic_fetch_add_explicit(&g_call_walks, 1, memory_order_relaxed) % 20000 == 19999) {
+        char line[1024]; int m = 0;
+        for (unsigned b = 0; b < 16; b++) if (g_call_hist[0][b]) m += snprintf(line + m, sizeof line - m, " <=%u: %llu calls %.1f MiB;", 64u << b, (unsigned long long)g_call_hist[0][b], g_call_hist[1][b] / 1048576.0);
+        LOG("[nvn] CallCommands: %llu by reference (%.1f MiB not copied), %llu copied though over the size for their deferred binds; by reference by size:%s",
+            (unsigned long long)g_call_ref_n, g_call_ref_bytes / 1048576.0, (unsigned long long)g_call_copy_defer, line);
+    }
+}
 static void plan_offer(uint8_t *copy);   /* below, with the translation thread */
 static _Atomic uint64_t g_copy_bytes;   /* live recording-copy bytes (logged with the copy count) */
 static copy_prefix *copy_of(NVNcommandHandle h) { copy_prefix *c = (copy_prefix *)(uintptr_t)h - 1; return c; }
@@ -1214,7 +1247,7 @@ typedef struct { uint64_t lo, hi; } ubo_range_t;
    address copy_walk takes once: this library is loaded after start, so every thread-local access is a call into
    the linker's dynamic resolver (tlsdesc_resolver_dynamic), which per op and per uniform bind was 1.5% of the process's
    CPU on the game's threads */
-typedef struct { uint32_t *idx; uint32_t idx_cap; ubo_range_t *ubo; uint32_t ubo_cap, ubo_n; ubo_range_t *ubo_set; uint32_t ubo_set_mask; } rec_scratch;
+typedef struct { uint32_t *idx; uint32_t idx_cap; ubo_range_t *ubo; uint32_t ubo_cap, ubo_n; ubo_range_t *ubo_set; uint32_t ubo_set_mask; uint32_t *calls; uint32_t calls_cap; } rec_scratch;
 static __thread rec_scratch t_rec;
 static void ubo_range_note(rec_scratch *T, uint64_t lo, uint64_t hi) {
     if (!T->ubo_set || T->ubo_n * 2 >= T->ubo_set_mask) {   /* grow (or first use), then re-insert the list so far */
@@ -1249,14 +1282,14 @@ static void ubo_ranges_sort(ubo_range_t *r, uint32_t n) {   /* LSD radix on lo, 
 static void copy_ready(copy_prefix *c);
 const ubo_range_t *nvn_copy_ubo_ranges(uint64_t handle, uint32_t *n, uint32_t *calls) {
     copy_prefix *c = (copy_prefix *)(uintptr_t)handle - 1;
-    if (c->magic != COPY_MAGIC) return NULL;
+    if (c->magic != COPY_MAGIC && !c->dropped) return NULL;   /* dropped: released by the game, kept for its callers */
     copy_ready(c); if (!c->ubo_off) return NULL;
-    *n = c->nubo; *calls = c->ncall; return (const ubo_range_t *)c->ubo_list;
+    *n = c->nubo; *calls = 0; return (const ubo_range_t *)c->ubo_list;   /* the called copies' ranges are in the list (copy_walk) */
 }
 static int op_indexed(uint32_t op) { return op == OP_BIND_UBO || op == OP_BIND_TEX || op == OP_BIND_IMG || op == OP_BIND_SAMP || op == OP_CALL; }
 const uint32_t *nvn_copy_op_index(uint64_t handle, uint32_t *n) {
     copy_prefix *c = (copy_prefix *)(uintptr_t)handle - 1;
-    if (c->magic != COPY_MAGIC) return NULL;
+    if (c->magic != COPY_MAGIC && !c->dropped) return NULL;   /* dropped: released by the game, kept for its callers */
     copy_ready(c); if (!c->idx_off) return NULL;
     *n = c->nidx; return c->idx_list;
 }
@@ -1277,7 +1310,7 @@ static uint8_t *copy_recording(const uint8_t *p, size_t len) {
 }
 static void copy_walk(copy_prefix *c) {   /* the walk: c->walk is 1, set by the caller that claimed it */
     const uint8_t *base = (const uint8_t *)(c + 1), *p = base, *end = base + c->rec_bytes;
-    int bulk_ok = 1, idx_ok = 1; uint32_t last_size = 0, nidx = 0, ncall = 0, nmark = 0, end_size = 0; size_t n = 0;
+    int bulk_ok = 1, idx_ok = 1; uint32_t last_size = 0, nidx = 0, ncall = 0, nmark = 0, ndefer = 0, end_size = 0; size_t n = 0; uint64_t called_bytes = 0;
     rec_scratch *T = &t_rec;
     T->ubo_n = 0; if (T->ubo_set) memset(T->ubo_set, 0, (size_t)(T->ubo_set_mask + 1) * sizeof *T->ubo_set);
     for (;;) {
@@ -1297,7 +1330,19 @@ static void copy_walk(copy_prefix *c) {   /* the walk: c->walk is 1, set by the 
                mapped is zeroed by the capture's fault-safe copy) */
             if (b.stage == 0 && (unsigned)b.index < 32 && mv_banks() >> b.index & 1) { uint64_t step = (b.size + 255) & ~(uint64_t)255;
                 ubo_range_note(T, b.addr + step, b.addr + step + b.size); if (b.addr >= step) ubo_range_note(T, b.addr - step, b.addr - step + b.size); } } }
-        if (h.op == OP_CALL) ncall++;
+        if (h.op == OP_CALL) {
+            if (n > UINT32_MAX) die("recording %p: a call past 4 GiB", (const void *)base);
+            if (ncall == T->calls_cap) { T->calls_cap = T->calls_cap ? T->calls_cap * 2 : 256; T->calls = realloc(T->calls, T->calls_cap * sizeof *T->calls); if (!T->calls) die("command call list"); }
+            T->calls[ncall++] = (uint32_t)n;
+            /* the called copy's uniform ranges (its own calls' included) join this copy's, as its bytes did when they were
+               copied in: the submit's capture takes one list per submitted recording and follows no calls */
+            uint64_t t; memcpy(&t, p + 8, 8); copy_prefix *tc = (copy_prefix *)(uintptr_t)t - 1;
+            /* walked before the call was recorded (inline_recording); a walk here would reuse this walk's scratch */
+            if (atomic_load_explicit(&tc->walk, memory_order_acquire) == 0) die("recording %p calls %p, which was never walked", (const void *)base, (const void *)(tc + 1));
+            copy_ready(tc); called_bytes += tc->rec_bytes; call_hist_note(tc->rec_bytes); ndefer += tc->ndefer;
+            const ubo_range_t *cr = (const ubo_range_t *)tc->ubo_list; for (uint32_t i = 0; i < tc->nubo; i++) ubo_range_note(T, cr[i].lo, cr[i].hi);
+        }
+        else if (h.op == OP_BIND_TEX || h.op == OP_BIND_IMG || h.op == OP_BIND_SAMP) { uint64_t src; memcpy(&src, p + 8 + offsetof(p_bind_handles, src), 8); if (src) ndefer++; }
         if (op_indexed(h.op) && idx_ok) {
             if (n > UINT32_MAX) idx_ok = 0;
             else { if (nidx == T->idx_cap) { T->idx_cap = T->idx_cap ? T->idx_cap * 2 : 4096; T->idx = realloc(T->idx, T->idx_cap * sizeof *T->idx); if (!T->idx) die("command op index"); }
@@ -1307,19 +1352,23 @@ static void copy_walk(copy_prefix *c) {   /* the walk: c->walk is 1, set by the 
         if (h.op == OP_END) { end_size = h.size; break; }
         p += h.size;
     }
-    size_t idx_bytes = idx_ok ? (size_t)nidx * sizeof *T->idx : 0, ubo_at = (idx_bytes + 15) & ~(size_t)15, ubo_bytes = (size_t)T->ubo_n * sizeof *T->ubo;
+    size_t idx_bytes = idx_ok ? (size_t)nidx * sizeof *T->idx : 0, ubo_at = (idx_bytes + 15) & ~(size_t)15, ubo_bytes = (size_t)T->ubo_n * sizeof *T->ubo,
+           calls_at = ubo_at + ubo_bytes, calls_bytes = (size_t)ncall * sizeof *T->calls;
     static uint64_t empty_list[2];   /* an index or range list with no entries is there (not NULL) but empty */
     uint8_t *lists = NULL;
-    if (idx_bytes || ubo_bytes) {
-        lists = malloc(ubo_at + ubo_bytes); if (!lists) die("command copy lists");
+    if (idx_bytes || ubo_bytes || calls_bytes) {
+        lists = malloc(calls_at + calls_bytes); if (!lists) die("command copy lists");
         if (idx_bytes) memcpy(lists, T->idx, idx_bytes);
         if (ubo_bytes) { ubo_ranges_sort(T->ubo, T->ubo_n); memcpy(lists + ubo_at, T->ubo, ubo_bytes); }
+        if (calls_bytes) memcpy(lists + calls_at, T->calls, calls_bytes);
         g_copy_bytes += malloc_size(lists);
     }
+    c->call_list = calls_bytes ? (uint32_t *)(lists + calls_at) : (uint32_t *)empty_list;
+    if (ncall) call_stats_walk(ncall, called_bytes);
     c->lists = lists;
     c->idx_off = (uint32_t)idx_ok; c->nidx = idx_ok ? nidx : 0; c->idx_list = !idx_ok ? NULL : idx_bytes ? (uint32_t *)lists : (uint32_t *)empty_list;
     c->ubo_off = 1; c->nubo = T->ubo_n; c->ubo_list = ubo_bytes ? (void *)(lists + ubo_at) : (void *)empty_list;
-    c->ncall = ncall; c->nmark = nmark;
+    c->ncall = ncall; c->nmark = nmark; c->ndefer = ndefer;
     size_t body = n >= 16 ? n - 16 : 0;
     c->body_bytes = bulk_ok && end_size == 8 && body <= UINT32_MAX ? (uint32_t)body : 0;
     c->last_size = c->body_bytes ? last_size : 0;
@@ -1418,18 +1467,24 @@ static int qo_replay_async(void); static uint64_t qo_pushed(void), qo_replayed(v
 static int qo_on(void);
 typedef struct { copy_prefix *pf; uint64_t after, qo_after; } retired_copy;
 static retired_copy *g_retired; static size_t g_nretired, g_cretired;
+static void copy_destroy(copy_prefix *pf);
 static void retired_sweep(void) {
     if (!g_nretired) return;
-    uint64_t done = xsub_replayed(), qo_done = qo_on() ? qo_replayed() : UINT64_MAX; size_t k = 0;
-    for (size_t i = 0; i < g_nretired; i++) {
-        if (g_retired[i].after <= done && g_retired[i].qo_after <= qo_done) { copy_lists_free(g_retired[i].pf); g_copy_bytes -= malloc_size(g_retired[i].pf); free(g_retired[i].pf); }
-        else g_retired[k++] = g_retired[i];
-    }
+    uint64_t done = xsub_replayed(), qo_done = qo_on() ? qo_replayed() : UINT64_MAX; size_t k = 0, nfree = 0;
+    /* the copies to free are moved past the kept ones first: freeing one releases the copies it calls, which may retire
+       them onto this list */
+    for (size_t i = 0; i < g_nretired; i++) if (!(g_retired[i].after <= done && g_retired[i].qo_after <= qo_done)) { retired_copy r = g_retired[i]; g_retired[i] = g_retired[k]; g_retired[k++] = r; }
+    nfree = g_nretired - k;
+    if (!nfree) return;
+    copy_prefix *stack[64], **gone = nfree <= 64 ? stack : malloc(nfree * sizeof *gone); if (!gone) die("retired command copies");
+    for (size_t i = 0; i < nfree; i++) gone[i] = g_retired[k + i].pf;
     g_nretired = k;
+    for (size_t i = 0; i < nfree; i++) copy_destroy(gone[i]);
+    if (gone != stack) free(gone);
 }
 static void copy_free(copy_prefix *pf) {
     uint64_t after = async_replay() || qo_replay_async() ? xsub_pushed() : 0, qo_after = qo_on() ? qo_pushed() : 0;
-    if ((!after || after <= xsub_replayed()) && (!qo_after || qo_after <= qo_replayed())) { copy_lists_free(pf); g_copy_bytes -= malloc_size(pf); free(pf); return; }
+    if ((!after || after <= xsub_replayed()) && (!qo_after || qo_after <= qo_replayed())) { copy_destroy(pf); return; }
     if (g_nretired == g_cretired) {
         size_t cap = g_cretired ? g_cretired * 2 : 256; retired_copy *r = realloc(g_retired, cap * sizeof *r);
         if (!r) die("retired command copies");
@@ -1453,12 +1508,34 @@ static void copy_drop(copy_bucket *b, uint32_t i, int by_token) {   /* g_copy_mu
     if (cmdlog_env()) LOG("[cmd] free copy=%p%s", (void *)c->copy, by_token ? " (its mark in the control memory is gone)" : "");
     g_freed[g_nfreed++ % FREED_RING] = (typeof(g_freed[0])){(uintptr_t)c->copy, g_submits, c->stale_at, pf->used_at, pf->made_at, c->ctl_lo};
     pf->magic = 0;
-    if (atomic_load(&pf->pinned)) { if (g_copy_ndeferred == sizeof g_copy_deferred / sizeof *g_copy_deferred) { while (atomic_load(&pf->pinned)) sched_yield(); copy_free(pf); } else g_copy_deferred[g_copy_ndeferred++] = pf; }
+    if (atomic_load(&pf->held)) pf->dropped = 1;   /* a recording or copy still calls it: freed with the last (call_release) */
+    else if (atomic_load(&pf->pinned)) { if (g_copy_ndeferred == sizeof g_copy_deferred / sizeof *g_copy_deferred) { while (atomic_load(&pf->pinned)) sched_yield(); copy_free(pf); } else g_copy_deferred[g_copy_ndeferred++] = pf; }
     else copy_free(pf);
     b->v[i] = b->v[--b->n]; g_ncopies--;
     if (by_token) g_copy_drop_token++; else g_copy_drop_readd++;
     if (!b->n && !b->empty) { b->empty = 1; g_cbk_empty++; }
 }
+/* CallCommands by reference (call_ref): an OP_CALL record names the called copy instead of carrying its bytes. Each such
+   record, in a recording being made or in a copy not yet freed, holds the copy it names, so a called copy the game
+   releases (copy_drop) stays readable until the last copy calling it is freed, as an inline copy of it would.
+   Copies are immutable after EndRecording, so sharing one body is the same as copying it. Holds are taken without the
+   copy lock (the copy is live: the game is calling it); they are released under it. */
+static void call_release(copy_prefix *t) {   /* g_copy_mu held */
+    if (atomic_fetch_sub(&t->held, 1) != 1 || !t->dropped) return;
+    if (atomic_load(&t->pinned) && g_copy_ndeferred < sizeof g_copy_deferred / sizeof *g_copy_deferred) { g_copy_deferred[g_copy_ndeferred++] = t; return; }
+    while (atomic_load(&t->pinned)) sched_yield();
+    copy_free(t);
+}
+static void calls_hold(const copy_prefix *c, int hold) {   /* every OP_CALL in c's body: hold (1) or release (0, g_copy_mu held) */
+    copy_ready((copy_prefix *)c);
+    if (!c->ncall) return;
+    const uint8_t *base = (const uint8_t *)(c + 1);
+    for (uint32_t i = 0; i < c->ncall; i++) {
+        uint64_t t; memcpy(&t, base + c->call_list[i] + 8, 8); copy_prefix *tc = copy_of((NVNcommandHandle)t);
+        if (hold) atomic_fetch_add(&tc->held, 1); else call_release(tc);
+    }
+}
+static void copy_destroy(copy_prefix *pf) { calls_hold(pf, 0); copy_lists_free(pf); g_copy_bytes -= malloc_size(pf); free(pf); }
 static void release_copies(uintptr_t lo, uintptr_t hi) {
     if (hi <= lo) return;
     pthread_mutex_lock(&g_copy_mu);
@@ -1696,10 +1773,10 @@ void dm_nvn_inline_bulk_set(int v) {
    bytes per inlined recording; the AreaMergeTarRenderer's 4,152-byte pool went past 4 KiB to 8 KiB and its private
    32 KiB heap ran out near Zora's Domain (#1742: main+0x855560 writes through a NULL allocation). Breath of the Wild and
    the Switch 2 games are not measured and keep the old accounting. */
-static void inline_recording_body(NVNcommandBuffer *c, NVNcommandHandle hd);
+static void inline_recording_body(NVNcommandBuffer *c, NVNcommandHandle hd, int call);
 static void inline_recording(NVNcommandBuffer *c, NVNcommandHandle hd, int call) {
     cmd_t *o = CB(c); size_t hw0 = o->hw_used;
-    inline_recording_body(c, hd);
+    inline_recording_body(c, hd, call);
     { uint8_t *m = cmd_alloc(o, 16); put_hdr(m, OP_BEGIN, 16); uint64_t w = 2; memcpy(m + 8, &w, 8); o->hw_used -= 16; }   /* piece marker: the copied recording ends here (no hardware equivalent) */
 #if defined(GAME_BOTW) || defined(GAME_NS2)
     (void)call; (void)hw0;
@@ -1707,7 +1784,30 @@ static void inline_recording(NVNcommandBuffer *c, NVNcommandHandle hd, int call)
     o->hw_used = hw0 + (call ? 0 : copy_of(hd)->hw_bytes);
 #endif
 }
-static void inline_recording_body(NVNcommandBuffer *c, NVNcommandHandle hd) {
+/* TOTK_CALL_REF=0: CallCommands copies the called recording's bytes into the caller, as CopyCommands does. On (the
+   default), a call of a large recording is one OP_CALL record naming the copy (calls_hold), which the replay, the
+   uniform capture (through the walk's merged ranges), the deferred-bind resolution, the fence scan and the texture pin
+   sweep follow. Small recordings are still copied (TOTK_CALL_REF_MIN), and so are recordings with deferred binds below
+   TOTK_CALL_REF_DEFER_MIN: the submit writes the handles it reads into their bind records (resolve_one), which in a
+   shared body waits for the replay of an earlier submission still reading it (resolve_shared_wait). Copying every
+   call takes 6.5-8.3% of the game's main thread and job workers' CPU. */
+static int g_call_ref = -1;
+/* TOTK_CALL_REF_MIN (bytes, default 1024): smaller recordings are copied in: nearly all calls are of recordings under
+   512 bytes, where a copy is a few cache lines and a reference would send the translation thread to another place in
+   memory for each (its loop took 1.7 times as long). TOTK_CALL_REF_DEFER_MIN (default 65536): recordings with deferred
+   binds are called by reference from this size (the submit resolves them in place, resolve_shared_wait). */
+static uint32_t g_call_ref_min = 1024, g_call_ref_defer_min = 65536; static int g_call_ref_sizes;
+static void call_ref_sizes(void) {
+    if (g_call_ref_sizes) return; g_call_ref_sizes = 1;
+    const char *e = getenv("TOTK_CALL_REF_MIN"); if (e) g_call_ref_min = (uint32_t)strtoul(e, NULL, 0);
+    e = getenv("TOTK_CALL_REF_DEFER_MIN"); if (e) g_call_ref_defer_min = (uint32_t)strtoul(e, NULL, 0);
+}
+#if defined(GAME_BOTW) || defined(GAME_NS2)
+static int call_ref_on(void) { return 0; }
+#else
+static int call_ref_on(void) { if (g_call_ref < 0) { const char *e = getenv("TOTK_CALL_REF"); g_call_ref = !(e && !strcmp(e, "0")); LOG("[nvn] CallCommands: %s", g_call_ref ? "by reference (TOTK_CALL_REF=0 copies)" : "copies the called recording"); } return g_call_ref; }
+#endif
+static void inline_recording_body(NVNcommandBuffer *c, NVNcommandHandle hd, int call) {
     const uint8_t *p = (const uint8_t *)(uintptr_t)hd;
     if (!p) die("CallCommands/CopyCommands with a null handle");
     copy_touch(hd, g_submits);
@@ -1721,7 +1821,18 @@ static void inline_recording_body(NVNcommandBuffer *c, NVNcommandHandle hd) {
        its bytes now, at exactly the original call position. Deferred bindings
        remain deferred; source handle retirement cannot affect the caller.
        CMDSTAT retains the record-by-record path and its exact counters. */
-    const copy_prefix *meta = copy_of(hd); copy_ready((copy_prefix *)meta);
+    copy_prefix *meta = copy_of(hd); copy_ready(meta);
+    if (call && call_ref_on()) {
+        call_ref_sizes();
+        if (meta->rec_bytes >= g_call_ref_min && (!meta->ndefer || meta->rec_bytes >= g_call_ref_defer_min)) {
+            atomic_fetch_add(&meta->held, 1);
+            uint8_t *r = cmd_alloc(CB(c), 16); put_hdr(r, OP_CALL, 16); uint64_t t = (uint64_t)hd; memcpy(r + 8, &t, 8);
+            return;
+        }
+        if (meta->ndefer && meta->rec_bytes >= g_call_ref_min) atomic_fetch_add_explicit(&g_call_copy_defer, 1, memory_order_relaxed);
+    }
+    /* the copied body's own calls hold their copies for the caller too */
+    calls_hold(meta, 1);
     if (inline_bulk_on() && !cs_on() && meta->body_bytes && meta->last_size) {
         cmd_t *o = CB(c);
         uint8_t *dst = cmd_alloc(o, meta->body_bytes);
@@ -1892,7 +2003,7 @@ static void pin_mark(const void *p) {   /* g_pin_mu held */
         if ((const void *)g_pin_ptrs.v[j] == p) { g_pin_ptrs.v[j]->alive_sweep = g_pin_sweep_id; g_pin_marks++; return; }
 }
 static int pin_negative(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_PROBE_NEGATIVE"); v = e && atoi(e) == 21; } return v; }
-static void pin_mark_ops(const uint8_t *p) {   /* one recording copy: OP_BEGIN ... OP_END */
+static void pin_mark_ops(const uint8_t *p, int depth) {   /* one recording copy: OP_BEGIN ... OP_END, and the copies it calls */
     for (;;) {
         op_hdr h; memcpy(&h, p, sizeof h);
         if (h.op == OP_END || h.size < 8) return;
@@ -1904,6 +2015,8 @@ static void pin_mark_ops(const uint8_t *p) {   /* one recording copy: OP_BEGIN .
             case OP_COPY_B2T: case OP_COPY_T2B: pin_mark(((const p_copy_b2t *)(const void *)a)->tex); break;
             case OP_CLEAR_TEX: pin_mark(((const p_clear_tex *)(const void *)a)->tex); break;
             case OP_COPY_T2T: { const p_copy_t2t *c = (const void *)a; pin_mark(c->src); pin_mark(c->dst); break; }
+            /* a called copy the game has released is in no bucket: its targets are marked through its callers */
+            case OP_CALL: { const uint8_t *t; memcpy(&t, a, 8); if (depth < 16) pin_mark_ops(t, depth + 1); break; }
             default: break;
         }
         p += h.size;
@@ -1943,7 +2056,7 @@ static void pin_scan(size_t buckets) {   /* g_copy_mu and g_pin_mu held */
                 && !botw_mark_gone_keep(&b->v[i])
 #endif
                ) { copy_drop(b, i, 1); continue; }   /* its control memory was reused: the copy goes */
-            pin_mark_ops(b->v[i].copy); g_pin_scanned++; i++;
+            pin_mark_ops(b->v[i].copy, 0); g_pin_scanned++; i++;
         }
     }
     g_mark_jb = NULL;
@@ -2088,6 +2201,17 @@ NVN(nvnCommandBufferSetViewports, void, NVNcommandBuffer *c, int first, int n, c
 }
 NVN(nvnCommandBufferSetScissor, void, NVNcommandBuffer *c, int x, int y, int w, int h) { *REC(c, OP_SCISSOR, p_scissor) = (p_scissor){x, y, w, h}; }
 
+/* Probes count copies and bytes: the walk thread's queue is emptied and the copies released meanwhile (deferred while
+   queued, retired while a replay may read them) are freed first. */
+static void probe_settle(void) {
+    for (int i = 0; i < 2000; i++) {
+        int queued = __atomic_load_n(&g_wq_in, __ATOMIC_ACQUIRE) != __atomic_load_n(&g_wq_out, __ATOMIC_ACQUIRE);
+        pthread_mutex_lock(&g_copy_mu); copy_drain_deferred(); retired_sweep(); unsigned left = g_copy_ndeferred; pthread_mutex_unlock(&g_copy_mu);
+        if (!queued && !left) return;
+        usleep(1000);
+    }
+    die("probe: the walk thread's queue did not empty");
+}
 /* CPU-only regression: independently recorded handles can share command storage. */
 void dm_nvn_probe_commands(void) {
     NVNcommandBuffer a, b, caller;
@@ -2119,12 +2243,14 @@ void dm_nvn_probe_commands(void) {
     h_nvnCommandBufferAddControlMemory(&b, control[0], sizeof control[0]);
     if (g_ncopies != before + 2) die("command probe: control reuse retired wrong recordings");
     copy_touch(hb, g_submits); copy_touch(hc, g_submits);
-    const uint8_t *p = (const uint8_t *)(uintptr_t)hc;
+    const uint8_t *p = (const uint8_t *)(uintptr_t)hc, *ret = NULL;
     const p_scissor expected[] = {{11,22,33,44}, {55,66,77,88}};
     unsigned n = 0;
+    /* a called recording is copied in or named by an OP_CALL (call_ref); either way its payload must still be there */
     for (;;) {
         op_hdr h; memcpy(&h, p, sizeof h);
-        if (h.op == OP_END) break;
+        if (h.op == OP_END) { if (!ret) break; p = ret; ret = NULL; continue; }
+        if (h.op == OP_CALL && !ret) { ret = p + h.size; memcpy(&p, p + 8, 8); continue; }
         if (h.op == OP_SCISSOR) {
             if (n >= 2 || memcmp(p + 8, &expected[n++], sizeof(p_scissor)))
                 die("command probe: cached payload changed");
@@ -2135,7 +2261,8 @@ void dm_nvn_probe_commands(void) {
     h_nvnCommandBufferAddControlMemory(&b, control[1], sizeof control[1]);
     h_nvnCommandBufferAddControlMemory(&caller, control[2], sizeof control[2]);
     h_nvnCommandBufferFinalize(&b); h_nvnCommandBufferFinalize(&caller);
-    if (g_ncopies != before || g_copy_bytes != bytes_before) die("command probe: copy leak");
+    probe_settle();
+    if (g_ncopies != before || g_copy_bytes != bytes_before) die("command probe: copy leak (%zd copies, %lld bytes)", (ssize_t)(g_ncopies - before), (long long)(g_copy_bytes - bytes_before));
 }
 /* TOTK (2026-10-17): a recording copy goes when its control memory is reused for other data (its mark there is gone) or
    unmapped (reading the mark faults), and not otherwise: a copy whose mark is intact, or one recorded without room for a
@@ -2234,7 +2361,8 @@ void dm_nvn_probe_texture_pins(void) {
 /* Compare the complete production recording and allocator accounting against
    the original per-record copier, including growth, nesting and source reuse. */
 void dm_nvn_probe_inline_bulk(void) {
-    int saved = atomic_load(&g_inline_bulk_on); unsigned checks = 0;
+    int saved = atomic_load(&g_inline_bulk_on), saved_ref = call_ref_on(); unsigned checks = 0;
+    g_call_ref = 0;
     const unsigned lengths[] = {0, 1, 7, 3000};
     size_t copies_before = g_ncopies; uint64_t bytes_before = g_copy_bytes;
     for (unsigned scenario = 0; scenario < sizeof lengths / sizeof *lengths; scenario++) {
@@ -2274,17 +2402,101 @@ void dm_nvn_probe_inline_bulk(void) {
         NVNcommandHandle nested = h_nvnCommandBufferEndRecording(&cb[3]);
         h_nvnCommandBufferAddControlMemory(&cb[0], control[0], sizeof control[0]);
         h_nvnCommandBufferAddControlMemory(&cb[2], control[2], sizeof control[2]);
-        // source and intermediate fast handle are gone; nested bytes must survive.
-        copy_ready(copy_of(reference)); size_t full_size = copy_of(reference)->body_bytes + 16;
-        if (memcmp((const void *)(uintptr_t)reference, (const void *)(uintptr_t)nested, full_size)) die("inline bulk probe: nested copy changed after source retirement"); checks++;
+        // source and intermediate fast handle are gone; nested bytes must survive. The nested copy is BEGIN, the piece
+        // marker naming fast (32 bytes), then fast's body: the same bytes as reference's body.
+        probe_settle();
+        copy_ready(copy_of(reference)); size_t body_size = copy_of(reference)->body_bytes;
+        if (memcmp((const uint8_t *)(uintptr_t)reference + 8, (const uint8_t *)(uintptr_t)nested + 8 + 32, body_size)) die("inline bulk probe: nested copy changed after source retirement"); checks++;
         for (unsigned i = 0; i < 4; i++) {
             h_nvnCommandBufferAddControlMemory(&cb[i], control[i], sizeof control[i]);
             h_nvnCommandBufferFinalize(&cb[i]);
         }
     }
-    if (g_ncopies != copies_before || g_copy_bytes != bytes_before) die("inline bulk probe: copy leak"); checks++;
-    g_inline_bulk_negative = 0; atomic_store(&g_inline_bulk_on, saved);
+    probe_settle();
+    if (g_ncopies != copies_before || g_copy_bytes != bytes_before) die("inline bulk probe: copy leak (%zd copies, %lld bytes)", (ssize_t)(g_ncopies - copies_before), (long long)(g_copy_bytes - bytes_before)); checks++;
+    g_inline_bulk_negative = 0; atomic_store(&g_inline_bulk_on, saved); g_call_ref = saved_ref;
     LOG("inline bulk probe: %u byte/accounting/growth/nesting/lifetime checks passed", checks);
+}
+/* CallCommands by reference: the caller holds an OP_CALL naming the copy; a copy the game releases while called stays
+   readable until its last caller is freed; a body with deferred binds is copied; a copy of a caller (CopyCommands) holds
+   the callee too; nothing leaks. TOTK_PROBE_NEGATIVE=23: holds are not taken, and the released callee must be found freed. */
+static void resolve_deferred(const uint8_t *p, int depth, uint64_t sub);
+void dm_nvn_probe_call_ref(void) {
+#if defined(GAME_BOTW) || defined(GAME_NS2)
+    LOG("call reference probe: not used by this game");
+#else
+    int saved = call_ref_on(), negative = getenv("TOTK_PROBE_NEGATIVE") && atoi(getenv("TOTK_PROBE_NEGATIVE")) == 23; unsigned checks = 0;
+    call_ref_sizes(); uint32_t saved_min = g_call_ref_min, saved_defer_min = g_call_ref_defer_min;
+    g_call_ref = 1; g_call_ref_min = 0; g_call_ref_defer_min = UINT32_MAX;   /* every call by reference, except of a recording with deferred binds */
+    size_t copies_before = g_ncopies; uint64_t bytes_before = g_copy_bytes;
+    typedef void (*bind_fn)(NVNcommandBuffer *, NVNshaderStage, int, int, const NVNtextureHandle *);
+    bind_fn deferred = (bind_fn)nvn_lookup("nvnCommandBufferBindTexturesDeferred");
+    if (!deferred) die("call reference probe: nvnCommandBufferBindTexturesDeferred not exported");
+    NVNcommandBuffer cb[4]; uint8_t control[4][256] = {{0}}, commands[4096] = {0};
+    pool_t pool = {.mem = commands};
+    for (unsigned i = 0; i < 4; i++) {
+        h_nvnCommandBufferInitialize(&cb[i], NULL);
+        h_nvnCommandBufferAddControlMemory(&cb[i], control[i], sizeof control[i]);
+        h_nvnCommandBufferAddCommandMemory(&cb[i], (NVNmemoryPool *)&pool, 0, sizeof commands);
+    }
+    h_nvnCommandBufferBeginRecording(&cb[0]);
+    h_nvnCommandBufferSetScissor(&cb[0], 1, 2, 3, 4);
+    NVNcommandHandle leaf = h_nvnCommandBufferEndRecording(&cb[0]);
+    NVNtextureHandle table[1] = {0x10200001};
+    h_nvnCommandBufferBeginRecording(&cb[1]);
+    deferred(&cb[1], NVN_SHADER_STAGE_FRAGMENT, 0, 1, table);
+    NVNcommandHandle with_defer = h_nvnCommandBufferEndRecording(&cb[1]);
+    h_nvnCommandBufferBeginRecording(&cb[2]);
+    if (negative) g_call_ref = 0;
+    h_nvnCommandBufferCallCommands(&cb[2], 1, &leaf);
+    if (negative) { g_call_ref = 1; uint8_t *r = cmd_alloc(CB(&cb[2]), 16); put_hdr(r, OP_CALL, 16); uint64_t t = (uint64_t)leaf; memcpy(r + 8, &t, 8); }
+    h_nvnCommandBufferCallCommands(&cb[2], 1, &with_defer);
+    NVNcommandHandle caller = h_nvnCommandBufferEndRecording(&cb[2]);
+    unsigned calls = 0, binds = 0;
+    for (const uint8_t *p = (const uint8_t *)(uintptr_t)caller;;) {
+        op_hdr h; memcpy(&h, p, sizeof h); if (h.op == OP_END) break;
+        if (h.op == OP_CALL) { uint64_t t; memcpy(&t, p + 8, 8); if (t != (uint64_t)leaf) die("call reference probe: the call names %#llx, not the called copy", (unsigned long long)t); calls++; }
+        if (h.op == OP_BIND_TEX) binds++;
+        p += h.size;
+    }
+    if (calls != 1 || binds != 1) die("call reference probe: %u calls and %u copied binds in the caller, expected 1 and 1", calls, binds); checks++;
+    /* a copy of the caller calls the leaf as well */
+    h_nvnCommandBufferBeginRecording(&cb[3]);
+    h_nvnCommandBufferCopyCommands(&cb[3], 1, &caller);
+    NVNcommandHandle outer = h_nvnCommandBufferEndRecording(&cb[3]);
+    if (copy_of(leaf)->held != 2u) die("call reference probe: the leaf is held %u times, expected 2", copy_of(leaf)->held); checks++;
+    /* the game releases the leaf, then the caller: the copy of the caller still calls the leaf */
+    h_nvnCommandBufferAddControlMemory(&cb[0], control[0], sizeof control[0]);
+    h_nvnCommandBufferAddControlMemory(&cb[2], control[2], sizeof control[2]);
+    probe_settle();
+    if (g_ncopies != copies_before + 2) die("call reference probe: %zu copies indexed, expected 2", g_ncopies - copies_before); checks++;
+    if (!copy_of(leaf)->dropped || copy_of(leaf)->held != 1) die("call reference probe: the released leaf is not kept for its caller's copy (dropped %u, held %u)", copy_of(leaf)->dropped, copy_of(leaf)->held); checks++;
+    { op_hdr h; memcpy(&h, (const void *)(uintptr_t)leaf, sizeof h); if (h.op != OP_BEGIN) die("call reference probe: the kept leaf's body changed"); } checks++;
+    (void)outer;
+    for (unsigned i = 0; i < 4; i++) { h_nvnCommandBufferAddControlMemory(&cb[i], control[i], sizeof control[i]); h_nvnCommandBufferFinalize(&cb[i]); }
+    probe_settle();
+    if (g_ncopies != copies_before || g_copy_bytes != bytes_before) die("call reference probe: copy leak (%zd copies, %lld bytes)", (ssize_t)(g_ncopies - copies_before), (long long)(g_copy_bytes - bytes_before)); checks++;
+    /* a recording with deferred binds called by reference: the submit reads the game's table into the called copy */
+    g_call_ref_defer_min = 0;
+    for (unsigned i = 0; i < 2; i++) { h_nvnCommandBufferInitialize(&cb[i], NULL); h_nvnCommandBufferAddControlMemory(&cb[i], control[i], sizeof control[i]); h_nvnCommandBufferAddCommandMemory(&cb[i], (NVNmemoryPool *)&pool, 0, sizeof commands); }
+    table[0] = 0x10200001;
+    h_nvnCommandBufferBeginRecording(&cb[0]); deferred(&cb[0], NVN_SHADER_STAGE_FRAGMENT, 0, 1, table); NVNcommandHandle dleaf = h_nvnCommandBufferEndRecording(&cb[0]);
+    h_nvnCommandBufferBeginRecording(&cb[1]); h_nvnCommandBufferCallCommands(&cb[1], 1, &dleaf); NVNcommandHandle dcaller = h_nvnCommandBufferEndRecording(&cb[1]);
+    copy_ready(copy_of(dcaller));
+    if (copy_of(dcaller)->ncall != 1 || copy_of(dcaller)->ndefer != 1) die("call reference probe: the caller of a deferred recording has %u calls and %u deferred binds, expected 1 and 1", copy_of(dcaller)->ncall, copy_of(dcaller)->ndefer); checks++;
+    table[0] = 0x10200021;
+    resolve_deferred((const uint8_t *)(uintptr_t)dcaller, 0, 0);
+    { const uint8_t *p = (const uint8_t *)(uintptr_t)dleaf; unsigned seen = 0;
+      for (;;) { op_hdr h; memcpy(&h, p, sizeof h); if (h.op == OP_END) break;
+          if (h.op == OP_BIND_TEX) { const p_bind_handles *b = (const p_bind_handles *)(p + 8); if (b->h[0] != 0x10200021) die("call reference probe: the called copy's deferred bind kept %#llx", (unsigned long long)b->h[0]); seen++; }
+          p += h.size; }
+      if (seen != 1) die("call reference probe: %u deferred binds in the called copy, expected 1", seen); } checks++;
+    for (unsigned i = 0; i < 2; i++) { h_nvnCommandBufferAddControlMemory(&cb[i], control[i], sizeof control[i]); h_nvnCommandBufferFinalize(&cb[i]); }
+    probe_settle();
+    if (g_ncopies != copies_before || g_copy_bytes != bytes_before) die("call reference probe: copy leak after the deferred case"); checks++;
+    g_call_ref = saved; g_call_ref_min = saved_min; g_call_ref_defer_min = saved_defer_min;
+    LOG("call reference probe: %u reference/deferred-bind/nesting/lifetime/leak checks passed", checks);
+#endif
 }
 NVN(nvnCommandBufferSetDepthRange, void, NVNcommandBuffer *c, float n, float f) { *REC(c, OP_DEPTH_RANGE, p_depth_range) = (p_depth_range){n, f}; }
 // TOTK: the replay keeps one scissor / depth range (index 0); other indices only matter to shaders that
@@ -2449,17 +2661,37 @@ void nvn_bind_handles_deferred(NVNcommandBuffer *c, int op, int st, int first, i
     if (hw_bytes && n >= 0 && n <= 32) hw_fix(CB(c), hw_bytes);
 }
 static _Atomic int g_def_on = -1;                   // TOTK_DEFERRED_BINDS=0 / runtime flag "deferred 0": keep the record-time handles (A/B)
-static uint64_t g_def_n, g_def_changed, g_def_logged, g_def_ns;
+static uint64_t g_def_n, g_def_changed, g_def_logged, g_def_ns, g_def_waits, g_def_wait_ns, g_def_gaveup;
 void nvn_set_deferred_binds(int on) { atomic_store(&g_def_on, on); LOG("[flag] deferred = %d", on); }
-static void resolve_one(p_bind_handles *b);
-static void resolve_deferred(const uint8_t *p, int depth) {   // read the handles of every deferred bind in a submitted recording
+static int resolve_one(p_bind_handles *b, int write);
+/* A copy called by reference (call_ref) is one body for every recording that calls it, and the submit writes the
+   handles it reads into that body. When they changed while an earlier submission reading the copy is not replayed yet,
+   the write waits for that replay, as a copy per caller would have kept the earlier handles for it. A queue item parked
+   at a cross-queue wait may wait for a later submit: after 50 ms the write goes ahead (counted). */
+static void resolve_shared_wait(copy_prefix *c, uint64_t sub) {
+    if (!sub || !c->res_sub || c->res_sub == sub || c->res_sub <= xsub_replayed()) return;
+    uint64_t t0 = now_ns(); g_def_waits++;
+    while (c->res_sub > xsub_replayed()) { if (now_ns() - t0 > 50000000ull) { g_def_gaveup++; break; } sched_yield(); }
+    g_def_wait_ns += now_ns() - t0;
+}
+/* sub: this submission's number among the translation thread's submissions (0: none is queued) */
+static void resolve_deferred(const uint8_t *p, int depth, uint64_t sub) {   // read the handles of every deferred bind in a submitted recording
     uint32_t nx; const uint32_t *ix = nvn_copy_op_index((uint64_t)(uintptr_t)p, &nx);
     if (ix) {   /* a copy made by EndRecording: only the indexed ops */
+        copy_prefix *self = depth ? copy_of((NVNcommandHandle)(uintptr_t)p) : NULL; int waited = 0;
         for (uint32_t i = 0; i < nx; i++) {
             const uint8_t *q = p + ix[i]; op_hdr h; memcpy(&h, q, sizeof h);
-            if (h.op == OP_CALL) { uint64_t t; memcpy(&t, q + 8, 8); if (depth >= 16) die("deferred bind resolution: call depth over 16"); resolve_deferred((const uint8_t *)(uintptr_t)t, depth + 1); }
-            else if (h.op == OP_BIND_TEX || h.op == OP_BIND_IMG || h.op == OP_BIND_SAMP) resolve_one((p_bind_handles *)(uintptr_t)(q + 8));
+            if (h.op == OP_CALL) { uint64_t t; memcpy(&t, q + 8, 8); if (depth >= 16) die("deferred bind resolution: call depth over 16");
+                /* ndefer counts the deferred binds of the copies it calls as well */
+                const copy_prefix *tc = copy_of((NVNcommandHandle)t); if (atomic_load_explicit(&tc->walk, memory_order_acquire) == 2 && !tc->ndefer) continue;
+                resolve_deferred((const uint8_t *)(uintptr_t)t, depth + 1, sub); }
+            else if (h.op == OP_BIND_TEX || h.op == OP_BIND_IMG || h.op == OP_BIND_SAMP) {
+                p_bind_handles *b = (p_bind_handles *)(uintptr_t)(q + 8);
+                if (self && !waited && resolve_one(b, 0)) { resolve_shared_wait(self, sub); waited = 1; }
+                resolve_one(b, 1);
+            }
         }
+        if (self && sub) self->res_sub = sub;
         return;
     }
     for (;;) {
@@ -2467,19 +2699,23 @@ static void resolve_deferred(const uint8_t *p, int depth) {   // read the handle
         if (h.size < 8 || (h.size & 7) || h.op >= OP_COUNT_) die("corrupt recording at %p while resolving deferred binds (op %u size %u)", (const void *)p, h.op, h.size);
         if (h.op == OP_END) return;
         if (h.op == OP_JUMP) { memcpy(&p, p + 8, 8); continue; }
-        if (h.op == OP_CALL) { uint64_t t; memcpy(&t, p + 8, 8); if (depth >= 16) die("deferred bind resolution: call depth over 16"); resolve_deferred((const uint8_t *)(uintptr_t)t, depth + 1); }
-        else if (h.op == OP_BIND_TEX || h.op == OP_BIND_IMG || h.op == OP_BIND_SAMP) resolve_one((p_bind_handles *)(uintptr_t)(p + 8));
+        if (h.op == OP_CALL) { uint64_t t; memcpy(&t, p + 8, 8); if (depth >= 16) die("deferred bind resolution: call depth over 16"); resolve_deferred((const uint8_t *)(uintptr_t)t, depth + 1, sub); }
+        else if (h.op == OP_BIND_TEX || h.op == OP_BIND_IMG || h.op == OP_BIND_SAMP) resolve_one((p_bind_handles *)(uintptr_t)(p + 8), 1);
         p += h.size;
     }
 }
-static void resolve_one(p_bind_handles *b) {
+/* write 0: only whether the game's table holds other handles now (1) */
+static int resolve_one(p_bind_handles *b, int write) {
     if (b->src && b->n > 0 && b->n <= 32) {
-        uint64_t cur[32]; memcpy(cur, (const void *)(uintptr_t)b->src, 8 * (size_t)b->n); g_def_n++;
+        uint64_t cur[32]; memcpy(cur, (const void *)(uintptr_t)b->src, 8 * (size_t)b->n);
+        if (!write) return memcmp(cur, b->h, 8 * (size_t)b->n) != 0;
+        g_def_n++;
         if (memcmp(cur, b->h, 8 * (size_t)b->n)) {
             if (g_def_logged++ < 6) LOG("[nvn] 延迟绑定在提交时读到新句柄：阶段 %d 槽 %d 起，录制时 %#llx → 提交时 %#llx | deferred bind read a new handle at submit: stage %d from slot %d, recorded %#llx -> submitted %#llx", b->stage, b->first, (unsigned long long)b->h[0], (unsigned long long)cur[0], b->stage, b->first, (unsigned long long)b->h[0], (unsigned long long)cur[0]);
             g_def_changed++; memcpy(b->h, cur, 8 * (size_t)b->n);
         }
     }
+    return 0;
 }
 // 图像（可写贴图）：句柄 = 贴图池号（GetImageHandle 原样返回；游戏不调 RegisterImage，图像与贴图共用登记）
 // Image (writable texture): handle = texture pool index (GetImageHandle returns it as-is; the game does not call RegisterImage, images and textures share registration)
@@ -2528,7 +2764,7 @@ void dm_nvn_probe_deferred_binds(void) {
     int negative = getenv("TOTK_PROBE_NEGATIVE") && atoi(getenv("TOTK_PROBE_NEGATIVE")) == 1;   /* other numbers are later checks of probe-gfx */
     for (unsigned k = 0; k < 2; k++) {
         const uint8_t *p = (const uint8_t *)(uintptr_t)(k ? hc : hd);
-        if (!negative) resolve_deferred(p, 0);
+        if (!negative) resolve_deferred(p, 0, 0);
         unsigned seen = 0;
         for (;;) {
             op_hdr h; memcpy(&h, p, sizeof h);
@@ -3117,10 +3353,12 @@ NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h)
     if (atomic_load(&g_def_on) < 0) { const char *e = getenv("TOTK_DEFERRED_BINDS"); atomic_store(&g_def_on, !(e && !strcmp(e, "0"))); LOG("[nvn] 延迟绑定：%s", atomic_load(&g_def_on) ? "提交时读句柄" : "录制时读句柄（TOTK_DEFERRED_BINDS=0，旧行为）"); }
     if (atomic_load(&g_def_on)) {
         uint64_t r0 = now_ns();
-        for (int i = 0; i < n; i++) resolve_deferred((const uint8_t *)h[i], 0);
+        uint64_t sub = async_replay() || qo_replay_async() ? xsub_pushed() + 1 : 0;
+        for (int i = 0; i < n; i++) resolve_deferred((const uint8_t *)h[i], 0, sub);
         if (n > 0 && copy_of(h[n - 1])->magic == COPY_MAGIC) __atomic_store_n(&g_root_cb, copy_of(h[n - 1])->cb, __ATOMIC_RELAXED);
         g_def_ns += now_ns() - r0;
-        if (((queue_t *)q)->submits % 600 == 0) LOG("[nvn] 延迟绑定 至提交 %llu：提交时读句柄 %llu 次，其中与录制时不同 %llu 次；每次提交读句柄平均 %.3f ms", (unsigned long long)((queue_t *)q)->submits, (unsigned long long)g_def_n, (unsigned long long)g_def_changed, g_def_ns / 1e6 / (double)((queue_t *)q)->submits);
+        if (((queue_t *)q)->submits % 600 == 0) { LOG("[nvn] 延迟绑定 至提交 %llu：提交时读句柄 %llu 次，其中与录制时不同 %llu 次；每次提交读句柄平均 %.3f ms", (unsigned long long)((queue_t *)q)->submits, (unsigned long long)g_def_n, (unsigned long long)g_def_changed, g_def_ns / 1e6 / (double)((queue_t *)q)->submits);
+            LOG("[nvn] deferred binds in copies called by reference: %llu waits for an earlier submission's replay (%.2f ms in all), %llu gave up after 50 ms", (unsigned long long)g_def_waits, g_def_wait_ns / 1e6, (unsigned long long)g_def_gaveup); }
     }
     gfx_enter();
     if (async_replay()) {
