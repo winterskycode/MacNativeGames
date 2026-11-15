@@ -281,14 +281,23 @@ static uint64_t alias_map(int unmap,uint64_t addr,uint64_t size){
      first touch after the re-map) was most of the game threads' kernel time during streaming (Zora Domain profile,
      2026-11-01: 15.7% of all CPU in one kernel path, with bursts of 60-140 ms frames). The pool accounting is unchanged. */
   static int decommit=-1;if(decommit<0){const char *e=getenv("TOTK_ALIAS_DECOMMIT");decommit=!e||atoi(e)!=0;}
-  if(decommit)for(uint64_t page=low;page<high;page+=0x4000){unsigned p=(unsigned)((page-start)/4096);if(!alias_pages[p]&&!alias_pages[p+1]&&!alias_pages[p+2]&&!alias_pages[p+3]){
+  /* contiguous free pages are given back as one range: a page at a time made three system calls a 16 KB page, and a large
+     unmap held the thread's virtual core for tens of milliseconds while better threads waited for it */
+  uint64_t run=0,run_end=0;
+  for(uint64_t page=low;page<=high;page+=0x4000){
+   int free_page=0;unsigned p=(unsigned)((page-start)/4096);
+   if(decommit&&page<high&&!alias_pages[p]&&!alias_pages[p+1]&&!alias_pages[p+2]&&!alias_pages[p+3]){free_page=1;memset(alias_stale+p,0,4);}
+   if(free_page&&run_end==page){run_end=page+0x4000;continue;}
+   if(run_end>run){
 #ifdef __ANDROID__
-   /* memfd-backed guest memory (compat/mach_compat.c): punch the page out of the file, so later aliases still share it */
-   if(compat_decommit((void *)page,0x4000))runtime_fail("decommit physical alias page");
+    /* memfd-backed guest memory (compat/mach_compat.c): punch the pages out of the file, so later aliases still share it */
+    if(compat_decommit((void *)run,run_end-run))runtime_fail("decommit physical alias page");
 #else
-   if(mmap((void *)page,0x4000,PROT_NONE,MAP_FIXED|MAP_PRIVATE|MAP_ANON,-1,0)!=(void *)page)runtime_fail("decommit physical alias page");
+    if(mmap((void *)run,run_end-run,PROT_NONE,MAP_FIXED|MAP_PRIVATE|MAP_ANON,-1,0)!=(void *)run)runtime_fail("decommit physical alias page");
 #endif
-   memset(alias_stale+p,0,4);}}
+   }
+   run=run_end=free_page?page:0;if(free_page)run_end=page+0x4000;
+  }
  }else if(fresh){
   uint64_t low=addr&~0x3fffULL,high=(addr+size+0x3fff)&~0x3fffULL;
   if(mprotect((void *)low,high-low,PROT_READ|PROT_WRITE))runtime_fail("commit physical alias pages");

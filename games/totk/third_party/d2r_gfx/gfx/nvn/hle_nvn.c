@@ -267,7 +267,12 @@ static int cmdlog_env(void) { static int on = -1; if (on < 0) on = getenv("TOTK_
 static int chainlog_env(void) { static int on = -1; if (on < 0) on = getenv("TOTK_CHAIN_LOG") != NULL; return on; }   // once: EndRecording runs per command buffer
 static int poollog_env(void) { static int on = -1; if (on < 0) on = getenv("TOTK_POOL_LOG") != NULL; return on; }
 static void guest_chain(const char *what);
+/* A pool's set-up (the zero-copy remap, its GPU memory, the pool and dirty-range indexes) is host work of milliseconds:
+   done without the virtual core, as texel copies are, so a better thread pinned to that core is not kept waiting
+   behind it (AYN Thor: most of the waits behind a lower-priority owner). TOTK_POOL_AWAY=0 keeps the core. */
+static int pool_away_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("TOTK_POOL_AWAY"); on = !(e && !strcmp(e, "0")); } return on; }
 NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBuilder *b) {
+    __attribute__((cleanup(runtime_core_back))) int away = pool_away_on() ? runtime_core_away() : 0;
     const pool_builder_t *s = (const pool_builder_t *)b; pool_t *o = (pool_t *)p;
     memset(o, 0, sizeof *o);
     o->magic = MAGIC('P', 'O', 'O', 'L'); o->flags = s->flags; o->mem = s->mem; o->size = s->size;
