@@ -1030,7 +1030,51 @@ static void cb_check(const cmd_t *o, const char *where) {
 NVN(nvnCommandBufferInitialize, NVNboolean, NVNcommandBuffer *c, NVNdevice *d) {
     memset(c, 0, sizeof(cmd_t)); CB(c)->magic = MAGIC('C', 'M', 'D', 'B'); CB(c)->dev = d; CB(c)->inline_cur = ~0ull; CB(c)->inline_end = 0; return 1;
 }
-NVN(nvnCommandBufferFinalize, void, NVNcommandBuffer *c) { free(CB(c)->seg); CB(c)->seg = CB(c)->cur = CB(c)->end = NULL; CB(c)->magic = 0; }
+/* Recording buffers of finalized command buffers, kept for the next ones. Tears of the Kingdom initializes and finalizes
+   about 67 command buffers a frame, each recording once: every buffer started at 64 KiB and grew by realloc (a copy of
+   what it held, into fresh pages) to its recording's size, five times a frame for a 1 MiB recording. A buffer takes the
+   smallest kept one that holds what the same command buffer object recorded last (seg_hint), else the largest.
+   TOTK_SEG_POOL=0: none kept. */
+#define SEG_POOL 48
+#define SEG_POOL_BYTES (96ull << 20)
+static struct { uint8_t *p; size_t cap; } g_seg_pool[SEG_POOL]; static unsigned g_seg_n; static size_t g_seg_bytes;
+static uint64_t g_seg_takes, g_seg_new, g_seg_grows, g_seg_puts, g_seg_dropped;
+static pthread_mutex_t g_seg_mu = PTHREAD_MUTEX_INITIALIZER;
+/* what each command buffer object (by address) last recorded, as a buffer size */
+#define SEG_HINTS 1024
+static struct { uintptr_t at; size_t cap; } g_seg_hint[SEG_HINTS];
+static int seg_pool_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_SEG_POOL"); v = !(e && !strcmp(e, "0")); } return v; }
+static size_t seg_hint(uintptr_t at) { size_t k = (size_t)((at >> 4) * 0x9E3779B97F4A7C15ull >> 54) & (SEG_HINTS - 1); return g_seg_hint[k].at == at ? g_seg_hint[k].cap : 0; }
+static uint8_t *seg_take(uintptr_t at, size_t *cap) {
+    if (!seg_pool_on()) return NULL;
+    pthread_mutex_lock(&g_seg_mu);
+    size_t want = seg_hint(at); int best = -1;
+    for (unsigned i = 0; i < g_seg_n; i++) {
+        size_t c = g_seg_pool[i].cap;
+        if (best < 0) { best = (int)i; continue; }
+        size_t b = g_seg_pool[best].cap;
+        if (want ? (c >= want && (b < want || c < b)) || (b < want && c > b) : c > b) best = (int)i;
+    }
+    uint8_t *p = NULL;
+    if (best >= 0) { p = g_seg_pool[best].p; *cap = g_seg_pool[best].cap; g_seg_bytes -= *cap; g_seg_pool[best] = g_seg_pool[--g_seg_n]; g_seg_takes++; }
+    else g_seg_new++;
+    pthread_mutex_unlock(&g_seg_mu);
+    return p;
+}
+static void seg_put(uintptr_t at, uint8_t *p, size_t cap, size_t used) {   /* used: what its last recording took */
+    if (!p) return;
+    if (!seg_pool_on()) { free(p); return; }
+    pthread_mutex_lock(&g_seg_mu);
+    size_t k = (size_t)((at >> 4) * 0x9E3779B97F4A7C15ull >> 54) & (SEG_HINTS - 1); g_seg_hint[k].at = at; g_seg_hint[k].cap = used + OP_RESERVE;
+    if (g_seg_n < SEG_POOL && g_seg_bytes + cap <= SEG_POOL_BYTES) { g_seg_pool[g_seg_n].p = p; g_seg_pool[g_seg_n].cap = cap; g_seg_n++; g_seg_bytes += cap; p = NULL; g_seg_puts++; }
+    else g_seg_dropped++;
+    if ((g_seg_puts + g_seg_dropped) % 20000 == 0)
+        LOG("[nvn] recording buffers: %llu taken from the kept ones, %llu new, %llu grown while recording, %llu kept, %llu freed; %u kept now (%.1f MiB)",
+            (unsigned long long)g_seg_takes, (unsigned long long)g_seg_new, (unsigned long long)g_seg_grows, (unsigned long long)g_seg_puts, (unsigned long long)g_seg_dropped, g_seg_n, g_seg_bytes / 1048576.0);
+    pthread_mutex_unlock(&g_seg_mu);
+    free(p);
+}
+NVN(nvnCommandBufferFinalize, void, NVNcommandBuffer *c) { seg_put((uintptr_t)c, CB(c)->seg, (size_t)(CB(c)->end - CB(c)->seg), (size_t)(CB(c)->cur - CB(c)->seg)); CB(c)->seg = CB(c)->cur = CB(c)->end = NULL; CB(c)->magic = 0; }
 /* TOTK_CTL_LOG (diagnostic): memory callbacks, control memory additions, and the first recording of each command buffer
    past the control memory it was given (how a game sizes and refills its control memory; Pokemon Pokopia, 2026-11-03) */
 static int ctl_log_left(void) { static int on = -1; static _Atomic int left = 200; if (on < 0) on = getenv("TOTK_CTL_LOG") != NULL; return on && atomic_fetch_sub(&left, 1) > 0; }
@@ -1057,17 +1101,24 @@ static void cs_dump(void) {   // 每帧调一次（出图处） | Called once pe
     int on = g_cs.on; memset(&g_cs, 0, sizeof g_cs); g_cs.on = on; g_cs.frame0 = f; pthread_mutex_unlock(&g_cs_mu);
 }
 static __thread uint32_t t_rec_hist[OP_COUNT_]; static __thread uint32_t t_rec_n;
-static void put_hdr(uint8_t *p, uint32_t op, uint32_t size) { op_hdr h = {op, size}; memcpy(p, &h, sizeof h); if (op) { cs_op(op, size); if (op < OP_COUNT_) t_rec_hist[op]++; } }
+static int reclog_limit(void);
+/* t_rec_hist only for DM_NVN_RECLOG: a thread-local access is a call into the linker here, once per record */
+static inline void put_hdr(uint8_t *p, uint32_t op, uint32_t size) { op_hdr h = {op, size}; memcpy(p, &h, sizeof h); if (op) { cs_op(op, size); if (op < OP_COUNT_ && reclog_limit()) t_rec_hist[op]++; } }
 // TOTK: records are written into a growable host buffer per command buffer, never into game command memory.
 // Games hand the same command memory to several command buffers recording concurrently (budgeted for real NVN
 // encodings); our records are larger and would overwrite each other there. The game's memory is accounted only.
-static void cmd_reserve(cmd_t *o, size_t need) {
-    if (o->seg && o->cur + need + OP_RESERVE <= o->end) return;
+static __attribute__((noinline)) void cmd_reserve_slow(cmd_t *o, size_t need) {
+    if (!o->seg) { size_t kept = 0; uint8_t *b = seg_take((uintptr_t)o, &kept); if (b) { o->seg = o->cur = b; o->end = b + kept; if (o->cur + need + OP_RESERVE <= o->end) return; } }
     size_t used = o->seg ? (size_t)(o->cur - o->seg) : 0;
     size_t cap = o->seg ? (size_t)(o->end - o->seg) : 0; if (!cap) cap = 64 << 10;
+    if (o->seg) __atomic_fetch_add(&g_seg_grows, 1, __ATOMIC_RELAXED);
     while (used + need + OP_RESERVE > cap) cap *= 2;
     uint8_t *b = realloc(o->seg, cap); if (!b) die("command recording buffer allocation (%zu bytes)", cap);
     o->seg = b; o->cur = b + used; o->end = b + cap;
+}
+static inline void cmd_reserve(cmd_t *o, size_t need) {
+    if (__builtin_expect(o->seg && o->cur + need + OP_RESERVE <= o->end, 1)) return;
+    cmd_reserve_slow(o, need);
 }
 
 // TOTK diagnostics: guest return chain of the current NVN call (frames link through runtime_hle_switch).
@@ -1133,7 +1184,7 @@ NVN(nvnCommandBufferGetMemoryCallback, PFNNVNCOMMANDBUFFERMEMORYCALLBACKPROC, co
 NVN_NOPROTO(nvnCommandBufferGetMemoryCallbackData, void *, const NVNcommandBuffer *c) { return ((const cmd_t *)c)->cb_data; }
 // 取一条记录的空间；不够则按 NVN 约定回调游戏补命令内存
 // Get space for one record; if not enough, call back into the game per the NVN convention to add command memory
-static uint8_t *cmd_alloc(cmd_t *o, uint32_t size) {
+static inline __attribute__((always_inline)) uint8_t *cmd_alloc(cmd_t *o, uint32_t size) {
 #ifdef GAME_BOTW
     cb_check(o, "record");
 #endif
