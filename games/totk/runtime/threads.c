@@ -93,6 +93,7 @@ typedef struct thr {
     int cqueued;                  // in g_core_wait: queued by core_take, or by wake_queue / totk_wake_queue the moment it was woken
     int spin_short;   /* the last wait ended within the spin window: spin again before sleeping (sync_spin); last, the layout before it is shared */
     _Atomic int spinning;   /* in sync_spin's loop (set and cleared under G): a wake needs no futex wake, the spinner sees the flag */
+    int free_logged;   /* TOTK_FREE_PRIO: said once that it runs without a virtual core */
 } thr_t;
 static thr_t *g_all;
 
@@ -345,6 +346,17 @@ static uint64_t g_core_wait_all_ns, g_core_wait_all_n;   // all guest threads' w
 static int g_cores_on = -1;
 static int cores_enabled(void) { if (g_cores_on < 0) g_cores_on = getenv("TOTK_FREE_CORES") ? 0 : 1; return g_cores_on; }
 static int core_allowed(const thr_t *t, int c) { return (int)((t->mask >> c) & 1); }
+/* TOTK_FREE_PRIO=<n> (experiment, default 0 = off): guest threads of priority value n or more (the lower-priority ones)
+   run without a virtual core, while the main thread and the job workers (priority 44, two of them per core, which keep
+   per-core NVN command memory and allocators) stay on the three. The loaders and background threads at 50-58 waited
+   0.4-0.7 s every 10 s for their cores. What breaks if one of them uses per-core data is what this tests. */
+static int g_free_prio = -1;
+static int core_exempt(thr_t *t) {
+    if (g_free_prio < 0) { const char *e = getenv("TOTK_FREE_PRIO"); g_free_prio = e ? atoi(e) : 0; if (g_free_prio) fprintf(stderr, "[threads] TOTK_FREE_PRIO=%d: threads of priority %d and above run without a virtual core\n", g_free_prio, g_free_prio); }
+    if (!g_free_prio || t->prio < g_free_prio) return 0;
+    if (!t->free_logged) { t->free_logged = 1; fprintf(stderr, "[threads] thread %#x (priority %d, mask %#llx) runs without a virtual core\n", t->handle, t->prio, (unsigned long long)t->mask); }
+    return 1;
+}
 #ifdef GAME_BOTW
 /* Priority inheritance (Breath of the Wild, botw.md): a thread that owns a guest mutex runs, for the virtual cores, at
    the priority of the best thread blocked on that mutex, as Horizon raises a mutex owner. The owner is read from the
@@ -536,7 +548,7 @@ static void core_unqueue(thr_t *t) {   // holding G: out of the core wait queue,
 static int g_wake_queue_on = -1;   /* TOTK_WAKE_QUEUE=0: a woken thread queues only when it reaches core_take (old) */
 static void wake_queue(thr_t *t) {
     if (g_wake_queue_on < 0) { const char *e = getenv("TOTK_WAKE_QUEUE"); g_wake_queue_on = !(e && !strcmp(e, "0")); fprintf(stderr, "[threads] woken threads compete for a core at once: %s\n", g_wake_queue_on ? "on" : "off (TOTK_WAKE_QUEUE=0)"); }
-    if (!g_wake_queue_on || !cores_enabled() || t->cur_core >= 0 || t->cqueued || !t->started || t->exited) return;
+    if (!g_wake_queue_on || !cores_enabled() || core_exempt(t) || t->cur_core >= 0 || t->cqueued || !t->started || t->exited) return;
     for (int i = 0; i < NCORE; i++) if (core_allowed(t, i) && !g_core_owner[i]) return;   /* a free core: core_take takes it */
     t->cseq = ++g_wseq; t->cnext = g_core_wait; g_core_wait = t; t->cqueued = 1; t->cwait_ns = now_ns();
     if (dm_wait_stats_enabled()) t->core_stats_since = t->cwait_ns;
@@ -800,7 +812,7 @@ static void totk_core_unqueue(thr_t *t) {   // holding G: out of the core wait q
 static int g_wake_queue_on = -1;
 static void totk_wake_queue(thr_t *t) {   // holding G
     if (g_wake_queue_on < 0) { const char *e = getenv("TOTK_WAKE_QUEUE"); g_wake_queue_on = !(e && !strcmp(e, "0")); fprintf(stderr, "[threads] woken threads compete for a core at once: %s\n", g_wake_queue_on ? "on (TOTK_WAKE_QUEUE=0 turns it off)" : "off"); }
-    if (!g_wake_queue_on || !cores_enabled() || t->cur_core >= 0 || t->cqueued || !t->started || t->exited) return;
+    if (!g_wake_queue_on || !cores_enabled() || core_exempt(t) || t->cur_core >= 0 || t->cqueued || !t->started || t->exited) return;
     for (int i = 0; i < NCORE; i++) if (core_allowed(t, i) && !g_core_owner[i]) return;   /* a free core: core_take takes it */
     t->cseq = ++g_wseq; t->cnext = g_core_wait; g_core_wait = t; t->cqueued = 1;
     if (dm_wait_stats_enabled()) t->core_stats_since = now_ns();
@@ -808,7 +820,7 @@ static void totk_wake_queue(thr_t *t) {   // holding G
 }
 #endif
 static void core_take(thr_t *t) {   // holding G; waits until a core in t's mask is handed over
-    if (!cores_enabled() || t->cur_core >= 0) return;
+    if (!cores_enabled() || t->cur_core >= 0 || core_exempt(t)) return;
     if (!(t->mask & ((1u << NCORE) - 1))) die("thread %#x core mask %#llx has no application core", t->handle, (unsigned long long)t->mask);
     int c = t->core >= 0 && t->core < NCORE && core_allowed(t, t->core) && !g_core_owner[t->core] ? t->core : -1;
     for (int i = 0; c < 0 && i < NCORE; i++) if (core_allowed(t, i) && !g_core_owner[i]) c = i;
@@ -1410,7 +1422,7 @@ int svc_thread(int num, uint64_t *regs) {
 #endif
         regs[0] = t ? 0 : R_BAD_HANDLE;pthread_mutex_unlock(&G); return 1;
     }
-    case 0x10: { thr_t *t = cur(); regs[0] = (uint64_t)(uint32_t)(t->cur_core >= 0 ? t->cur_core : t->core); return 1; }   // GetCurrentProcessorNumber
+    case 0x10: { thr_t *t = cur(); regs[0] = (uint64_t)(uint32_t)(t->cur_core >= 0 ? t->cur_core : t->core >= 0 ? t->core : __builtin_ctzll(t->mask & ALL_CORES ? t->mask & ALL_CORES : 1)); return 1; }   /* without a core (TOTK_FREE_CORES, TOTK_FREE_PRIO): its ideal core, else the lowest of its mask; never -2 */   // GetCurrentProcessorNumber
     case 0x25: { g_lock();thr_t *t = h_get((uint32_t)regs[1], O_THREAD); regs[0] = t ? 0 : R_BAD_HANDLE; regs[1] = t ? t->id : 0;pthread_mutex_unlock(&G); return 1; }
 
     case 0x1A: {  // ArbitrateLock(w0 持有者句柄, x1 地址, w2 本线程标签) | ArbitrateLock(w0 owner handle, x1 address, w2 this thread's tag)
