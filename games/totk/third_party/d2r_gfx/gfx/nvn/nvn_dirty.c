@@ -421,3 +421,8 @@ void nvn_dirty_mp_stats(uint64_t *calls, uint64_t *pages, uint64_t *ns) {
     static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb);
     *calls = atomic_load(&g_mp_calls); *pages = atomic_load(&g_mp_pages); *ns = atomic_load(&g_mp_ticks) * tb.numer / tb.denom;
 }
+/* Ocarina of Time's GPU read fences (upstream's nvn_dirty.c) are not part of this version: the statistics the shared
+   summary logs read zero. */
+void nvn_dirty_read_wait_stats(uint64_t *marks, uint64_t *pages, uint64_t *waits, uint64_t *ns, uint64_t *max_ns, uint64_t *timeouts) {
+    *marks = *pages = *waits = *ns = *max_ns = *timeouts = 0;
+}

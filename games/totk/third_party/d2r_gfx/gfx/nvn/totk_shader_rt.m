@@ -13,6 +13,7 @@
 #include <TargetConditionals.h>
 #include "totk_shader_rt.h"
 #include "dmsh_chain.h"
+#include "nvn_blend_zero.h"
 #include "../../host/hle.h"
 #include <CommonCrypto/CommonDigest.h>
 #include <mach-o/dyld.h>
@@ -26,6 +27,7 @@
 #include <dirent.h>
 #include <stdatomic.h>
 #include "totk_shader_seed.h"
+#include "totk_seed_image.h"
 #include "totk_shader_observed.h"
 #include "totk_shader_contrib.h"
 extern void runtime_boot_status(const char *,const char *) __attribute__((weak_import));
@@ -59,6 +61,8 @@ static NSString *g_root, *g_dir;
    shader's .variants lists of both places are joined. nil on the Mac, where the seed is cloned into the cache. */
 static NSString *g_seed_dir;
 static NSSet<NSString *> *g_seed_names;
+static seed_image g_seed_img;   // the seed's per-shader files when it came as an image (<seed>.img.000 ...), opened with g_seed_dir
+static NSString *g_seed_prefix;   // g_seed_dir + "/"
 /* Seed files found broken (an empty or entry-less MSL, 2026-10-30: a translation cut short on 10-26 left a 0-byte
    5e0447ea... in the packaging cache, and the warm-up ended the game on it): read from the cache instead, where the
    translation made again goes. Also every seed name the cache already has a file for (made again in an earlier run). */
@@ -125,6 +129,9 @@ NSString *totk_rt_dir(void) {
             totk_seed_progress = NULL;
             if ([seed[@"overlay"] isKindOfClass:NSArray.class]) {
                 g_seed_dir = source; g_seed_names = [NSSet setWithArray:seed[@"overlay"]];
+                g_seed_prefix = [source stringByAppendingString:@"/"]; seed_image_open(&g_seed_img, source);
+                if (g_seed_img.parts) { uint64_t files = 0; for (int i = 0; i < g_seed_img.parts; i++) files += g_seed_img.p[i].count;
+                    LOG("[shader-seed] 着色器文件在镜像里：%d 份，%llu 个文件（原地读取，不解包）", g_seed_img.parts, (unsigned long long)files); }
                 for (NSString *name in [NSFileManager.defaultManager contentsOfDirectoryAtPath:g_dir error:nil] ?: @[])   // made again before: the cache's
                     if ([name hasSuffix:@"_b.metal"] && [g_seed_names containsObject:name]) {
                         seed_mark_broken(name); seed_mark_broken([[name substringToIndex:name.length - 6] stringByAppendingString:@".json"]);
@@ -280,6 +287,29 @@ NSString *totk_rt_file(NSString *name) {
     return g_seed_dir && [g_seed_names containsObject:name] && !seed_broken(name) ? [g_seed_dir stringByAppendingPathComponent:name]
                                                              : [dir stringByAppendingPathComponent:name];
 }
+/* A seed file in the image, by its path under the seed folder (what totk_rt_file gave): nil when it is not there. */
+static NSData *seed_image_file(NSString *path) {
+    if (!g_seed_img.parts || ![path hasPrefix:g_seed_prefix]) return nil;
+    NSString *name = [path substringFromIndex:g_seed_prefix.length];
+    return [name containsString:@"/"] ? nil : seed_image_data(&g_seed_img, name);
+}
+NSData *totk_rt_read(NSString *path) {
+    if (!path) return nil;
+    NSData *d = seed_image_file(path);
+    return d ?: [NSData dataWithContentsOfFile:path];
+}
+int totk_rt_exists(NSString *path) {
+    if (!path) return 0;
+    if (g_seed_img.parts && [path hasPrefix:g_seed_prefix]) {
+        const seed_image_part *p; const seed_image_ent *x; NSString *name = [path substringFromIndex:g_seed_prefix.length];
+        if (![name containsString:@"/"] && seed_image_find(&g_seed_img, name, &p, &x)) return 1;
+    }
+    return [NSFileManager.defaultManager fileExistsAtPath:path];
+}
+NSString *totk_rt_text(NSString *path) {
+    NSData *d = totk_rt_read(path);
+    return d ? [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] : nil;
+}
 NSArray<NSString *> *totk_rt_list(void) {
     NSArray<NSString *> *cached = [NSFileManager.defaultManager contentsOfDirectoryAtPath:totk_rt_dir() error:nil] ?: @[];
     if (!g_seed_dir) return [cached sortedArrayUsingSelector:@selector(compare:)];
@@ -289,7 +319,7 @@ NSArray<NSString *> *totk_rt_list(void) {
 static NSString *index_path(NSString *shader) { return [totk_rt_dir() stringByAppendingFormat:@"/%@.variants", shader]; }
 static NSMutableArray *variants_of(NSString *shader);
 static NSArray *variants_file(NSString *path) {
-    NSData *d = [NSData dataWithContentsOfFile:path];
+    NSData *d = totk_rt_read(path);
     NSArray *a = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
     return [a isKindOfClass:[NSArray class]] ? a : @[];
 }
@@ -345,8 +375,7 @@ static NSString *variant_lookup(NSString *shader, NSDictionary *answers) {
         if (!g_msl_checked) g_msl_checked = [NSMutableSet set];
         BOOL checked = [g_msl_checked containsObject:found];
         NSString *msl = checked ? nil :
-            [NSString stringWithContentsOfFile:totk_rt_file([found stringByAppendingString:@"_b.metal"])
-                                             encoding:NSUTF8StringEncoding error:nil];
+            totk_rt_text(totk_rt_file([found stringByAppendingString:@"_b.metal"]));
         /* missing, empty (a translation cut short: 0 bytes, 2026-10-30) or previously un-compilable: translated again */
         if (!checked && (!msl || msl.length < 64 || [msl containsString:@"double "] || [msl containsString:@"unsupported_GLSLstd450"])) {
             [vs removeObjectAtIndex:i];
@@ -360,7 +389,46 @@ static NSString *variant_lookup(NSString *shader, NSDictionary *answers) {
     return nil;
 }
 #include "nvn_ctl.h"
-static NSString *stage_name(int stage) { return stage == 0 ? @"vs" : stage == 1 ? @"ps" : stage == 2 ? @"gs" : stage == 5 ? @"cs" : nil; }   // gs: run as compute (nvn_geometry_rt.inc)
+/* Diagnostic, off unless TOTK_SHADER_DUMP_UNSEEDED names a folder (2026-11-12, Pokopia): a shader the game sets whose key is
+   not among the game's shaders (the seed's game-shader-keys.json, prepare_ns2_seed.py) is written there once, its control
+   section (0xe0 bytes NVN2, 0x880 NVN) as <key>.ctl and its code area as <key>.code, with a line in index.tsv (key, stage,
+   control +0x30 / +0x38 / +0x40 / +0x44, the addresses). Of the 80 such shaders this Mac's Pokopia met in play, 20 have
+   the instructions and c1 of a shader in the game files: what differs is in the control section or the padding, which
+   these bytes show; the other 60 are in no game file. */
+void totk_rt_dump_unseeded(const uint8_t *control, const void *code, uint32_t length, NSString *key) {
+    static NSString *dir; static NSSet<NSString *> *game; static NSMutableSet<NSString *> *done;
+    static dispatch_once_t once; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    dispatch_once(&once, ^{
+        const char *e = getenv("TOTK_SHADER_DUMP_UNSEEDED");
+        if (!e || !*e) return;
+        NSData *data = [NSData dataWithContentsOfFile:[seed_dir() stringByAppendingPathComponent:@"game-shader-keys.json"]];
+        NSDictionary *ident = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+        NSArray *keys = [ident isKindOfClass:NSDictionary.class] ? ident[@"keys"] : nil;
+        if (![keys isKindOfClass:NSArray.class]) { LOG("[shader-dump] no game-shader-keys.json in the seed: nothing is dumped"); return; }
+        if (![NSFileManager.defaultManager createDirectoryAtPath:@(e) withIntermediateDirectories:YES attributes:nil error:nil]) {
+            LOG("[shader-dump] cannot make %s: nothing is dumped", e); return; }
+        game = [NSSet setWithArray:keys]; done = [NSMutableSet set]; dir = @(e);
+        LOG("[shader-dump] shaders outside the game's %lu go to %s", (unsigned long)game.count, e);
+    });
+    if (!dir || !control || !code || !key || [game containsObject:key]) return;
+    pthread_mutex_lock(&mu);
+    BOOL fresh = ![done containsObject:key];
+    if (fresh) [done addObject:key];
+    pthread_mutex_unlock(&mu);
+    if (!fresh) return;
+    size_t clen = nvn2_ctl(control) ? 0xe0 : 0x880;
+    [[NSData dataWithBytes:control length:clen] writeToFile:[dir stringByAppendingFormat:@"/%@.ctl", key] atomically:YES];
+    [[NSData dataWithBytes:code length:length] writeToFile:[dir stringByAppendingFormat:@"/%@.code", key] atomically:YES];
+    uint32_t w[4];   /* control +0x30 (its size), +0x38 (instructions), +0x40 (c1 start), +0x44 (code area) */
+    memcpy(&w[0], control + 0x30, 4); memcpy(&w[1], control + 0x38, 4); memcpy(&w[2], control + 0x40, 4); memcpy(&w[3], control + 0x44, 4);
+    NSString *line = [NSString stringWithFormat:@"%@\t%d\t%#x\t%#x\t%#x\t%#x\t%p\t%p\n", key, ctl_stage(control, code), w[0], w[1], w[2], w[3],
+                      (const void *)control, code];
+    pthread_mutex_lock(&mu);
+    FILE *f = fopen([dir stringByAppendingPathComponent:@"index.tsv"].fileSystemRepresentation, "a");
+    if (f) { fputs(line.UTF8String, f); fclose(f); }
+    pthread_mutex_unlock(&mu);
+}
+static NSString *stage_name(int stage) { return stage == 0 ? @"vs" : stage == 1 ? @"ps" : stage == 2 ? @"gs" : stage == 3 ? @"ts" : stage == 4 ? @"ms" : stage == 5 ? @"cs" : nil; }   // gs: run as compute (nvn_geometry_rt.inc)
 /* The translation request for these answers; the guest code is written to <variant>.code (the translator reads it there).
    code_out: the code is handed back instead, to be written by the job that translates it (rt_job_run): an atomic file
    write on the submit thread took 10-30 ms, 0.42 s of the long frames of a session that met 1,670 new variants. */
@@ -386,6 +454,7 @@ static NSMutableDictionary *variant_request(NSString *shader, int stage, const u
     if (local) rq[@"local"] = local;
     if (nvn2) {
         rq[@"arch"] = @"sm86";
+        if (stage == 3 || stage == 4) rq[@"mesh_ctl"] = hex(control, 0xe0);
         /* Compute lays out its driver constants in c[0] per shader: its push-constant words (+0xa9), its uniform buffer,
            storage buffer and texture entry counts (+0xb1..+0xb3) and its c[0] size (+0xba); the translator maps them
            (InstEmitAmpere.cs AMapC0). Shared memory at +0x64. From seedds/nxnative dmsh_build.py job_for (MIT). */
@@ -401,7 +470,14 @@ static NSMutableDictionary *variant_request(NSString *shader, int stage, const u
        a fragment flag and the Switch tests depth before the shader). Breath of the Wild's shorter sections (the size word
        at +0x20 between 0x7cc and 0x880, as for the key) are not read. Same rule as prepare_shader_seed.py. */
     { uint32_t size; memcpy(&size, control + 0x20, 4);
-      if (!nvn2 && stage == 1 && !(size >= 0x7cc && size < 0x880) && (control[0x718] & 1)) rq[@"early_fragment_tests"] = @YES; }
+      if (!nvn2 && stage == 1 && !(size >= 0x7cc && size < 0x880) && (control[0x718] & 1)) rq[@"early_fragment_tests"] = @YES;
+      /* NVN2 (Switch 2) keeps the flag at control byte +0x5b: the NVN2 driver reads a pixel shader's flags one byte each
+         at +0x58..+0x62, and Ampere's shader header has no such bit. A shader whose header writes depth (word 19 bit 1,
+         +0x4c of the code) is left as it is: tested early, the depth it computes would not be the one tested. From
+         seedds/nxnative dmsh_ampere.early_fragment_tests / dmsh_build.early_fragment_tests (MIT, a888e668), which counted
+         746 of Ocarina of Time's 22,352 pixel shaders; before 2026-11-10 no NVN2 shader here got the attribute. */
+      if (nvn2 && stage == 1 && control[0x5b] && ninst >= 0x50) { uint32_t omap; memcpy(&omap, code + 0x4c, 4); if (!(omap & 2)) rq[@"early_fragment_tests"] = @YES; }
+    }
     /* What decides this translation, kept with it (variant_record) so a seed run of another runtime keeps every translation
        whose request is the same and makes only the others again (seed_verified; user 2026-11-11: "如何让 快速更新 不要这么容易
        失效"): the request as sent, with the code's bytes instead of its file's path. Neither key is sent (request_sent). */
@@ -497,7 +573,7 @@ static void record_miss(NSString *shader, NSDictionary *rq, NSDictionary *answer
    Breath of the Wild, whose every shader translates. A Switch 2 game (GAME_NS2), whose Ampere coverage is still growing,
    and a seed (seed-shaders) name the shader in red instead: no variant is returned, so its draws are skipped
    (nvn_mtl.m prog_get), and it is not asked for again in this run. */
-#ifdef GAME_NS2
+#if defined(GAME_NS2) && !defined(GAME_OOT)
 static int g_rt_fail_soft = 1;
 #else
 static int g_rt_fail_soft;
@@ -505,9 +581,40 @@ static int g_rt_fail_soft;
 static NSMutableSet<NSString *> *g_rt_failed;   // shaders whose translation failed (g_rt_lock)
 void totk_rt_fail_soft(void) { g_rt_fail_soft = 1; }
 static void rt_failed(NSString *shader) { if (!g_rt_failed) g_rt_failed = [NSMutableSet set]; [g_rt_failed addObject:shader]; }   // g_rt_lock held
+#if defined(GAME_OOT)
+/* NVIDIA's "zero times anything is zero" blend (nvn_blend_zero.h): a translated pixel shader of Ocarina of Time gets the
+   guard in its MSL before anything reads it (the libraries are named by the MSL's SHA-256, so the seed, the Metal libraries
+   and the runtime all see the guarded source), and its reflection says so ("blend_zero": nvn_mtl.m binds the word for it).
+   A shader of another shape keeps its MSL and has no word (blend_zero_skipped counts them, logged at the seed's end). */
+static _Atomic uint64_t g_bz_guarded, g_bz_skipped;
+static NSDictionary *blend_zero_guard(NSString *variant, NSDictionary *refl) {
+    NSString *path = [totk_rt_dir() stringByAppendingFormat:@"/%@_b.metal", variant];
+    NSString *msl = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+    int guarded = 0; NSString *out = msl_blend_zero(msl, &guarded);
+    if (!guarded) { if (msl && [msl containsString:@"[[color("]) atomic_fetch_add(&g_bz_skipped, 1); return refl; }
+    if (![out writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil]) die("shader %s: cannot write the blend guard", variant.UTF8String);
+    NSMutableDictionary *r = [refl mutableCopy]; r[@"blend_zero"] = @YES;
+    NSData *jd = [NSJSONSerialization dataWithJSONObject:r options:NSJSONWritingSortedKeys error:nil];
+    if (!jd || ![jd writeToFile:[totk_rt_dir() stringByAppendingFormat:@"/%@_b.json", variant] atomically:YES]) die("shader %s: cannot write its reflection", variant.UTF8String);
+    atomic_fetch_add(&g_bz_guarded, 1);
+    return r;
+}
+void totk_rt_blend_zero_counts(uint64_t *guarded, uint64_t *skipped) { *guarded = atomic_load(&g_bz_guarded); *skipped = atomic_load(&g_bz_skipped); }
+#endif
 /* One request through a translator service; the reflection of the new variant (nil: refused, with g_rt_fail_soft). */
 static NSDictionary *translate(rt_svc *svc, NSDictionary *rq, uint64_t started) {
     NSString *variant = rq[@"variant"]; const char *stage = [rq[@"stage"] UTF8String];
+    // One capture point covers synchronous and background translation alike.
+    // Explicit diagnostics only: ordinary player starts do not collect requests.
+    if (getenv("OOT_SHADER_REQUEST_DUMP")) {
+        NSData *code=[NSData dataWithContentsOfFile:rq[@"code"]];
+        if (!code) die("read shader request evidence %s",[rq[@"code"]UTF8String]);
+        NSMutableDictionary *evidence=[request_sent(rq) mutableCopy];
+        unsigned char digest[32];CC_SHA256(code.bytes,(CC_LONG)code.length,digest);evidence[@"code_sha256"]=hex(digest,32);
+        NSData *request=[NSJSONSerialization dataWithJSONObject:evidence options:NSJSONWritingSortedKeys error:nil];
+        NSString *path=[totk_rt_dir() stringByAppendingFormat:@"/%@.request.json",variant];
+        if(![request writeToFile:path atomically:YES])die("write shader request %s",path.UTF8String);
+    }
     service_start(svc);
     char line[2048];
 #ifdef DEVICE_XLATE
@@ -527,6 +634,9 @@ static NSDictionary *translate(rt_svc *svc, NSDictionary *rq, uint64_t started) 
     NSData *jd = [NSData dataWithContentsOfFile:[totk_rt_dir() stringByAppendingFormat:@"/%@_b.json", variant]];
     NSDictionary *refl = jd ? [NSJSONSerialization JSONObjectWithData:jd options:0 error:nil] : nil;
     if (![refl isKindOfClass:[NSDictionary class]]) die("shader %s: reflection missing", variant.UTF8String);
+#if defined(GAME_OOT)
+    if (!strcmp(stage, "ps")) refl = blend_zero_guard(variant, refl);
+#endif
     return refl;
 }
 /* A translated variant into the shader's index, the counters and the contribution file (g_rt_lock held). */

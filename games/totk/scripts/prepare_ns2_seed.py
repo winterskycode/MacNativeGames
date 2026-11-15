@@ -28,7 +28,8 @@ import sys
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from prepare_shader_seed import CHAIN, shader_key_scope   # noqa: E402
+from prepare_shader_seed import CHAIN, shader_key_scope, record_verified   # noqa: E402
+from ns2_shader_corpus import KEY_RULE, list_key_rule   # noqa: E402  (the key rule the seed's keys are made with; update_runtime.py checks it)
 
 VARIANTS = re.compile(r'^[0-9a-f]{64}\.variants$')
 VARIANT = re.compile(r'^[0-9a-f]{64}-[0-9a-f]{12}$')
@@ -63,6 +64,82 @@ def run(cmd, log, env=None):
         r = subprocess.run([str(c) for c in cmd], stdout=out, stderr=subprocess.STDOUT, env=env)
     if r.returncode:
         raise SystemExit(f'{Path(str(cmd[0])).name} failed ({r.returncode}); see {log}')
+
+
+def publish_digests(paths, seed, hash_all):
+    """name -> SHA-256 of the seed about to be published, and how many files were read for it. A file that is still the
+    cache file the last published seed had (same device, inode, size and modification time in that seed's .verified.json,
+    record_verified) keeps the digest recorded then; every other one is read (hash_all). The change time is not compared:
+    linking a cache file into the new seed changes its inode's. A translation made again is a new file, and an index this
+    run writes is new too (user 2026-11-11 "极速更新": hashing all 250,000 files took 3 minutes of every update)."""
+    known = {}
+    try:
+        record = json.loads(seed.with_name(seed.name + '.verified.json').read_text())
+        if record.get('schema') == 1 and isinstance(record.get('files'), dict):
+            known = record['files']
+    except (OSError, ValueError):
+        pass
+    out, todo = {}, []
+    for path in paths:
+        entry = known.get(path.name)
+        try:
+            st = path.stat()
+        except OSError:
+            todo.append(path)
+            continue
+        if isinstance(entry, list) and len(entry) == 6 and entry[:4] == [st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns]:
+            out[path.name] = entry[5]
+        else:
+            todo.append(path)
+    out.update(hash_all(todo))
+    return out, len(todo)
+
+
+
+def parallel_sha256(paths):
+    """name -> sha256 of every path, on all cores."""
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(min(16, (os.cpu_count() or 4) * 2)) as pool:
+        return dict(zip((p.name for p in paths), pool.map(sha256, paths)))
+
+
+GENERATED = {'shader-keys.json', 'pso_title.tsv', 'pso_manifest.tsv'}   # written by the publish itself, from the inputs
+# Every shader the game ships (the corpus finds them all and keeps only those the list names), as shader_key_scope writes
+# it: which shaders are this game's, whatever this seed translated (shader-keys.json names only those). The shader merge
+# (games/totk/scripts/collect_shaders.py) reads it, so a row naming a shader outside it is never this game's (user
+# 2026-11-12: every game's shaders apart; Pokopia's seed named 8,291 of its 131,090 shaders). Not in the manifest: the
+# runtime takes the manifest's files only by its own names (totk_shader_seed.h) and never reads this one.
+IDENTITY = 'game-shader-keys.json'
+
+
+def write_identity(folder, identity):
+    """The game's shader keys into folder/IDENTITY, written only when they changed (the shader data bundle is signed again
+    when a file of the seed folder changes, build_app.shader_bundle)."""
+    path, text = folder / IDENTITY, json.dumps(identity, separators=(',', ':')) + '\n'
+    if not path.is_file() or path.read_text() != text:
+        path.write_text(text)
+
+
+def seed_unchanged(out, files, inputs):
+    """Whether the published seed already is this one: made from the same inputs (translator, chain, depth mode, game
+    files, shader list, corpus and the scripts that write it), and every translation and index file is the very file it has
+    (same device and inode: a translation made again, or an index this run writes, is another file). Then it is kept as it
+    is, without new links, digests or manifest, so the shader data bundle made from it is kept too (user 2026-11-11 "极速
+    更新": publishing an unchanged seed took 3 minutes, and its new manifest had the bundle signed again, 3 more)."""
+    try:
+        old = json.loads((out / 'seed-manifest.json').read_text())
+        if old.get('inputs') != inputs:
+            return False
+        names = set(old.get('files', {}))
+        if not set(files) <= names or not names - set(files) <= GENERATED:
+            return False
+        for name, src in files.items():
+            a, b = (out / name).stat(), src.stat()
+            if (a.st_dev, a.st_ino) != (b.st_dev, b.st_ino):
+                return False
+        return True
+    except (OSError, ValueError, AttributeError):
+        return False
 
 
 def seed_files(cache, verified=None):
@@ -111,14 +188,19 @@ def main():
     a.logs.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
     romfs_sha = json.loads((romfs / 'index.json').read_text())['romfs_sha256']
+    if list_key_rule(a.list) != KEY_RULE:   # its rows would name no shader of this seed
+        raise SystemExit(f'{a.list}: names its shaders by key rule {list_key_rule(a.list) or "(none said)"}, the seed by {KEY_RULE}: '
+                         'move it with ns2_rekey.py --apply first')
 
     stamp = corpus.with_suffix('.json')   # the corpus is made again only for other game files
+    all_keys = corpus.with_suffix('.keys.json')   # every shader the game ships (IDENTITY)
     want = {'romfs_sha256': romfs_sha, 'modules': {e.name: sha256(e) for e in sorted(elf.glob('*.elf'))},
             'tool': sha256(Path(__file__).resolve().parent / 'ns2_shader_corpus.py'), 'list': sha256(a.list)}
-    if not corpus.is_file() or not stamp.is_file() or json.loads(stamp.read_text()) != want:
+    if not corpus.is_file() or not all_keys.is_file() or not stamp.is_file() or json.loads(stamp.read_text()) != want:
         corpus.parent.mkdir(parents=True, exist_ok=True)
         run([sys.executable, Path(__file__).resolve().parent / 'ns2_shader_corpus.py', '--romfs', romfs,
-             '--modules', *sorted(elf.glob('*.elf')), '--out', corpus, '--listed', a.list], a.logs / f'ns2-corpus-{v}.log')
+             '--modules', *sorted(elf.glob('*.elf')), '--out', corpus, '--listed', a.list, '--all-keys', all_keys],
+            a.logs / f'ns2-corpus-{v}.log')
         stamp.write_text(json.dumps(want))
 
     service = Path('build/shader-service/totk_xlate')   # where the runtime looks for the translator (totk_shader_rt.m)
@@ -154,6 +236,18 @@ def main():
     files, indexes = seed_files(cache, set(verified_list.read_text().split()))
     keys = sorted(n[:-len('.variants')] for n in files if n.endswith('.variants'))
     shaders = sum(n.endswith('_b.metal') for n in files)
+    here = Path(__file__).resolve().parent
+    inputs = dict(chain=CHAIN, shader_key_rule=KEY_RULE, version=v, source_romfs_sha256=romfs_sha, translation_context_sha256=context,
+                  nvn_depth_mode=a.depth_mode, translator_sha256=sha256(prebuilt), shader_list_sha256=sha256(a.list),
+                  corpus_sha256=sha256(corpus), scripts_sha256={n: sha256(here / n) for n in ('prepare_ns2_seed.py', 'prepare_shader_seed.py')})
+    identity = shader_key_scope(json.loads(all_keys.read_text()), v, romfs_sha)
+    if not set(keys) <= set(identity['keys']):   # the seed translated only shaders the corpus found
+        raise SystemExit(f'{len(set(keys) - set(identity["keys"]))} translated shaders are not among the game\'s {len(identity["keys"])}')
+    if not indexes and seed_unchanged(out, files, inputs):
+        write_identity(out, identity)
+        print(f'seed unchanged: its {len(files)} translation files are the ones published, from the same inputs; '
+              'kept as it is (no new links, digests or manifest)', flush=True)
+        return
     staging = out.with_name(out.name + '.partial')
     shutil.rmtree(staging, ignore_errors=True)
     staging.mkdir(parents=True)
@@ -167,16 +261,18 @@ def main():
     # Unlike the shaders, a complete render-pipeline description needs the game's bind state. NS2 starts without
     # recorded pipeline rows; the shared list adds real rows as the game is played (never invent descriptors).
     (staging / 'pso_manifest.tsv').write_text('# NS2 startup shaders; render pipelines come from the shared list.\n')
-    report = dict(schema=1, chain=CHAIN, version=v, game=v, source_romfs_sha256=romfs_sha,
+    report = dict(schema=1, chain=CHAIN, shader_key_rule=KEY_RULE, version=v, game=v, source_romfs_sha256=romfs_sha,
                   translation_context_sha256=context,
                   nvn_depth_mode=a.depth_mode,
                   translator_sha256=sha256(prebuilt), shader_list_sha256=sha256(a.list),
                   preparation_sha256=sha256(Path(__file__).resolve()), shaders=shaders,
                   corpus_shaders=int(done.group(2)), translated_default=int(done.group(1)),
                   listed_variants=int(listed.group(1)) if listed else 0, listed_asked=int(listed.group(2)) if listed else 0,
-                  seconds=round(time.time() - t0, 1),
-                  files={p.name: sha256(p) for p in sorted(staging.iterdir())})
+                  seconds=round(time.time() - t0, 1), inputs=inputs, files={})
+    report['files'], read = publish_digests(sorted(staging.iterdir()), out, parallel_sha256)
+    print(f'seed files: {len(report["files"])}, {read} read again (the rest kept the digest of the last seed)', flush=True)
     (staging / 'seed-manifest.json').write_text(json.dumps(report, indent=2) + '\n')
+    write_identity(staging, identity)   # after the manifest's digests: never one of its files
     # Publish first; deleting tens of thousands of old files on an external APFS volume takes minutes. The old seed
     # is entirely generated data and no longer read once its replacement is published.
     old = out.with_name(f'.{out.name}.old-{os.getpid()}-{time.time_ns()}')
@@ -187,6 +283,7 @@ def main():
         if old.exists(): old.rename(out)
         raise
     if old.exists(): subprocess.Popen(['/bin/rm', '-rf', str(old)], start_new_session=True)
+    record_verified(out, report['files'])   # the next publish keeps the digests of the files that stay (publish_digests)
     print(json.dumps({k: report[k] for k in ('version', 'shaders', 'corpus_shaders', 'translated_default',
                                              'listed_variants', 'listed_asked', 'seconds')}))
 

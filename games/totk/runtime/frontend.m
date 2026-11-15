@@ -132,6 +132,8 @@ static int textEntryOpen;
 static void front_mouse_update(void);
 int taa_enabled(void);   /* third_party/d2r_gfx/gfx/nvn/totk_taa.m: edge smoothing in the settings panel */
 void taa_set(int on);
+void taa_set_fast(int on);   /* totk_taa.m: edge smoothing's resolve, MetalFX (0) or fast (1); graphics-taa-mode.txt */
+int taa_fast_enabled(void);   /* totk_taa.m: the resolve in use (the settings panel shows it) */
 static uint64_t bootStartNS;
 static _Atomic uint64_t presentedFrames;
 static _Atomic int warmPending;
@@ -631,15 +633,25 @@ static CGPathRef mirror_path(CGSize z,int eye){   /* +1; eye -1: the whole recta
 #define TOTK_SCREENSHOT_WINDOW 1
 #endif
 #if defined(TOTK_SCREENSHOT_WINDOW) && !defined(TOTK_SCREENSHOT_PICTURE)
-/* The renderer's next frame: mtl_grab_next_present (third_party/d2r_gfx/gfx/nvn/nvn_mtl.m) has the present thread draw the
-   frame it is about to show and hands the picture over when the GPU is done, so the capture button waits on no thread and
-   the main thread never spins. Weak: a probe links this file without the renderer and answers with no picture. */
+/* The renderer's next frame: mtl_grab_next_game_frame (third_party/d2r_gfx/gfx/nvn/nvn_mtl.m) has the present thread copy
+   the game's own frame -- the source texture before the output upscale, no letterbox bars -- and hands the picture over
+   when the GPU is done, so the capture button waits on no thread and the main thread never spins. A renderer that only
+   offers the window picture (mtl_grab_next_present) gets that instead; weak, so a probe links this file without the
+   renderer and answers with no picture. */
 extern void mtl_grab_next_present(void (^cb)(CGImageRef img)) __attribute__((weak_import));
-static void screenshot_picture(void (^cb)(CGImageRef img)) { if (mtl_grab_next_present) mtl_grab_next_present(cb); else cb(NULL); }
+extern void mtl_grab_next_game_frame(void (^cb)(CGImageRef img)) __attribute__((weak_import));
+static void screenshot_picture(void (^cb)(CGImageRef img)) {
+    if (mtl_grab_next_game_frame) mtl_grab_next_game_frame(cb);
+    else if (mtl_grab_next_present) mtl_grab_next_present(cb);
+    else cb(NULL);
+}
 #define TOTK_SCREENSHOT_PICTURE screenshot_picture
 #endif
 #include "screenshot.h"
 #include "settings_panel.h"
+#if defined(TOTK_SCREENSHOT_WINDOW)
+#include "shot_upload.h"   /* 截图分享: with its switch on, each saved screenshot is shared (screenshot.h totk_screenshot_shared) */
+#endif
 void runtime_front_resize_output(unsigned w,unsigned h) {
  dispatch_async(dispatch_get_main_queue(),^{settings_window_size(w,h,h?(double)w/h:0);});
 }
@@ -950,6 +962,9 @@ void runtime_front_run(void(*callback)(void)){
   front_sync_drawable();
   if(assume_focus()){[window orderFrontRegardless];}else{[window makeKeyAndOrderFront:nil];[NSApp activateIgnoringOtherApps:YES];}   /* in front of other apps' windows, keyboard left alone */
   totk_board_start();   /* the leaderboard's rounds (board_upload.h): nothing is sent unless the player turned 我要上榜 on */
+#if defined(TOTK_SCREENSHOT_WINDOW)
+  totk_screenshot_shared=totk_shot_queue;totk_shot_start();   /* 截图分享 (shot_upload.h): off unless the player turned it on */
+#endif
   front_sr_view();
   [NSNotificationCenter.defaultCenter addObserverForName:NSApplicationDidChangeScreenParametersNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n){(void)n;note_window_screen();front_sr_view();}];   /* a refresh rate changed on the same screen */
   dispatch_after(dispatch_time(DISPATCH_TIME_NOW,3*NSEC_PER_SEC),dispatch_get_main_queue(),^{note_occlusion(" 3 s after opening");});
