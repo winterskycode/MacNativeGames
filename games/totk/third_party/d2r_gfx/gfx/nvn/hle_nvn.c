@@ -53,6 +53,9 @@
 #include <stdatomic.h>
 #include <mach-o/getsect.h>
 #include <mach-o/ldsyms.h>
+#ifdef __ANDROID__
+#include "totk_affinity.h"   /* totk_pin_self (the walk thread) */
+#endif
 
 // ---------- 槽表、跳板、未实现桩 ----------
 // ---------- Slot table, thunks, unimplemented stubs ----------
@@ -1187,17 +1190,18 @@ static pthread_mutex_t g_copy_mu = PTHREAD_MUTEX_INITIALIZER;
 /* The opaque handle points past this host-only validation and accounting prefix. */
 #define COPY_MAGIC 0x59504f43444d43ull   /* "CMDCOPY" */
 /* One layout for both games (the Android port's fields -- the UBO index, the piece markers, serial / pinned / cb for the
-   predecode -- are set for every copy by flatten_recording; `used` is Breath of the Wild's NVN 53 lifetime mark). The copy
-   is one allocation sized from the recorded bytes, filled one contiguous segment run at a time. */
+   predecode -- are set for every copy by copy_recording and copy_walk; `used` is Breath of the Wild's NVN 53 lifetime mark). The copy
+   is one allocation of the recorded bytes, filled by one memcpy; its op index and uniform ranges are a second (copy_walk). */
 typedef struct { uint64_t magic; _Atomic uint64_t used_at; uint64_t made_at; uint32_t body_bytes, last_size, idx_off, nidx, ubo_off, nubo, ncall, nmark;   /* nmark: piece markers inside (copies of other recordings) */
                  uint64_t serial; _Atomic uint32_t pinned; uint32_t pad2_; uint64_t cb;   /* cb: the command buffer object it was recorded on */   /* serial: unique per copy (plan key); pinned: the translation thread's predecode reads the body (nvn_vulkan_plan.inc) */
-                 _Atomic uint32_t used; uint32_t hw_bytes; } copy_prefix;   /* used: called or submitted at least once (NVN 53 lifetime, release_copies; Breath of the Wild); hw_bytes: the recording's command memory on hardware (EndRecording), what CopyCommands of it adds (inline_recording) */
+                 _Atomic uint32_t used; uint32_t hw_bytes;
+                 _Atomic uint32_t walk; uint32_t rec_bytes; void *lists; uint32_t *idx_list; void *ubo_list; } copy_prefix;   /* walk: 0 to do, 1 being walked, 2 done (copy_walk: the op index, uniform ranges, bulk and marker fields); rec_bytes: the body with BEGIN and END; lists: one allocation holding idx_list and ubo_list */   /* used: called or submitted at least once (NVN 53 lifetime, release_copies; Breath of the Wild); hw_bytes: the recording's command memory on hardware (EndRecording), what CopyCommands of it adds (inline_recording) */
 static _Atomic uint64_t g_copy_serial;
 static void plan_offer(uint8_t *copy);   /* below, with the translation thread */
 static _Atomic uint64_t g_copy_bytes;   /* live recording-copy bytes (logged with the copy count) */
 static copy_prefix *copy_of(NVNcommandHandle h) { copy_prefix *c = (copy_prefix *)(uintptr_t)h - 1; return c; }
 /* the copy's op index and uniform ranges live in its own allocation: nothing else to free with it */
-static void copy_lists_free(copy_prefix *c) { (void)c; }
+static void copy_lists_free(copy_prefix *c) { if (c->lists) { g_copy_bytes -= malloc_size(c->lists); free(c->lists); c->lists = NULL; } }
 /* The copy also carries an index of the ops the submit call has to visit (uniform binds for the uniform capture, texture /
    image / sampler binds for the deferred binds, calls), appended after OP_END: the submit call, on the frame's critical
    path, read the whole recording twice to find them (TOTK, 2026-10-23: ~0.3 ms of a 0.8 ms submit). Offsets are from
@@ -1206,8 +1210,8 @@ static void copy_lists_free(copy_prefix *c) { (void)c; }
    submit call's uniform capture (mtl_sub_capture_ubos) takes a list per recording instead of walking every uniform bind
    (13,800 a frame, 0.2 ms on the frame's critical path, 2026-10-31). Deduplicated here with a small open-addressing set. */
 typedef struct { uint64_t lo, hi; } ubo_range_t;
-/* the op index and the uniform ranges of the recording being flattened, per recording thread. One thread-local whose
-   address flatten_recording takes once: this library is loaded after start, so every thread-local access is a call into
+/* the op index and the uniform ranges of the recording being walked, per walking thread. One thread-local whose
+   address copy_walk takes once: this library is loaded after start, so every thread-local access is a call into
    the linker's dynamic resolver (tlsdesc_resolver_dynamic), which per op and per uniform bind was 1.5% of the process's
    CPU on the game's threads */
 typedef struct { uint32_t *idx; uint32_t idx_cap; ubo_range_t *ubo; uint32_t ubo_cap, ubo_n; ubo_range_t *ubo_set; uint32_t ubo_set_mask; } rec_scratch;
@@ -1242,37 +1246,50 @@ static void ubo_ranges_sort(ubo_range_t *r, uint32_t n) {   /* LSD radix on lo, 
     }
     if (from != r) memcpy(r, from, (size_t)n * sizeof *r);
 }
+static void copy_ready(copy_prefix *c);
 const ubo_range_t *nvn_copy_ubo_ranges(uint64_t handle, uint32_t *n, uint32_t *calls) {
-    const copy_prefix *c = (const copy_prefix *)(uintptr_t)handle - 1;
-    if (c->magic != COPY_MAGIC || !c->ubo_off) return NULL;
-    *n = c->nubo; *calls = c->ncall; return (const ubo_range_t *)(uintptr_t)(handle + c->ubo_off);
+    copy_prefix *c = (copy_prefix *)(uintptr_t)handle - 1;
+    if (c->magic != COPY_MAGIC) return NULL;
+    copy_ready(c); if (!c->ubo_off) return NULL;
+    *n = c->nubo; *calls = c->ncall; return (const ubo_range_t *)c->ubo_list;
 }
 static int op_indexed(uint32_t op) { return op == OP_BIND_UBO || op == OP_BIND_TEX || op == OP_BIND_IMG || op == OP_BIND_SAMP || op == OP_CALL; }
 const uint32_t *nvn_copy_op_index(uint64_t handle, uint32_t *n) {
-    const copy_prefix *c = (const copy_prefix *)(uintptr_t)handle - 1;
-    if (c->magic != COPY_MAGIC || !c->idx_off) return NULL;
-    *n = c->nidx; return (const uint32_t *)(uintptr_t)(handle + c->idx_off);
+    copy_prefix *c = (copy_prefix *)(uintptr_t)handle - 1;
+    if (c->magic != COPY_MAGIC) return NULL;
+    copy_ready(c); if (!c->idx_off) return NULL;
+    *n = c->nidx; return c->idx_list;
 }
-/* hint: the recorded bytes (cmd_used - rec_start). The copy is allocated once at that size plus room for the op index (one
-   4-byte entry per op of at least 16 bytes) and not trimmed: growing from 4 KiB by realloc, then trimming, copied the
-   bigger recordings several times over on the game's threads (~1/4 of the main thread's memcpy). */
-static uint8_t *flatten_recording(const uint8_t *p, size_t hint) {
-    size_t n = sizeof(copy_prefix), cap = sizeof(copy_prefix) + hint + hint / 4 + 64; uint8_t *out = malloc(cap);
-    int bulk_ok = 1; uint32_t last_size = 0, nidx = 0, ncall = 0, nmark = 0; int idx_ok = 1;
-    if (!out) die("command copy allocation");
+/* EndRecording copies the recording (one allocation at its exact size, one memcpy) and returns its handle at once; the
+   walk over its ops (checks, the op index, the uniform ranges, the bulk-inline and marker fields) runs on the walk
+   thread (TOTK_REC_ASYNC, default on; =0 walks inside EndRecording). Everything that reads what the walk makes calls
+   copy_ready first, which walks the copy itself when nobody has started (so nothing waits for a sleeping thread):
+   the uniform capture and the op index (the submit and the translation thread), CallCommands' bulk inline, the
+   predecode offer. The walk was most of EndRecording's time on the game's main thread and job workers. */
+static uint8_t *copy_recording(const uint8_t *p, size_t len) {
+    if (len < 16 || len > UINT32_MAX) die("recording of %zu bytes", len);
+    uint8_t *out = malloc(sizeof(copy_prefix) + len); if (!out) die("command copy allocation");
+    copy_prefix *c = (copy_prefix *)out; memset(c, 0, sizeof *c);
+    memcpy(out + sizeof(copy_prefix), p, len);
+    c->magic = COPY_MAGIC; c->made_at = g_submits; c->rec_bytes = (uint32_t)len;
+    c->serial = atomic_fetch_add(&g_copy_serial, 1) + 1;
+    g_copy_bytes += malloc_size(out); return out + sizeof(copy_prefix);
+}
+static void copy_walk(copy_prefix *c) {   /* the walk: c->walk is 1, set by the caller that claimed it */
+    const uint8_t *base = (const uint8_t *)(c + 1), *p = base, *end = base + c->rec_bytes;
+    int bulk_ok = 1, idx_ok = 1; uint32_t last_size = 0, nidx = 0, ncall = 0, nmark = 0, end_size = 0; size_t n = 0;
     rec_scratch *T = &t_rec;
     T->ubo_n = 0; if (T->ubo_set) memset(T->ubo_set, 0, (size_t)(T->ubo_set_mask + 1) * sizeof *T->ubo_set);
-    const uint8_t *run = p; size_t run_n = n;   /* ops are copied one contiguous segment run at a time */
     for (;;) {
+        if ((size_t)(end - p) < 8) die("recording %p runs past its %u bytes", (const void *)base, c->rec_bytes);
         op_hdr h; memcpy(&h, p, sizeof h);
-        if (h.size < 8 || (h.size & 7)) die("corrupt recording at %p (op %u size %u)", (const void *)p, h.op, h.size);
-        if (h.op == OP_JUMP) { memcpy(out + run_n, run, n - run_n); memcpy(&p, p + 8, 8); run = p; run_n = n; continue; }
+        if (h.size < 8 || (h.size & 7) || h.size > (size_t)(end - p)) die("corrupt recording at %p (op %u size %u)", (const void *)p, h.op, h.size);
+        if (h.op == OP_JUMP) die("recording %p: a jump inside a contiguous recording", (const void *)base);
         if (h.op >= OP_COUNT_ || h.size > (64u << 20)) bulk_ok = 0;
-        if (n == sizeof(copy_prefix)) { if (h.op != OP_BEGIN || h.size != 8) bulk_ok = 0; }
+        if (n == 0) { if (h.op != OP_BEGIN || h.size != 8) bulk_ok = 0; }
         else if (h.op == OP_BEGIN && h.size == 8) bulk_ok = 0;   /* a piece marker (size 16 / 32, inline_recording) may sit in a bulk body */
         else if (h.op == OP_BEGIN && h.size >= 32) nmark++;
         else if (h.op != OP_END && h.op != OP_BEGIN) last_size = h.size;
-        if (n + h.size > cap) { while (n + h.size > cap) cap *= 2; out = realloc(out, cap); if (!out) die("command copy allocation"); }
         if (h.op == OP_BIND_UBO) { p_bind_buf b; memcpy(&b, p + 8, sizeof b); if (b.addr && b.size && b.size <= 65536) { ubo_range_note(T, b.addr, b.addr + b.size);
             /* per-object motion vectors (Vulkan backend): the game writes these vertex blocks into two copies that take turns,
                addr and addr +- the size rounded up to 256; the copy not written this frame still holds last frame's when
@@ -1282,32 +1299,92 @@ static uint8_t *flatten_recording(const uint8_t *p, size_t hint) {
                 ubo_range_note(T, b.addr + step, b.addr + step + b.size); if (b.addr >= step) ubo_range_note(T, b.addr - step, b.addr - step + b.size); } } }
         if (h.op == OP_CALL) ncall++;
         if (op_indexed(h.op) && idx_ok) {
-            if (n - sizeof(copy_prefix) > UINT32_MAX) idx_ok = 0;
+            if (n > UINT32_MAX) idx_ok = 0;
             else { if (nidx == T->idx_cap) { T->idx_cap = T->idx_cap ? T->idx_cap * 2 : 4096; T->idx = realloc(T->idx, T->idx_cap * sizeof *T->idx); if (!T->idx) die("command op index"); }
-                   T->idx[nidx++] = (uint32_t)(n - sizeof(copy_prefix)); }
+                   T->idx[nidx++] = (uint32_t)n; }
         }
         n += h.size;
-        if (h.op == OP_END) {
-            memcpy(out + run_n, run, n - run_n);
-            size_t ops_end = n, idx_bytes = idx_ok ? (size_t)nidx * sizeof *T->idx : 0;
-            if (n + idx_bytes > cap) { cap = n + idx_bytes; out = realloc(out, cap); if (!out) die("command copy allocation"); }
-            if (idx_bytes) memcpy(out + n, T->idx, idx_bytes);
-            n += idx_bytes;
-            size_t ubo_at = n, ubo_bytes = (size_t)T->ubo_n * sizeof *T->ubo;
-            if (n + ubo_bytes > cap) { cap = n + ubo_bytes; out = realloc(out, cap); if (!out) die("command copy allocation"); }
-            if (ubo_bytes) { ubo_ranges_sort(T->ubo, T->ubo_n); memcpy(out + n, T->ubo, ubo_bytes); }
-            n += ubo_bytes;
-            copy_prefix *c = (copy_prefix *)out; c->magic = COPY_MAGIC; c->used_at = 0; c->made_at = g_submits; c->used = 0; c->hw_bytes = 0;
-            c->idx_off = idx_ok && ops_end - sizeof(copy_prefix) <= UINT32_MAX ? (uint32_t)(ops_end - sizeof(copy_prefix)) : 0; c->nidx = c->idx_off ? nidx : 0;
-            c->ubo_off = ubo_at - sizeof(copy_prefix) <= UINT32_MAX ? (uint32_t)(ubo_at - sizeof(copy_prefix)) : 0; c->nubo = c->ubo_off ? T->ubo_n : 0; c->ncall = ncall; c->nmark = nmark;
-            c->serial = atomic_fetch_add(&g_copy_serial, 1) + 1; atomic_store(&c->pinned, 0); c->pad2_ = 0; c->cb = 0;
-            size_t body = ops_end >= sizeof(copy_prefix) + 16 ? ops_end - sizeof(copy_prefix) - 16 : 0;
-            c->body_bytes = bulk_ok && h.size == 8 && body <= UINT32_MAX ? (uint32_t)body : 0;
-            c->last_size = c->body_bytes ? last_size : 0;
-            g_copy_bytes += malloc_size(out); return out + sizeof(copy_prefix);
-        }
+        if (h.op == OP_END) { end_size = h.size; break; }
         p += h.size;
     }
+    size_t idx_bytes = idx_ok ? (size_t)nidx * sizeof *T->idx : 0, ubo_at = (idx_bytes + 15) & ~(size_t)15, ubo_bytes = (size_t)T->ubo_n * sizeof *T->ubo;
+    static uint64_t empty_list[2];   /* an index or range list with no entries is there (not NULL) but empty */
+    uint8_t *lists = NULL;
+    if (idx_bytes || ubo_bytes) {
+        lists = malloc(ubo_at + ubo_bytes); if (!lists) die("command copy lists");
+        if (idx_bytes) memcpy(lists, T->idx, idx_bytes);
+        if (ubo_bytes) { ubo_ranges_sort(T->ubo, T->ubo_n); memcpy(lists + ubo_at, T->ubo, ubo_bytes); }
+        g_copy_bytes += malloc_size(lists);
+    }
+    c->lists = lists;
+    c->idx_off = (uint32_t)idx_ok; c->nidx = idx_ok ? nidx : 0; c->idx_list = !idx_ok ? NULL : idx_bytes ? (uint32_t *)lists : (uint32_t *)empty_list;
+    c->ubo_off = 1; c->nubo = T->ubo_n; c->ubo_list = ubo_bytes ? (void *)(lists + ubo_at) : (void *)empty_list;
+    c->ncall = ncall; c->nmark = nmark;
+    size_t body = n >= 16 ? n - 16 : 0;
+    c->body_bytes = bulk_ok && end_size == 8 && body <= UINT32_MAX ? (uint32_t)body : 0;
+    c->last_size = c->body_bytes ? last_size : 0;
+    atomic_store_explicit(&c->walk, 2, memory_order_release);
+}
+static _Atomic uint64_t g_walk_helped, g_walk_waited;   /* walks done by a reader that needed the copy first / readers that waited for a walk under way */
+static void copy_ready(copy_prefix *c) {
+    if (atomic_load_explicit(&c->walk, memory_order_acquire) == 2) return;
+    uint32_t todo = 0;
+    if (atomic_compare_exchange_strong(&c->walk, &todo, 1)) { copy_walk(c); atomic_fetch_add_explicit(&g_walk_helped, 1, memory_order_relaxed); return; }
+    atomic_fetch_add_explicit(&g_walk_waited, 1, memory_order_relaxed);
+    while (atomic_load_explicit(&c->walk, memory_order_acquire) != 2) __asm__ __volatile__("yield");
+}
+/* The walk thread: copies are pinned while queued (copy_drop defers their free). At most WQ queued; with the
+   predecode's PQ that stays under the deferred list's length, so copy_drop never has to wait for a pin. It polls for
+   WALK_SPIN_NS after its last copy before it sleeps: a frame's recordings come in bursts, and a wake is a system call on
+   the recording thread. */
+#define WQ 4096
+#define WALK_SPIN_NS 300000ull
+static copy_prefix *g_wq[WQ]; static unsigned g_wq_in, g_wq_out; static int g_wq_sleeping, g_wq_started;
+static pthread_mutex_t g_wq_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_wq_cv = PTHREAD_COND_INITIALIZER;
+static uint64_t g_wq_wakes, g_wq_full;
+static int rec_async_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_REC_ASYNC"); v = !(e && !strcmp(e, "0")); LOG("[nvn] recording walks: %s", v ? "on the walk thread (TOTK_REC_ASYNC=0 walks in EndRecording)" : "in EndRecording"); } return v; }
+static void plan_offer(uint8_t *copy);
+static void copy_drain_deferred(void);
+static void *walk_main(void *unused) {
+    (void)unused; pthread_setname_np(pthread_self(), "totk-recwalk");
+#ifdef __ANDROID__
+    /* two performance cores, clear of the translation and recording threads' (fast:0-2) and of little cores: inherited
+       from the game thread it started on, the AYN Thor ran it on a little core and its queue filled */
+    totk_pin_self("TOTK_RECWALK_CPUS", "fast:3+fast:4");
+#endif
+    for (uint64_t done = 0;;) {
+        pthread_mutex_lock(&g_wq_mu);
+        while (g_wq_in == g_wq_out) {
+            pthread_mutex_unlock(&g_wq_mu);
+            uint64_t t0 = now_ns();
+            while (__atomic_load_n(&g_wq_in, __ATOMIC_ACQUIRE) == __atomic_load_n(&g_wq_out, __ATOMIC_RELAXED) && now_ns() - t0 < WALK_SPIN_NS) __asm__ __volatile__("yield");
+            pthread_mutex_lock(&g_wq_mu);
+            if (g_wq_in != g_wq_out) break;
+            g_wq_sleeping = 1; pthread_cond_wait(&g_wq_cv, &g_wq_mu); g_wq_sleeping = 0;
+        }
+        copy_prefix *c = g_wq[g_wq_out % WQ]; __atomic_store_n(&g_wq_out, g_wq_out + 1, __ATOMIC_RELEASE);
+        pthread_mutex_unlock(&g_wq_mu);
+        { uint32_t todo = 0; if (atomic_compare_exchange_strong(&c->walk, &todo, 1)) copy_walk(c); else copy_ready(c); }   /* a reader may have walked it first */
+        pthread_mutex_lock(&g_copy_mu);
+        if (c->magic == COPY_MAGIC) plan_offer((uint8_t *)(c + 1));
+        atomic_fetch_sub(&c->pinned, 1); copy_drain_deferred();
+        pthread_mutex_unlock(&g_copy_mu);
+        if (++done % 30000 == 0) LOG("[nvn] recording walks: %llu on the walk thread, %llu by a reader that needed the copy first, %llu readers waited for one under way; %llu wakes, %llu queue full",
+                                     (unsigned long long)done, (unsigned long long)atomic_load(&g_walk_helped), (unsigned long long)atomic_load(&g_walk_waited), (unsigned long long)g_wq_wakes, (unsigned long long)g_wq_full);
+    }
+    return NULL;
+}
+static int walk_offer(copy_prefix *c) {   /* g_copy_mu held (EndRecording); 0: walk it now */
+    if (!rec_async_on()) return 0;
+    pthread_mutex_lock(&g_wq_mu);
+    if (!g_wq_started) { pthread_t t; if (pthread_create(&t, NULL, walk_main, NULL)) { pthread_mutex_unlock(&g_wq_mu); return 0; } pthread_detach(t); g_wq_started = 1; }
+    if (g_wq_in - g_wq_out >= WQ) { g_wq_full++; pthread_mutex_unlock(&g_wq_mu); return 0; }
+    atomic_fetch_add(&c->pinned, 1);
+    g_wq[g_wq_in % WQ] = c; __atomic_store_n(&g_wq_in, g_wq_in + 1, __ATOMIC_RELEASE);
+    int wake = g_wq_sleeping; if (wake) { g_wq_sleeping = 0; g_wq_wakes++; }
+    pthread_mutex_unlock(&g_wq_mu);
+    if (wake) pthread_cond_signal(&g_wq_cv);
+    return 1;
 }
 /* Track handle use for diagnostics; lifetime depends on control-memory reuse, never elapsed frames. */
 static void copy_touch(NVNcommandHandle h, uint64_t now) {
@@ -1364,7 +1441,7 @@ static uint64_t g_copy_drop_readd, g_copy_drop_token, g_copy_mark_faults;   /* w
 static uint64_t g_copy_mark_late;   /* Breath of the Wild: handles called after their mark was found gone (botw_handle_copy; the copy was kept) */
 /* Copies a predecode on the translation thread is reading (copy_prefix.pinned) are not freed under it: they wait here
    until it is done (drained at the next drop, and by the predecode itself when it unpins). */
-static copy_prefix *g_copy_deferred[1024]; static unsigned g_copy_ndeferred;   /* at most PQ are pinned at once */
+static copy_prefix *g_copy_deferred[8192]; static unsigned g_copy_ndeferred;   /* at most PQ + WQ are pinned at once */
 static void copy_drain_deferred(void) {   /* g_copy_mu held */
     for (unsigned i = 0; i < g_copy_ndeferred;) { if (atomic_load(&g_copy_deferred[i]->pinned)) { i++; continue; } copy_free(g_copy_deferred[i]); g_copy_deferred[i] = g_copy_deferred[--g_copy_ndeferred]; }
 }
@@ -1478,12 +1555,12 @@ NVN(nvnCommandBufferEndRecording, NVNcommandHandle, NVNcommandBuffer *c) {
         for (unsigned i = 1; i < OP_COUNT_ && n < sizeof line - 24; i++) if (t_rec_hist[i]) n += snprintf(line + n, sizeof line - n, " op%u×%u", i, t_rec_hist[i]);
         LOG("[rec] #%u cb=%p ours=%zu hw=%zu%s", t_rec_n, (void *)c, o->cmd_used - o->rec_start - 16, hw_before - o->hw_start, line); }
     uint64_t flat_t0 = now_ns();
-    uint8_t *copy = flatten_recording(o->seg, o->cmd_used - o->rec_start);
+    uint8_t *copy = copy_recording(o->seg, (size_t)(o->cur - o->seg));
     copy_of((NVNcommandHandle)(uintptr_t)copy)->hw_bytes = (uint32_t)(hw_before - o->hw_start);   /* what CopyCommands of it adds (inline_recording) */
     totk_tl(TL_REC_END, (uint64_t)(o->cmd_used - o->rec_start), (uint64_t)(uintptr_t)copy);   /* when, on which thread, and which handle (TOTK_TIMELINE) */
     { static _Atomic uint64_t n, ns, bytes; uint64_t k = atomic_fetch_add(&n, 1) + 1; atomic_fetch_add(&ns, now_ns() - flat_t0); atomic_fetch_add(&bytes, o->cmd_used - o->rec_start);
       if (k % 3000 == 0) { LOG("[nvn] EndRecording: flatten %.3f ms a call, %.1f KiB recorded a call (%llu calls)", atomic_load(&ns) / 3000e6, atomic_load(&bytes) / 3000.0 / 1024, (unsigned long long)k); atomic_store(&ns, 0); atomic_store(&bytes, 0); } }
-    if (call_stats_on()) call_stats_end(c, copy);
+    if (call_stats_on()) { copy_ready(copy_of((NVNcommandHandle)(uintptr_t)copy)); call_stats_end(c, copy); }
     /* Finalizing the recorder does not retire its handle; only reusing the backing control region does. */
 #ifdef GAME_BOTW
     /* NVN 53 (Breath of the Wild, botw.md): the handle is the recording's position in the command buffer's control memory,
@@ -1523,7 +1600,7 @@ NVN(nvnCommandBufferEndRecording, NVNcommandHandle, NVNcommandBuffer *c) {
             (unsigned long long)made, g_ncopies, g_copy_bytes / 1048576.0, (unsigned long long)g_submits, (unsigned long long)g_copy_drop_readd, (unsigned long long)g_copy_drop_token, (unsigned long long)g_copy_mark_faults,
             (unsigned long long)g_copy_mark_late, g_cbk_used, g_cbk_empty, g_cbk_cap, (unsigned long long)g_cbk_compactions); }
     copy_of((NVNcommandHandle)(uintptr_t)copy)->cb = (uint64_t)(uintptr_t)c;
-    plan_offer(copy);   /* g_copy_mu held: pins the copy for the predecode */
+    if (!walk_offer(copy_of((NVNcommandHandle)(uintptr_t)copy))) { copy_ready(copy_of((NVNcommandHandle)(uintptr_t)copy)); plan_offer(copy); }   /* g_copy_mu held; plan_offer pins the copy for the predecode (after the walk, on the walk thread) */
     pthread_mutex_unlock(&g_copy_mu);
     if (cmdlog_env()) LOG("[cmd] EndRecording cb=%p recorded=%p copy=%p ctl=%p", (void *)c, (void *)o->seg, (void *)copy, o->ctl);
     if (totk_life_on() && totk_life_cb_take(c)) { totk_life_log("end cb=%p handle=%p", (void *)c, (void *)copy); totk_life_handle_add((uint64_t)(uintptr_t)copy); }
@@ -1644,7 +1721,7 @@ static void inline_recording_body(NVNcommandBuffer *c, NVNcommandHandle hd) {
        its bytes now, at exactly the original call position. Deferred bindings
        remain deferred; source handle retirement cannot affect the caller.
        CMDSTAT retains the record-by-record path and its exact counters. */
-    const copy_prefix *meta = copy_of(hd);
+    const copy_prefix *meta = copy_of(hd); copy_ready((copy_prefix *)meta);
     if (inline_bulk_on() && !cs_on() && meta->body_bytes && meta->last_size) {
         cmd_t *o = CB(c);
         uint8_t *dst = cmd_alloc(o, meta->body_bytes);
@@ -2198,7 +2275,7 @@ void dm_nvn_probe_inline_bulk(void) {
         h_nvnCommandBufferAddControlMemory(&cb[0], control[0], sizeof control[0]);
         h_nvnCommandBufferAddControlMemory(&cb[2], control[2], sizeof control[2]);
         // source and intermediate fast handle are gone; nested bytes must survive.
-        size_t full_size = copy_of(reference)->body_bytes + 16;
+        copy_ready(copy_of(reference)); size_t full_size = copy_of(reference)->body_bytes + 16;
         if (memcmp((const void *)(uintptr_t)reference, (const void *)(uintptr_t)nested, full_size)) die("inline bulk probe: nested copy changed after source retirement"); checks++;
         for (unsigned i = 0; i < 4; i++) {
             h_nvnCommandBufferAddControlMemory(&cb[i], control[i], sizeof control[i]);
@@ -2719,7 +2796,7 @@ static void plan_offer(uint8_t *copy) {   /* g_copy_mu held (EndRecording) */
     pthread_mutex_lock(&g_xq_mu);
     /* pinned from here until plan_run is done with it: a dropped copy (copy_drop) then waits in the deferred list instead
        of being freed, so the body can be read without the copy lock (a large copy is a mapping of its own; its free unmaps it) */
-    if (g_pq_in - g_pq_out < PQ) { atomic_store(&c->pinned, 1); g_pq[g_pq_in++ % PQ] = (plan_job){(uint64_t)(uintptr_t)copy, c->serial}; pthread_cond_broadcast(&g_xq_cv); } else g_pq_dropped++;
+    if (g_pq_in - g_pq_out < PQ) { atomic_fetch_add(&c->pinned, 1); g_pq[g_pq_in++ % PQ] = (plan_job){(uint64_t)(uintptr_t)copy, c->serial}; pthread_cond_broadcast(&g_xq_cv); } else g_pq_dropped++;
     pthread_mutex_unlock(&g_xq_mu);
 }
 int nvn_plan_yield(void) { return __atomic_load_n(&g_xq_in, __ATOMIC_RELAXED) != __atomic_load_n(&g_xq_done, __ATOMIC_RELAXED); }   /* a submit is waiting for the translation thread: the predecode stops */
@@ -2727,7 +2804,7 @@ static void plan_run(const plan_job *j) {   /* translation thread; the copy is p
     copy_prefix *pf = copy_of((NVNcommandHandle)(uintptr_t)j->copy); int ok;
     pthread_mutex_lock(&g_copy_mu); ok = pf->magic == COPY_MAGIC && pf->serial == j->serial; pthread_mutex_unlock(&g_copy_mu);
     if (ok) mtl_plan_predecode((const uint8_t *)(uintptr_t)j->copy, pf->body_bytes, j->copy, j->serial, pf->cb);   /* else released already: never submitted, or its control memory was reused */
-    pthread_mutex_lock(&g_copy_mu); atomic_store(&pf->pinned, 0); copy_drain_deferred(); pthread_mutex_unlock(&g_copy_mu);
+    pthread_mutex_lock(&g_copy_mu); atomic_fetch_sub(&pf->pinned, 1); copy_drain_deferred(); pthread_mutex_unlock(&g_copy_mu);
 }
 static win_t *g_xp_win; static uint64_t g_xp_job[4];   // job number of each swapchain image's last present (TOTK has one window)
 static _Atomic uint64_t g_x_drains, g_x_drain_ns;
