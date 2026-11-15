@@ -3729,6 +3729,21 @@ static unsigned present_ticks(const win_t *o) {   /* display ticks per game fram
     if (hold) { int hz = g_paced_hz > 0 ? g_paced_hz : 60; return (unsigned)(hz >= hold * 3 / 2 ? (hz + hold / 2) / hold : 1); }
     return g_display_mode || (uncapped_now() && !dm_detclock_enabled() && uncapped_interval_on()) || o->interval <= 0 ? 1u : (unsigned)o->interval;
 }
+/* Android (port/android/vk/nvn_vulkan_pacing.inc): the panel's measured refresh period, 0 unknown */
+extern uint64_t nvn_display_refresh_ns(void) __attribute__((weak));
+/* A frame period within 2.5% of a whole number of the panel's refreshes becomes exactly that many: panels run off their
+   nominal rate (the Odin's "120 Hz" refreshes every 8.22 ms), and a clock of exactly 1/30 s then drifts against four
+   refreshes, one picture shown a refresh longer every ~18 frames. The real-time frame step follows the measured frame
+   time, so game speed is unchanged. TOTK_PANEL_CLOCK=0 keeps the exact period. */
+static uint64_t panel_period(uint64_t period) {
+    static int on = -1; if (on < 0) { const char *e = getenv("TOTK_PANEL_CLOCK"); on = !(e && !strcmp(e, "0")); }
+    uint64_t r = on && period && nvn_display_refresh_ns ? nvn_display_refresh_ns() : 0;
+    if (!r) return period;
+    uint64_t n = (period + r / 2) / r, p = n * r;
+    if (!n || (p > period ? p - period : period - p) > period / 40) return period;
+    { static uint64_t logged; if (logged != p) { logged = p; LOG("[nvn] frame clock %.3f ms: %llu refreshes of %.3f ms (period %.3f)", p / 1e6, (unsigned long long)n, r / 1e6, period / 1e6); } }
+    return p;
+}
 static uint64_t present_period(const win_t *o) {
     unsigned itv = present_ticks(o); int m = mfx_enabled(), hz = g_uncapped && !uncapped_now() ? g_paced_hz : g_hz;
     { static int was = -1; if (was >= 0 && m != was)
@@ -4029,7 +4044,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         LOG("[nvn] 翻译线程 至帧 %llu：排空等待 %llu 次 / %.1f ms（近 300 帧），队列中 %llu 项", (unsigned long long)g_frame, (unsigned long long)d, dn / 1e6, (unsigned long long)q); }
     // 真机语义：出图只入队、立即返回；本帧显示时刻按节拍器排，该贴图到「显示时刻 + 一个周期」才可再获取（阻塞在 AcquireTexture）
     // Real-device semantics: present only enqueues and returns immediately; this frame's display time is scheduled by the pacer, and the texture can be acquired again only at "display time + one period" (blocking in AcquireTexture)
-    uint64_t period = present_period(o), now = dm_detclock_enabled() ? guest_ns() : now_ns();
+    uint64_t period = panel_period(present_period(o)), now = dm_detclock_enabled() ? guest_ns() : now_ns();
     if (totk_sr_on()) sr_frame(o);
     nvn_pacer pc = {o->pace};
     uint64_t slot = now + nvn_pace(&pc, now, period);
