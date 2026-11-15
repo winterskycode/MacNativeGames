@@ -547,15 +547,23 @@ void runtime_describe_address(uint64_t a, char *out, size_t n);
 #define CORE_DIAG_NS 4000000L
 static int core_diag_on(void) { return dm_core_diag_enabled(); }
 static int g_core_reports;
+/* an owner entry of the table recorded because that owner held a core a better thread waited 4 ms for (core_wait_report) */
+#define AP_INV_BIT 0x80000000u
+/* the owner core_wait_report signalled to see where it is: its handler records its pc whatever it decides */
+static _Atomic uint32_t g_inv_probe;
+/* when it was sent (a probe the owner never answers expires), and probes sent / answered */
+static uint64_t g_inv_probe_ns; static _Atomic uint64_t g_inv_probes, g_inv_answers;
 /* Enter/return holding G. Snapshot retained Mach ports, then drop G before suspending or formatting:
    an owner may be in host code holding an allocator/dyld lock, or may next need the scheduler lock. */
 static void core_wait_report(thr_t *w, uint64_t since) {
     if (g_core_reports++ >= 400) return;
-    struct { mach_port_t port; uint32_t handle; int prio; uint64_t mask, held; int svc; } owners[NCORE] = {0};
-    uint64_t now = now_ns(), mask = w->mask; uint32_t handle = w->handle; int prio = w->prio;
+    struct { mach_port_t port; uint32_t handle; int prio, eprio; uint64_t mask, held; int svc; } owners[NCORE] = {0};
+    uint64_t now = now_ns(), mask = w->mask; uint32_t handle = w->handle; int prio = w->prio, eprio = eff_prio(w);
     for (int i=0;i<NCORE;i++) {
         thr_t *o = g_core_owner[i]; if (!o) continue;
-        owners[i].handle=o->handle; owners[i].prio=o->prio; owners[i].mask=o->mask;
+        owners[i].handle=o->handle; owners[i].prio=o->prio; owners[i].eprio=eff_prio(o); owners[i].mask=o->mask;
+        /* a worse owner on a core the waiter may use: signalled once, its handler records where it is (the core table) */
+        if ((mask >> i & 1) && owners[i].eprio > eprio && (!atomic_load(&g_inv_probe) || now - g_inv_probe_ns > 20000000ull)) { g_inv_probe_ns = now; atomic_store(&g_inv_probe, o->handle); atomic_fetch_add(&g_inv_probes, 1); pthread_kill(o->pt, SIGUSR2); }
         owners[i].held=o->core_since ? now-o->core_since : 0; owners[i].svc=o->last_svc;
         if (o->mport && mach_port_mod_refs(mach_task_self(), o->mport, MACH_PORT_RIGHT_SEND, 1) == KERN_SUCCESS) owners[i].port=o->mport;
     }
@@ -573,11 +581,12 @@ static void core_wait_report(thr_t *w, uint64_t since) {
         if (ok) { runtime_describe_address(arm_thread_state64_get_pc(state), pc[i], sizeof pc[i]);
                   runtime_describe_address(arm_thread_state64_get_lr(state), lr[i], sizeof lr[i]); }
     }
-    fprintf(stderr, "[core-wait] thread %#x (priority %d, mask %#llx) waited %.1f ms:", handle, prio, (unsigned long long)mask, (now-since)/1e6);
+    /* "runs at": the priority inherited from a better thread waiting on a mutex it owns (eff_prio), which scheduling uses */
+    fprintf(stderr, "[core-wait] thread %#x (priority %d, runs at %d, mask %#llx) waited %.1f ms:", handle, prio, eprio, (unsigned long long)mask, (now-since)/1e6);
     for (int i=0;i<NCORE;i++) {
         if (!owners[i].handle) { fprintf(stderr, " core %d free;", i); continue; }
-        fprintf(stderr, " core %d%s: %#x (priority %d, mask %#llx, held %.1f ms, last svc %#x) at %s <- %s;", i,
-            (mask>>i&1) ? "" : " (not in mask)", owners[i].handle, owners[i].prio, (unsigned long long)owners[i].mask,
+        fprintf(stderr, " core %d%s: %#x (priority %d, runs at %d, mask %#llx, held %.1f ms, last svc %#x) at %s <- %s;", i,
+            (mask>>i&1) ? "" : " (not in mask)", owners[i].handle, owners[i].prio, owners[i].eprio, (unsigned long long)owners[i].mask,
             owners[i].held/1e6, owners[i].svc, pc[i], lr[i]);
     }
     fputc('\n',stderr);
@@ -648,7 +657,7 @@ static struct { _Atomic uint64_t key; uint64_t pc, lr, fp[AP_FRAMES]; uint32_t o
 static void ap_note_pc(uint32_t owner, uint64_t pc, uint64_t lr, const uint64_t fp[AP_FRAMES]) {
     /* TOTK_AP_OWNER=<handle>: that owner's refusals alone */
     static long only = -1; if (only < 0) { const char *e = getenv("TOTK_AP_OWNER"); only = e ? strtol(e, NULL, 0) : 0; }
-    if (only && owner != (uint32_t)only) return;
+    if (only && (owner & ~AP_INV_BIT) != (uint32_t)only && !(owner & AP_INV_BIT)) return;
     uint64_t key = pc ^ lr * 31 ^ (uint64_t)owner << 40; for (int i = 0; i < AP_FRAMES; i++) key = key * 961 ^ fp[i]; key |= 1;
     uint64_t h = (key ^ key >> 17) * 0x9E3779B97F4A7C15ull;
     for (int k = 0; k < 8; k++) {
@@ -673,16 +682,20 @@ static void ap_describe(uint64_t a, char *out, size_t n) {   // runtime_describe
     }
 }
 static void ap_print_pcs(void) {
+    /* the refusals, then the inversion holders: each its own most frequent 24 */
+    for (int inv = 0; inv < 2; inv++) {
     struct { unsigned i; uint64_t n; } top[24] = {{0}}; int nt = 0;
     for (unsigned i = 0; i < AP_PC_SLOTS; i++) {
-        uint64_t n = atomic_exchange(&g_ap_pcs[i].n, 0); if (!atomic_load(&g_ap_pcs[i].key) || !n) continue;
+        if (!atomic_load(&g_ap_pcs[i].key) || !(g_ap_pcs[i].owner & AP_INV_BIT) != !inv) continue;
+        uint64_t n = atomic_exchange(&g_ap_pcs[i].n, 0); if (!n) continue;
         int j = nt < 24 ? nt++ : 23; if (j == 23 && top[23].n >= n) continue;
         top[j].i = i; top[j].n = n;
         while (j > 0 && top[j - 1].n < top[j].n) { typeof(top[0]) tmp = top[j - 1]; top[j - 1] = top[j]; top[j] = tmp; j--; }
     }
     for (int i = 0; i < nt; i++) { char d[128], l[128], f[AP_FRAMES][128]; ap_describe(g_ap_pcs[top[i].i].pc, d, sizeof d); ap_describe(g_ap_pcs[top[i].i].lr, l, sizeof l);
         for (int k = 0; k < AP_FRAMES; k++) { if (g_ap_pcs[top[i].i].fp[k]) ap_describe(g_ap_pcs[top[i].i].fp[k], f[k], sizeof f[k]); else strcpy(f[k], "-"); }
-        fprintf(stderr, "[core-table]   refused in host code (owner %#x) at %s <- %s <- %s <- %s <- %s <- %s <- %s: %llu times\n", g_ap_pcs[top[i].i].owner, d, l, f[0], f[1], f[2], f[3], f[4], (unsigned long long)top[i].n); }
+        uint32_t ow = g_ap_pcs[top[i].i].owner; fprintf(stderr, ow & AP_INV_BIT ? "[core-table]   inversion holder %#x at %s <- %s <- %s <- %s <- %s <- %s <- %s: %llu times\n" : "[core-table]   refused in host code (owner %#x) at %s <- %s <- %s <- %s <- %s <- %s <- %s: %llu times\n", ow & ~AP_INV_BIT, d, l, f[0], f[1], f[2], f[3], f[4], (unsigned long long)top[i].n); }
+    }
 }
 static void totk_note_self(thr_t *t) {   // the calling thread, once its slots are set (guest_thread_init): for totk_kick
     if (t->hle_slot || !runtime_hle_tsd_off) return;
@@ -744,6 +757,13 @@ static void totk_preempt_signal(int sig, siginfo_t *si, void *context) {
     (void)sig; (void)si;
     thr_t *t = me_or_null();
     if (t) APT(t, APT_ENTER);
+    /* core_wait_report's probe: where this owner is while a better thread waits for its core */
+    if (t && atomic_load_explicit(&g_inv_probe, memory_order_acquire) == t->handle) {
+        atomic_store_explicit(&g_inv_probe, 0, memory_order_release); atomic_fetch_add(&g_inv_answers, 1);
+        uint64_t fp = (uint64_t)UC_FP(((ucontext_t *)context)), sp = (uint64_t)UC_SP(((ucontext_t *)context)), rets[AP_FRAMES] = {0};
+        for (int k = 0; k < AP_FRAMES && fp >= sp && fp - sp < (1u << 20) && !(fp & 15); k++) { const uint64_t *rec = (const uint64_t *)(uintptr_t)fp; rets[k] = rec[1]; if (rec[0] <= fp) break; fp = rec[0]; }
+        ap_note_pc(t->handle | AP_INV_BIT, (uint64_t)UC_PC(((ucontext_t *)context)), (uint64_t)UC_LR(((ucontext_t *)context)), rets);
+    }
     if (!t || !__atomic_load_n(&t->preempt, __ATOMIC_ACQUIRE) || t->cur_core < 0) { if (t) APT(t, APT_STALE); return; }
     uint64_t pc = (uint64_t)UC_PC(((ucontext_t *)context));
     uintptr_t tp = runtime_host_tsd();
@@ -1135,9 +1155,9 @@ static void core_table(void) {
     { uint64_t sp = atomic_load_explicit(&g_spin_passes, memory_order_relaxed); if (sp) fprintf(stderr, "[core-table] spin-wait gate passes so far: %llu, core hand-offs %llu%s\n", (unsigned long long)sp, (unsigned long long)atomic_load_explicit(&g_spin_handoffs, memory_order_relaxed), spin_on() ? "" : " (TOTK_SPIN=0: the core is kept)"); }
 #ifndef GAME_BOTW
     if (ap_on) fprintf(stderr,"[core-table] asynchronous preemption so far: %llu signals, %llu cores given up in the handler, %llu refused (host code), "
-                       "%llu deferred to SVC 0x36; not signalled: %llu in a host function, %llu with preemption disabled, %llu signalled < 2 ms ago\n",
+                       "%llu deferred to SVC 0x36; not signalled: %llu in a host function, %llu with preemption disabled, %llu signalled < 2 ms ago; inversion probes %llu sent, %llu answered\n",
                        (unsigned long long)ap[0],(unsigned long long)ap[1],(unsigned long long)ap[2],(unsigned long long)ap[3],
-                       (unsigned long long)ap[4],(unsigned long long)ap[5],(unsigned long long)ap[6]);
+                       (unsigned long long)ap[4],(unsigned long long)ap[5],(unsigned long long)ap[6],(unsigned long long)atomic_load(&g_inv_probes),(unsigned long long)atomic_load(&g_inv_answers));
     if (ap_on) ap_print_pcs();
 #endif
     for (int i=0;i<n;i++) { const row *r=&rows[i];
