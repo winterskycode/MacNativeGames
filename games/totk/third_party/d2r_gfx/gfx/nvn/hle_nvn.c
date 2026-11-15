@@ -636,6 +636,12 @@ NVN(nvnTextureGetViewOffset, ptrdiff_t, const NVNtexture *t, const NVNtextureVie
     if (w->set_layers) off += (uint64_t)w->min_layer * o->L.layer_size;
     return (ptrdiff_t)off;
 }
+/* Read and WriteTexels are host work (swizzling, the dirty pages' protection, a GPU read-back's fence wait) on the game's
+   texture threads, priority 55 pinned to core 1 like its render thread (priority 30): holding that virtual core they
+   kept the render thread waiting for it, and a host function cannot be preempted (one 4+ ms wait each time; frame-time
+   spikes while streaming). The core is given up for the call, as the other blocking NVN calls do (NVN_BLOCKING).
+   TOTK_TEXELS_AWAY=0 keeps it. */
+static int texels_away_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("TOTK_TEXELS_AWAY"); on = !(e && !strcmp(e, "0")); } return on; }
 // CPU 读贴图（NVN ReadTexels）：预排布贴图以池内存为真值（解排布直读），GPU 写出的贴图从 MTLTexture 读回（nvn_mtl.m）
 // CPU texture read (NVN ReadTexels): for packaged textures the pool memory is the ground truth (de-layout and read directly); GPU-written textures are read back from the MTLTexture (nvn_mtl.m)
 static void read_texels(const tex_t *o, const view_t *v, const NVNcopyRegion *r, uint8_t *dst, ptrdiff_t row, ptrdiff_t img) {
@@ -644,6 +650,7 @@ static void read_texels(const tex_t *o, const view_t *v, const NVNcopyRegion *r,
     if (!row) row = wb;
     if (!img) img = row * hb;
     unsigned level = v && v->set_levels ? (unsigned)v->base_level : 0, layer0 = v && v->set_layers ? (unsigned)v->min_layer : 0;
+    __attribute__((cleanup(runtime_core_back))) int away = texels_away_on() ? runtime_core_away() : 0;
     replay_enter(); mtl_read_texels(o, level, layer0, r, dst, (size_t)row, (size_t)img); replay_leave();
 }
 NVN(nvnTextureReadTexels, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r, void *dst) {
@@ -660,6 +667,7 @@ static void write_texels(const tex_t *o, const view_t *v, const NVNcopyRegion *r
     if (row < (ptrdiff_t)wb || img < row * (ptrdiff_t)hb) die("WriteTexels: stride smaller than region");
     unsigned level = v && v->set_levels ? (unsigned)v->base_level : 0, layer0 = v && v->set_layers ? (unsigned)v->min_layer : 0;
     if (v && v->set_format && v->format != o->d.format) die("WriteTexels: format-reinterpreting view not supported");
+    __attribute__((cleanup(runtime_core_back))) int away = texels_away_on() ? runtime_core_away() : 0;
     replay_enter(); mtl_write_texels(o, level, layer0, r, src, (size_t)row, (size_t)img); replay_leave();
 }
 NVN(nvnTextureWriteTexels, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r, const void *src) {
@@ -3834,6 +3842,7 @@ static void present_exec(win_t *o, int idx, double period, const int crop[4], ui
 }
 NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     NVN_BLOCKING();
+    { uint32_t runtime_thread_current_handle(void); static uint32_t said; uint32_t me = runtime_thread_current_handle(); if (me != said) { said = me; LOG("[nvn] the game presents from guest thread %#x", me); } }
     qtrace("present", q, idx, 0); win_t *o = (win_t *)w; o->presents++;
     if (runtime_frametrace_event) runtime_frametrace_event(9);
     totk_tl_frame(o->presents); totk_tl(TL_PRES_IN, (uint64_t)idx, 0);

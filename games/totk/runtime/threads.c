@@ -642,12 +642,18 @@ static uint64_t g_ap_skip_host, g_ap_skip_disabled, g_ap_skip_recent;
 /* TOTK_CORE_DIAG: where the owners that refused were (host code, by pc): an owner in a host function is then signalled
    anyway, so the handler sees the pc; the core table prints the most frequent places. Lock-free, lossy table. */
 #define AP_PC_SLOTS 256
-static struct { _Atomic uint64_t key; uint64_t pc, lr, fp1; _Atomic uint64_t n; } g_ap_pcs[AP_PC_SLOTS];
-static void ap_note_pc(uint64_t pc, uint64_t lr, uint64_t fp1) {
-    uint64_t key = (pc ^ lr * 31 ^ fp1 * 961) | 1, h = (key ^ key >> 17) * 0x9E3779B97F4A7C15ull;
+#define AP_FRAMES 5
+static struct { _Atomic uint64_t key; uint64_t pc, lr, fp[AP_FRAMES]; uint32_t owner; _Atomic uint64_t n; } g_ap_pcs[AP_PC_SLOTS];
+/* fp: the return addresses of up to AP_FRAMES frame records above the interrupted one (0 past the last sane one) */
+static void ap_note_pc(uint32_t owner, uint64_t pc, uint64_t lr, const uint64_t fp[AP_FRAMES]) {
+    /* TOTK_AP_OWNER=<handle>: that owner's refusals alone */
+    static long only = -1; if (only < 0) { const char *e = getenv("TOTK_AP_OWNER"); only = e ? strtol(e, NULL, 0) : 0; }
+    if (only && owner != (uint32_t)only) return;
+    uint64_t key = pc ^ lr * 31 ^ (uint64_t)owner << 40; for (int i = 0; i < AP_FRAMES; i++) key = key * 961 ^ fp[i]; key |= 1;
+    uint64_t h = (key ^ key >> 17) * 0x9E3779B97F4A7C15ull;
     for (int k = 0; k < 8; k++) {
         unsigned i = (unsigned)((h + (uint64_t)k) % AP_PC_SLOTS); uint64_t have = atomic_load_explicit(&g_ap_pcs[i].key, memory_order_acquire);
-        if (!have && atomic_compare_exchange_strong(&g_ap_pcs[i].key, &have, key)) { g_ap_pcs[i].pc = pc; g_ap_pcs[i].lr = lr; g_ap_pcs[i].fp1 = fp1; have = key; }
+        if (!have && atomic_compare_exchange_strong(&g_ap_pcs[i].key, &have, key)) { g_ap_pcs[i].pc = pc; g_ap_pcs[i].lr = lr; memcpy(g_ap_pcs[i].fp, fp, sizeof g_ap_pcs[i].fp); g_ap_pcs[i].owner = owner; have = key; }
         if (have == key) { atomic_fetch_add(&g_ap_pcs[i].n, 1); return; }
     }
 }
@@ -667,15 +673,16 @@ static void ap_describe(uint64_t a, char *out, size_t n) {   // runtime_describe
     }
 }
 static void ap_print_pcs(void) {
-    struct { unsigned i; uint64_t n; } top[12] = {{0}}; int nt = 0;
+    struct { unsigned i; uint64_t n; } top[24] = {{0}}; int nt = 0;
     for (unsigned i = 0; i < AP_PC_SLOTS; i++) {
         uint64_t n = atomic_exchange(&g_ap_pcs[i].n, 0); if (!atomic_load(&g_ap_pcs[i].key) || !n) continue;
-        int j = nt < 12 ? nt++ : 11; if (j == 11 && top[11].n >= n) continue;
+        int j = nt < 24 ? nt++ : 23; if (j == 23 && top[23].n >= n) continue;
         top[j].i = i; top[j].n = n;
         while (j > 0 && top[j - 1].n < top[j].n) { typeof(top[0]) tmp = top[j - 1]; top[j - 1] = top[j]; top[j] = tmp; j--; }
     }
-    for (int i = 0; i < nt; i++) { char d[128], l[128], f[128]; ap_describe(g_ap_pcs[top[i].i].pc, d, sizeof d); ap_describe(g_ap_pcs[top[i].i].lr, l, sizeof l); ap_describe(g_ap_pcs[top[i].i].fp1, f, sizeof f);
-        fprintf(stderr, "[core-table]   refused in host code at %s <- %s <- %s: %llu times\n", d, l, f, (unsigned long long)top[i].n); }
+    for (int i = 0; i < nt; i++) { char d[128], l[128], f[AP_FRAMES][128]; ap_describe(g_ap_pcs[top[i].i].pc, d, sizeof d); ap_describe(g_ap_pcs[top[i].i].lr, l, sizeof l);
+        for (int k = 0; k < AP_FRAMES; k++) { if (g_ap_pcs[top[i].i].fp[k]) ap_describe(g_ap_pcs[top[i].i].fp[k], f[k], sizeof f[k]); else strcpy(f[k], "-"); }
+        fprintf(stderr, "[core-table]   refused in host code (owner %#x) at %s <- %s <- %s <- %s <- %s <- %s <- %s: %llu times\n", g_ap_pcs[top[i].i].owner, d, l, f[0], f[1], f[2], f[3], f[4], (unsigned long long)top[i].n); }
 }
 static void totk_note_self(thr_t *t) {   // the calling thread, once its slots are set (guest_thread_init): for totk_kick
     if (t->hle_slot || !runtime_hle_tsd_off) return;
@@ -741,9 +748,10 @@ static void totk_preempt_signal(int sig, siginfo_t *si, void *context) {
     uint64_t pc = (uint64_t)UC_PC(((ucontext_t *)context));
     uintptr_t tp = runtime_host_tsd();
     if (!runtime_hle_tsd_off || !*(volatile uintptr_t *)(tp + runtime_hle_tsd_off) || !runtime_guest_code_pc(pc)) {
-        __atomic_fetch_add(&g_ap_refused, 1, __ATOMIC_RELAXED); APT(t, APT_REFUSED); if (core_diag_on()) { uint64_t fp = (uint64_t)UC_FP(((ucontext_t *)context)), sp = (uint64_t)UC_SP(((ucontext_t *)context)), fp1 = 0;
-            if (fp >= sp && fp - sp < (1u << 20) && !(fp & 15)) fp1 = ((const uint64_t *)(uintptr_t)fp)[1];   // the caller's return address, when the frame chain looks sane
-            ap_note_pc(pc, (uint64_t)UC_LR(((ucontext_t *)context)), fp1); } return; }   // in a host function: its next SVC gives the core up
+        __atomic_fetch_add(&g_ap_refused, 1, __ATOMIC_RELAXED); APT(t, APT_REFUSED); if (core_diag_on()) { uint64_t fp = (uint64_t)UC_FP(((ucontext_t *)context)), sp = (uint64_t)UC_SP(((ucontext_t *)context)), rets[AP_FRAMES] = {0};
+            /* the frame records' return addresses while the chain looks sane: upward, 16-byte aligned, within 1 MiB of sp */
+            for (int k = 0; k < AP_FRAMES && fp >= sp && fp - sp < (1u << 20) && !(fp & 15); k++) { const uint64_t *rec = (const uint64_t *)(uintptr_t)fp; rets[k] = rec[1]; if (rec[0] <= fp) break; fp = rec[0]; }
+            ap_note_pc(t->handle, pc, (uint64_t)UC_LR(((ucontext_t *)context)), rets); } return; }   // in a host function: its next SVC gives the core up
     /* Horizon's preemption disable (ThreadLocalRegion +0x100 disable_count, +0x102 interrupt_flag): the SDK's spin locks
        (sdk+0x1277e0 and siblings) set disable_count while they hold or try the lock word, and after clearing it call
        SynchronizePreemptionState (SVC 0x36) when interrupt_flag is set. The kernel does not preempt such a thread; it
