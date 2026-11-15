@@ -2609,6 +2609,7 @@ static void x_thread_pin(void) {}
 enum { FRZ_OFF, FRZ_ARMED, FRZ_REC, FRZ_REPLAY };
 static struct { int state; xjob *jobs; int n, cap; uint64_t replays; int preview; } g_frz;
 int overlay_preview_wanted(void) __attribute__((weak)); int overlay_preview_take(void) __attribute__((weak)); void mtl_freeze_preview(int images_only) __attribute__((weak));
+void mtl_preview_hold(int on) __attribute__((weak)); void mtl_preview_quiet(int on) __attribute__((weak));
 static int frz_preview_wanted(void) { return overlay_preview_wanted && overlay_preview_take && mtl_freeze_preview && overlay_preview_wanted(); }
 /* the menu's preview frame is recorded and the game held (the menu's pause until then lets the game draw it) */
 int nvn_preview_frozen(void) { return g_frz.preview && g_frz.state == FRZ_REPLAY; }
@@ -2672,7 +2673,11 @@ static int frz_replay(void) {
         LOG("[freeze] resumed after %llu replays", (unsigned long long)g_frz.replays); return 0; }
     int runs = g_frz.preview ? overlay_preview_take() : 1;
     uint64_t t0 = now_ns();
+    /* the menu's preview: the screen keeps the last picture until the last replay, which alone is shown */
+    int quiet = g_frz.preview && runs > 0 && mtl_preview_hold && mtl_preview_quiet;
+    if (quiet) mtl_preview_hold(1);
     for (int r = 0; r < runs; r++) {
+        if (quiet) mtl_preview_quiet(r < runs - 1);
         mtl_freeze_restore();
         for (int i = 0; i < g_frz.n; i++) {
             xjob *j = &g_frz.jobs[i];
@@ -2682,6 +2687,7 @@ static int frz_replay(void) {
         g_frz.replays++;
         if (!g_frz.preview && !(g_frz.replays % 120)) LOG("[freeze] %llu replays", (unsigned long long)g_frz.replays);
     }
+    if (quiet) { mtl_preview_quiet(0); mtl_preview_hold(0); }
     if (runs && g_frz.preview) LOG("[freeze] menu preview: %d replays in %.1f ms", runs, (now_ns() - t0) / 1e6);
     return runs > 0;
 }
