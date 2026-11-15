@@ -2600,9 +2600,18 @@ static void x_thread_pin(void) {}
    with copies of the handle lists and uniform captures), the game is held at its next acquire, and the translation thread
    replays that frame in a loop from the same GPU state (the backend snapshots every image before the frame and restores
    it before each replay: nvn_vulkan_freeze.inc). Live debug switches (magenta.txt, probes, shader overrides) then act on
-   an identical frame each time. Deleting the file resumes the game. */
+   an identical frame each time. Deleting the file resumes the game.
+   Android's in-game menu uses the same recording as a preview (overlay_preview_wanted): the frame drawn after the menu
+   opens is recorded with only the images snapshotted (mtl_freeze_preview), the game is held, and the frame is replayed
+   only when the menu asks (overlay_preview_take, after a picture setting changed), so the picture behind the menu is
+   the same moment drawn with the new settings. Without the translation thread the held game thread runs the replays
+   itself (frz_hold_tick). */
 enum { FRZ_OFF, FRZ_ARMED, FRZ_REC, FRZ_REPLAY };
-static struct { int state; xjob *jobs; int n, cap; uint64_t replays; } g_frz;
+static struct { int state; xjob *jobs; int n, cap; uint64_t replays; int preview; } g_frz;
+int overlay_preview_wanted(void) __attribute__((weak)); int overlay_preview_take(void) __attribute__((weak)); void mtl_freeze_preview(int images_only) __attribute__((weak));
+static int frz_preview_wanted(void) { return overlay_preview_wanted && overlay_preview_take && mtl_freeze_preview && overlay_preview_wanted(); }
+/* the menu's preview frame is recorded and the game held (the menu's pause until then lets the game draw it) */
+int nvn_preview_frozen(void) { return g_frz.preview && g_frz.state == FRZ_REPLAY; }
 static _Atomic int g_frz_hold;   // the game waits at nvnWindowAcquireTexture
 void mtl_freeze_snapshot(void) __attribute__((weak)); void mtl_freeze_frozen(void) __attribute__((weak)); void mtl_freeze_restore(void) __attribute__((weak)); void mtl_freeze_release(void) __attribute__((weak));
 void *mtl_sub_ucap_clone(const void *) __attribute__((weak)); void mtl_sub_ucap_free(void *) __attribute__((weak));   /* Vulkan backend; absent in the null backend (freeze stays off) */
@@ -2647,22 +2656,39 @@ static void frz_clear(void) {
     for (int i = 0; i < g_frz_nblocks; i++) free(g_frz_blocks[i]); free(g_frz_blocks); g_frz_blocks = NULL; g_frz_nblocks = g_frz_capblocks = 0;
 }
 static void frz_after_present(void) {
-    if (g_frz.state == FRZ_OFF && frz_requested()) { g_frz.state = FRZ_ARMED; LOG("[freeze] armed: recording the next frame"); }
+    if (g_frz.state == FRZ_OFF && frz_requested()) { g_frz.state = FRZ_ARMED; g_frz.preview = 0; LOG("[freeze] armed: recording the next frame"); }
+    else if (g_frz.state == FRZ_OFF && frz_preview_wanted()) { g_frz.state = FRZ_ARMED; g_frz.preview = 1; }
     else if (g_frz.state == FRZ_REC) { g_frz.state = FRZ_REPLAY; atomic_store(&g_frz_hold, 1); g_frz.replays = 0; mtl_freeze_frozen();
         int subs = 0; for (int i = 0; i < g_frz.n; i++) subs += g_frz.jobs[i].kind == XJ_SUBMIT;
-        LOG("[freeze] frozen: %d jobs (%d submits); the game is held, the frame replays until files/freeze is deleted", g_frz.n, subs); }
+        if (g_frz.preview) LOG("[freeze] menu preview: %d jobs (%d submits) recorded; the game is held while the menu is open", g_frz.n, subs);
+        else LOG("[freeze] frozen: %d jobs (%d submits); the game is held, the frame replays until files/freeze is deleted", g_frz.n, subs); }
 }
-static void frz_replay(void) {
-    if (!frz_requested()) {
+/* the recording starts at the frame's first job: every image snapshotted (only images for the menu preview) */
+static void frz_begin_recording(void) { if (mtl_freeze_preview) mtl_freeze_preview(g_frz.preview); mtl_freeze_snapshot(); g_frz.state = FRZ_REC; }
+/* Returns 1 when it replayed. The debug freeze replays in a loop; the menu preview as many times as the menu asked. */
+static int frz_replay(void) {
+    if (g_frz.preview ? !frz_preview_wanted() : !frz_requested()) {
         mtl_freeze_release(); frz_clear(); g_frz.state = FRZ_OFF; atomic_store(&g_frz_hold, 0);
-        LOG("[freeze] resumed after %llu replays", (unsigned long long)g_frz.replays); return; }
-    mtl_freeze_restore();
-    for (int i = 0; i < g_frz.n; i++) {
-        xjob *j = &g_frz.jobs[i];
-        if (j->kind == XJ_SUBMIT) submit_exec(j->n, j->h, mtl_sub_ucap_clone(j->ucap));
-        else if (j->kind == XJ_PRESENT) present_exec(j->win, j->idx, j->period, j->crop, j->frame);
+        LOG("[freeze] resumed after %llu replays", (unsigned long long)g_frz.replays); return 0; }
+    int runs = g_frz.preview ? overlay_preview_take() : 1;
+    uint64_t t0 = now_ns();
+    for (int r = 0; r < runs; r++) {
+        mtl_freeze_restore();
+        for (int i = 0; i < g_frz.n; i++) {
+            xjob *j = &g_frz.jobs[i];
+            if (j->kind == XJ_SUBMIT) submit_exec(j->n, j->h, mtl_sub_ucap_clone(j->ucap));
+            else if (j->kind == XJ_PRESENT) present_exec(j->win, j->idx, j->period, j->crop, j->frame);
+        }
+        g_frz.replays++;
+        if (!g_frz.preview && !(g_frz.replays % 120)) LOG("[freeze] %llu replays", (unsigned long long)g_frz.replays);
     }
-    if (!(++g_frz.replays % 120)) LOG("[freeze] %llu replays", (unsigned long long)g_frz.replays);
+    if (runs && g_frz.preview) LOG("[freeze] menu preview: %d replays in %.1f ms", runs, (now_ns() - t0) / 1e6);
+    return runs > 0;
+}
+/* The held game thread, without the translation thread: the replays, in the replay section like any submit */
+static void frz_hold_tick(void) {
+    if (async_replay() || g_frz.state != FRZ_REPLAY || !gfx_try_enter()) return;
+    replay_enter(); frz_replay(); replay_leave(); gfx_leave();
 }
 /* The replay section. With the translation thread (TOTK_ASYNC_REPLAY=1) every replay runs on it in order, and an operation
    that reads or changes Metal state from a game thread first waits for it to be idle (x_drain). With synchronous replay
@@ -2694,11 +2720,12 @@ static void *x_thread(void *unused) {
         if (g_xq_done == g_xq_in && g_pq_in != g_pq_out) { plan_job pj = g_pq[g_pq_out++ % PQ]; pthread_mutex_unlock(&g_xq_mu); plan_run(&pj); continue; }   /* idle: plan a finished recording */
         if (g_xq_done == g_xq_in) {   // frozen and nothing queued
             pthread_mutex_unlock(&g_xq_mu);
-            if (gfx_try_enter()) { frz_replay(); gfx_leave(); } else { struct timespec ts = {0, 16000000}; nanosleep(&ts, NULL); }
+            int ran = 0; if (gfx_try_enter()) { ran = frz_replay(); gfx_leave(); }
+            if (!ran) { struct timespec ts = {0, g_frz.preview ? 5000000 : 16000000}; nanosleep(&ts, NULL); }
             continue; }
         xjob j = g_xq[g_xq_done % XQ];
         pthread_mutex_unlock(&g_xq_mu);
-        if (g_frz.state == FRZ_ARMED && j.kind != XJ_TEXREL) { mtl_freeze_snapshot(); g_frz.state = FRZ_REC; }
+        if (g_frz.state == FRZ_ARMED && j.kind != XJ_TEXREL) frz_begin_recording();
         if (g_frz.state == FRZ_REC && j.kind != XJ_TEXREL) frz_record(&j);
         if (j.kind == XJ_SUBMIT) { if (mtl_sub_job_time) mtl_sub_job_time(j.ns); submit_exec(j.n, j.h, j.ucap); free(j.h); }
         else if (j.kind == XJ_TEXREL) { void live_del_x(const tex_t *o); live_del_x(&j.tex); mtl_tex_release(&j.tex); }
@@ -2851,7 +2878,12 @@ NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h)
 #endif
         return;
     }
-    replay_enter(); submit_exec(n, (const uint64_t *)h, NULL); replay_leave();
+    replay_enter();
+    if (g_frz.state == FRZ_ARMED) frz_begin_recording();
+    if (g_frz.state == FRZ_REC) {   /* the replays need this frame's uniforms: the game rewrites them before it is held */
+        xjob j = {.kind = XJ_SUBMIT, .n = n, .h = (uint64_t *)h, .ucap = mtl_sub_capture_ubos((const uint64_t *)h, n)};
+        mtl_sub_capture_copy(j.ucap); frz_record(&j); mtl_sub_ucap_free(j.ucap); }
+    submit_exec(n, (const uint64_t *)h, NULL); replay_leave();
     if (atomic_load(&g_fence_sync_used)) for (int i = 0; i < n; i++) fence_syncs((const uint8_t *)h[i], 0, mtl_last_fence(), 0);   /* without the translation thread: the fence the submit ended with */
     atomic_store(&g_sub_fence_prev, atomic_load(&g_sub_fence_last)); atomic_store(&g_sub_fence_last, mtl_last_fence());
     gfx_leave();
@@ -3122,7 +3154,7 @@ int overlay_open(void) __attribute__((weak));   /* Android in-game overlay: the 
 NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsync *s, int *idx) {
     NVN_BLOCKING();
     while (overlay_open && overlay_open()) usleep(5000);   /* paused: the frame step discards the long frame that follows */
-    while (atomic_load(&g_frz_hold)) usleep(5000);          /* freeze-frame (debug): the translation thread replays one frame */
+    while (atomic_load(&g_frz_hold)) { frz_hold_tick(); usleep(5000); }   /* freeze-frame (debug) or the menu's preview: the frame replays */
     totk_tl(TL_ACQ_IN, 0, 0);
     win_t *o = (win_t *)w;
     *idx = o->active ? o->next++ % o->active : 0;
@@ -3655,7 +3687,10 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         j.frame = g_frame + 1;   // dump_frame below advances g_frame before mtl_set_frame
         uint64_t no = x_push(&j);
         if (idx >= 0 && idx < 4) { g_xp_win = o; g_xp_job[idx] = no; }
-    } else { replay_enter(); present_exec(o, idx, present_period(o) / 1e9, o->crop, 0); replay_leave(); }
+    } else { replay_enter();
+        if (g_frz.state == FRZ_REC) { xjob j = {.kind = XJ_PRESENT, .win = o, .idx = idx, .period = present_period(o) / 1e9}; memcpy(j.crop, o->crop, sizeof j.crop); frz_record(&j); }
+        present_exec(o, idx, present_period(o) / 1e9, o->crop, 0);
+        frz_after_present(); replay_leave(); }
     gfx_leave();
     { static int fin = -1; if (fin < 0) { fin = getenv("TOTK_PRESENT_FINISH") != NULL; if (fin) LOG("[nvn] TOTK_PRESENT_FINISH: each present waits until its frame has run on the GPU (diagnostic)"); }
       if (fin) { if (async_replay() && idx >= 0 && idx < 4) x_wait_job(g_xp_job[idx]); void mtl_finish(void); mtl_finish(); } }
