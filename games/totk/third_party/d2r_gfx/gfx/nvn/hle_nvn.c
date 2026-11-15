@@ -2656,7 +2656,14 @@ static void frz_clear(void) {
     free(g_frz.jobs); g_frz.jobs = NULL; g_frz.n = g_frz.cap = 0;
     for (int i = 0; i < g_frz_nblocks; i++) free(g_frz_blocks[i]); free(g_frz_blocks); g_frz_blocks = NULL; g_frz_nblocks = g_frz_capblocks = 0;
 }
+/* the menu closed before its preview frame was recorded: no recording, no hold */
+static int frz_preview_stale(void) {
+    if (!g_frz.preview || (g_frz.state != FRZ_ARMED && g_frz.state != FRZ_REC) || frz_preview_wanted()) return 0;
+    if (g_frz.state == FRZ_REC) { mtl_freeze_release(); frz_clear(); }
+    g_frz.state = FRZ_OFF; g_frz.preview = 0; return 1;
+}
 static void frz_after_present(void) {
+    if (frz_preview_stale()) return;
     if (g_frz.state == FRZ_OFF && frz_requested()) { g_frz.state = FRZ_ARMED; g_frz.preview = 0; LOG("[freeze] armed: recording the next frame"); }
     else if (g_frz.state == FRZ_OFF && frz_preview_wanted()) { g_frz.state = FRZ_ARMED; g_frz.preview = 1; }
     else if (g_frz.state == FRZ_REC) { g_frz.state = FRZ_REPLAY; atomic_store(&g_frz_hold, 1); g_frz.replays = 0; mtl_freeze_frozen();
@@ -2665,7 +2672,7 @@ static void frz_after_present(void) {
         else LOG("[freeze] frozen: %d jobs (%d submits); the game is held, the frame replays until files/freeze is deleted", g_frz.n, subs); }
 }
 /* the recording starts at the frame's first job: every image snapshotted (only images for the menu preview) */
-static void frz_begin_recording(void) { if (mtl_freeze_preview) mtl_freeze_preview(g_frz.preview); mtl_freeze_snapshot(); g_frz.state = FRZ_REC; }
+static void frz_begin_recording(void) { if (frz_preview_stale()) return; if (mtl_freeze_preview) mtl_freeze_preview(g_frz.preview); mtl_freeze_snapshot(); g_frz.state = FRZ_REC; }
 /* Returns 1 when it replayed. The debug freeze replays in a loop; the menu preview as many times as the menu asked. */
 static int frz_replay(void) {
     if (g_frz.preview ? !frz_preview_wanted() : !frz_requested()) {
@@ -2707,14 +2714,18 @@ static void frz_hold_tick(void) {
 #define PTHREAD_RECURSIVE_MUTEX_INITIALIZER PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP   /* Bionic spells it this way */
 #endif
 static pthread_mutex_t g_sync_replay_mu = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
+/* With the translation thread: a frozen frame's replays (frz_replay, run there with the queue empty, so x_drain does not
+   wait for them) hold this, and so does every operation that enters the replay section from another thread, so the two
+   never overlap. Recursive: a write-back inside a replay enters it again on the translation thread. */
+static pthread_mutex_t g_frz_ex = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
 void mtl_take_submit_thread(void);   // nvn_mtl.m
 static int async_replay(void);
 static void replay_enter(void) {
-    if (async_replay()) { x_drain(); return; }
+    if (async_replay()) { x_drain(); { NVN_BLOCKING(); pthread_mutex_lock(&g_frz_ex); } return; }
     { NVN_BLOCKING(); pthread_mutex_lock(&g_sync_replay_mu); }
     mtl_take_submit_thread();
 }
-static void replay_leave(void) { if (!async_replay()) pthread_mutex_unlock(&g_sync_replay_mu); }
+static void replay_leave(void) { if (async_replay()) pthread_mutex_unlock(&g_frz_ex); else pthread_mutex_unlock(&g_sync_replay_mu); }
 void nvn_replay_enter(void) { replay_enter(); }   // for the graphics layer (memory-pool write-back)
 void nvn_replay_leave(void) { replay_leave(); }
 static _Thread_local int t_on_x_thread;   // set on the translation thread: x_drain there would wait for itself
@@ -2726,7 +2737,7 @@ static void *x_thread(void *unused) {
         if (g_xq_done == g_xq_in && g_pq_in != g_pq_out) { plan_job pj = g_pq[g_pq_out++ % PQ]; pthread_mutex_unlock(&g_xq_mu); plan_run(&pj); continue; }   /* idle: plan a finished recording */
         if (g_xq_done == g_xq_in) {   // frozen and nothing queued
             pthread_mutex_unlock(&g_xq_mu);
-            int ran = 0; if (gfx_try_enter()) { ran = frz_replay(); gfx_leave(); }
+            int ran = 0; if (gfx_try_enter()) { pthread_mutex_lock(&g_frz_ex); ran = frz_replay(); pthread_mutex_unlock(&g_frz_ex); gfx_leave(); }
             if (!ran) { struct timespec ts = {0, g_frz.preview ? 5000000 : 16000000}; nanosleep(&ts, NULL); }
             continue; }
         xjob j = g_xq[g_xq_done % XQ];
@@ -3159,7 +3170,7 @@ extern uint64_t g_t0_ns;   // 宿主进程起点（main.c；UIMSG 时间戳同�
 int overlay_open(void) __attribute__((weak));   /* Android in-game overlay: the game waits here while its menu is open */
 NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsync *s, int *idx) {
     NVN_BLOCKING();
-    while (overlay_open && overlay_open()) usleep(5000);   /* paused: the frame step discards the long frame that follows */
+    while (overlay_open && overlay_open()) { frz_hold_tick(); usleep(5000); }   /* paused (the menu's preview replays here without the translation thread): the frame step discards the long frame that follows */
     while (atomic_load(&g_frz_hold)) { frz_hold_tick(); usleep(5000); }   /* freeze-frame (debug) or the menu's preview: the frame replays */
     totk_tl(TL_ACQ_IN, 0, 0);
     win_t *o = (win_t *)w;
