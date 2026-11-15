@@ -1202,23 +1202,26 @@ static void copy_lists_free(copy_prefix *c) { (void)c; }
    image / sampler binds for the deferred binds, calls), appended after OP_END: the submit call, on the frame's critical
    path, read the whole recording twice to find them (TOTK, 2026-10-23: ~0.3 ms of a 0.8 ms submit). Offsets are from
    the handle. */
-static __thread uint32_t *t_idx; static __thread uint32_t t_idx_cap;
 /* TOTK: the recording's distinct uniform ranges {lo, hi}, sorted by lo, appended after the op index (ubo_off, nubo) so the
    submit call's uniform capture (mtl_sub_capture_ubos) takes a list per recording instead of walking every uniform bind
    (13,800 a frame, 0.2 ms on the frame's critical path, 2026-10-31). Deduplicated here with a small open-addressing set. */
 typedef struct { uint64_t lo, hi; } ubo_range_t;
-static __thread ubo_range_t *t_ubo; static __thread uint32_t t_ubo_cap, t_ubo_n;
-static __thread ubo_range_t *t_ubo_set; static __thread uint32_t t_ubo_set_mask;
-static void ubo_range_note(uint64_t lo, uint64_t hi) {
-    if (!t_ubo_set || t_ubo_n * 2 >= t_ubo_set_mask) {   /* grow (or first use), then re-insert the list so far */
-        uint32_t size = t_ubo_set ? (t_ubo_set_mask + 1) * 2 : 4096; free(t_ubo_set); t_ubo_set = calloc(size, sizeof *t_ubo_set); if (!t_ubo_set) die("uniform range set"); t_ubo_set_mask = size - 1;
-        for (uint32_t i = 0; i < t_ubo_n; i++) { uint32_t k = (uint32_t)((t_ubo[i].lo ^ t_ubo[i].hi * 0x9E3779B97F4A7C15ull) * 0xBF58476D1CE4E5B9ull >> 40) & t_ubo_set_mask;
-            while (t_ubo_set[k].hi) k = (k + 1) & t_ubo_set_mask; t_ubo_set[k] = t_ubo[i]; } }
-    uint32_t k = (uint32_t)((lo ^ hi * 0x9E3779B97F4A7C15ull) * 0xBF58476D1CE4E5B9ull >> 40) & t_ubo_set_mask;
-    for (;; k = (k + 1) & t_ubo_set_mask) { if (!t_ubo_set[k].hi) break; if (t_ubo_set[k].lo == lo && t_ubo_set[k].hi == hi) return; }
-    t_ubo_set[k] = (ubo_range_t){lo, hi};
-    if (t_ubo_n == t_ubo_cap) { t_ubo_cap = t_ubo_cap ? t_ubo_cap * 2 : 2048; t_ubo = realloc(t_ubo, t_ubo_cap * sizeof *t_ubo); if (!t_ubo) die("uniform range list"); }
-    t_ubo[t_ubo_n++] = (ubo_range_t){lo, hi};
+/* the op index and the uniform ranges of the recording being flattened, per recording thread. One thread-local whose
+   address flatten_recording takes once: this library is loaded after start, so every thread-local access is a call into
+   the linker's dynamic resolver (tlsdesc_resolver_dynamic), which per op and per uniform bind was 1.5% of the process's
+   CPU on the game's threads */
+typedef struct { uint32_t *idx; uint32_t idx_cap; ubo_range_t *ubo; uint32_t ubo_cap, ubo_n; ubo_range_t *ubo_set; uint32_t ubo_set_mask; } rec_scratch;
+static __thread rec_scratch t_rec;
+static void ubo_range_note(rec_scratch *T, uint64_t lo, uint64_t hi) {
+    if (!T->ubo_set || T->ubo_n * 2 >= T->ubo_set_mask) {   /* grow (or first use), then re-insert the list so far */
+        uint32_t size = T->ubo_set ? (T->ubo_set_mask + 1) * 2 : 4096; free(T->ubo_set); T->ubo_set = calloc(size, sizeof *T->ubo_set); if (!T->ubo_set) die("uniform range set"); T->ubo_set_mask = size - 1;
+        for (uint32_t i = 0; i < T->ubo_n; i++) { uint32_t k = (uint32_t)((T->ubo[i].lo ^ T->ubo[i].hi * 0x9E3779B97F4A7C15ull) * 0xBF58476D1CE4E5B9ull >> 40) & T->ubo_set_mask;
+            while (T->ubo_set[k].hi) k = (k + 1) & T->ubo_set_mask; T->ubo_set[k] = T->ubo[i]; } }
+    uint32_t k = (uint32_t)((lo ^ hi * 0x9E3779B97F4A7C15ull) * 0xBF58476D1CE4E5B9ull >> 40) & T->ubo_set_mask;
+    for (;; k = (k + 1) & T->ubo_set_mask) { if (!T->ubo_set[k].hi) break; if (T->ubo_set[k].lo == lo && T->ubo_set[k].hi == hi) return; }
+    T->ubo_set[k] = (ubo_range_t){lo, hi};
+    if (T->ubo_n == T->ubo_cap) { T->ubo_cap = T->ubo_cap ? T->ubo_cap * 2 : 2048; T->ubo = realloc(T->ubo, T->ubo_cap * sizeof *T->ubo); if (!T->ubo) die("uniform range list"); }
+    T->ubo[T->ubo_n++] = (ubo_range_t){lo, hi};
 }
 /* the vertex binding indices whose two-copy neighbours the capture takes (mtl_mv_banks, Vulkan backend; none without
    it), read once */
@@ -1257,7 +1260,8 @@ static uint8_t *flatten_recording(const uint8_t *p, size_t hint) {
     size_t n = sizeof(copy_prefix), cap = sizeof(copy_prefix) + hint + hint / 4 + 64; uint8_t *out = malloc(cap);
     int bulk_ok = 1; uint32_t last_size = 0, nidx = 0, ncall = 0, nmark = 0; int idx_ok = 1;
     if (!out) die("command copy allocation");
-    t_ubo_n = 0; if (t_ubo_set) memset(t_ubo_set, 0, (size_t)(t_ubo_set_mask + 1) * sizeof *t_ubo_set);
+    rec_scratch *T = &t_rec;
+    T->ubo_n = 0; if (T->ubo_set) memset(T->ubo_set, 0, (size_t)(T->ubo_set_mask + 1) * sizeof *T->ubo_set);
     const uint8_t *run = p; size_t run_n = n;   /* ops are copied one contiguous segment run at a time */
     for (;;) {
         op_hdr h; memcpy(&h, p, sizeof h);
@@ -1269,33 +1273,33 @@ static uint8_t *flatten_recording(const uint8_t *p, size_t hint) {
         else if (h.op == OP_BEGIN && h.size >= 32) nmark++;
         else if (h.op != OP_END && h.op != OP_BEGIN) last_size = h.size;
         if (n + h.size > cap) { while (n + h.size > cap) cap *= 2; out = realloc(out, cap); if (!out) die("command copy allocation"); }
-        if (h.op == OP_BIND_UBO) { p_bind_buf b; memcpy(&b, p + 8, sizeof b); if (b.addr && b.size && b.size <= 65536) { ubo_range_note(b.addr, b.addr + b.size);
+        if (h.op == OP_BIND_UBO) { p_bind_buf b; memcpy(&b, p + 8, sizeof b); if (b.addr && b.size && b.size <= 65536) { ubo_range_note(T, b.addr, b.addr + b.size);
             /* per-object motion vectors (Vulkan backend): the game writes these vertex blocks into two copies that take turns,
                addr and addr +- the size rounded up to 256; the copy not written this frame still holds last frame's when
                the frame is submitted, so both neighbours are captured with the bound block (a neighbour that is not
                mapped is zeroed by the capture's fault-safe copy) */
             if (b.stage == 0 && (unsigned)b.index < 32 && mv_banks() >> b.index & 1) { uint64_t step = (b.size + 255) & ~(uint64_t)255;
-                ubo_range_note(b.addr + step, b.addr + step + b.size); if (b.addr >= step) ubo_range_note(b.addr - step, b.addr - step + b.size); } } }
+                ubo_range_note(T, b.addr + step, b.addr + step + b.size); if (b.addr >= step) ubo_range_note(T, b.addr - step, b.addr - step + b.size); } } }
         if (h.op == OP_CALL) ncall++;
         if (op_indexed(h.op) && idx_ok) {
             if (n - sizeof(copy_prefix) > UINT32_MAX) idx_ok = 0;
-            else { if (nidx == t_idx_cap) { t_idx_cap = t_idx_cap ? t_idx_cap * 2 : 4096; t_idx = realloc(t_idx, t_idx_cap * sizeof *t_idx); if (!t_idx) die("command op index"); }
-                   t_idx[nidx++] = (uint32_t)(n - sizeof(copy_prefix)); }
+            else { if (nidx == T->idx_cap) { T->idx_cap = T->idx_cap ? T->idx_cap * 2 : 4096; T->idx = realloc(T->idx, T->idx_cap * sizeof *T->idx); if (!T->idx) die("command op index"); }
+                   T->idx[nidx++] = (uint32_t)(n - sizeof(copy_prefix)); }
         }
         n += h.size;
         if (h.op == OP_END) {
             memcpy(out + run_n, run, n - run_n);
-            size_t ops_end = n, idx_bytes = idx_ok ? (size_t)nidx * sizeof *t_idx : 0;
+            size_t ops_end = n, idx_bytes = idx_ok ? (size_t)nidx * sizeof *T->idx : 0;
             if (n + idx_bytes > cap) { cap = n + idx_bytes; out = realloc(out, cap); if (!out) die("command copy allocation"); }
-            if (idx_bytes) memcpy(out + n, t_idx, idx_bytes);
+            if (idx_bytes) memcpy(out + n, T->idx, idx_bytes);
             n += idx_bytes;
-            size_t ubo_at = n, ubo_bytes = (size_t)t_ubo_n * sizeof *t_ubo;
+            size_t ubo_at = n, ubo_bytes = (size_t)T->ubo_n * sizeof *T->ubo;
             if (n + ubo_bytes > cap) { cap = n + ubo_bytes; out = realloc(out, cap); if (!out) die("command copy allocation"); }
-            if (ubo_bytes) { ubo_ranges_sort(t_ubo, t_ubo_n); memcpy(out + n, t_ubo, ubo_bytes); }
+            if (ubo_bytes) { ubo_ranges_sort(T->ubo, T->ubo_n); memcpy(out + n, T->ubo, ubo_bytes); }
             n += ubo_bytes;
             copy_prefix *c = (copy_prefix *)out; c->magic = COPY_MAGIC; c->used_at = 0; c->made_at = g_submits; c->used = 0; c->hw_bytes = 0;
             c->idx_off = idx_ok && ops_end - sizeof(copy_prefix) <= UINT32_MAX ? (uint32_t)(ops_end - sizeof(copy_prefix)) : 0; c->nidx = c->idx_off ? nidx : 0;
-            c->ubo_off = ubo_at - sizeof(copy_prefix) <= UINT32_MAX ? (uint32_t)(ubo_at - sizeof(copy_prefix)) : 0; c->nubo = c->ubo_off ? t_ubo_n : 0; c->ncall = ncall; c->nmark = nmark;
+            c->ubo_off = ubo_at - sizeof(copy_prefix) <= UINT32_MAX ? (uint32_t)(ubo_at - sizeof(copy_prefix)) : 0; c->nubo = c->ubo_off ? T->ubo_n : 0; c->ncall = ncall; c->nmark = nmark;
             c->serial = atomic_fetch_add(&g_copy_serial, 1) + 1; atomic_store(&c->pinned, 0); c->pad2_ = 0; c->cb = 0;
             size_t body = ops_end >= sizeof(copy_prefix) + 16 ? ops_end - sizeof(copy_prefix) - 16 : 0;
             c->body_bytes = bulk_ok && h.size == 8 && body <= UINT32_MAX ? (uint32_t)body : 0;
