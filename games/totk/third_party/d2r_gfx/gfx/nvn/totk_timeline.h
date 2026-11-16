@@ -33,7 +33,32 @@ enum {
     TL_REC_COPY,                    /* TOTK Android: CopyCommands / CallCommands inlines handle a into command buffer b */
     TL_PLAN,                        /* TOTK Android: a present's requested time (VK_GOOGLE_display_timing): a = present id, b = desired time (0 none) */
     TL_READY,                       /* TOTK Android: a present's GPU work finished: t = its copy to the screen image, a = present id, b = the work before it */
+    TL_MARK,                        /* TOTK Android: a step of the frame hand-off (a = TL_MARK_* below, b = a value of that step) */
 };
+/* TL_MARK a: the submit call (game thread) and the start of its replay (translation and recording threads) */
+enum { TL_MARK_DEFERRED = 1,        /* deferred texture handles read */
+       TL_MARK_CAPTURE_INDEX,       /* the uniform capture's ranges and buffer are ready */
+       TL_MARK_HANDED_OFF,          /* the submission is queued for the translation thread */
+       TL_MARK_CAPTURE_BYTES,       /* the captured bytes are in */
+       TL_MARK_REPLAY_READY,        /* the replay installed the capture and may start on the first op */
+       TL_MARK_CAPTURE_WAIT_IN,     /* the translation thread waits for the captured bytes */
+       TL_MARK_CAPTURE_WAIT_OUT,
+       TL_MARK_QUEUE_SUBMIT,        /* vkQueueSubmit of recorded work, on the thread that calls the driver (b = 1 with a fence) */
+       TL_MARK_FIRST_DRAW,          /* the submission's first draw reaches draw_graphics */
+       TL_MARK_SLOT_WAIT_IN,        /* beginning a batch waits for one of the batch slots (b = 1 for the present's batch) */
+       TL_MARK_SLOT_WAIT_OUT,
+       TL_MARK_DRAIN_IN,            /* the present waits for the recording thread to replay what was published */
+       TL_MARK_DRAIN_OUT,
+       TL_MARK_PRESENT_CALL_IN,     /* vkQueuePresentKHR */
+       TL_MARK_PRESENT_CALL_OUT,
+       TL_MARK_GPU_WAIT_IN,         /* a CPU wait for a fence that has not passed (b = the caller's offset in its library) */
+       TL_MARK_GPU_WAIT_OUT,
+       TL_MARK_JOB,                 /* the translation thread starts a job (b = 1 submit, 2 present, 3 texture release, 4 plan) */
+       TL_MARK_JOB_END,
+       TL_MARK_ACQUIRE_IN,          /* vkAcquireNextImageKHR */
+       TL_MARK_ACQUIRE_OUT,
+       TL_MARK_PRESENT_ONE_IN,      /* one picture's present, from the blit's recording to the driver's present (b = 1 a generated or repeated picture) */
+       TL_MARK_PRESENT_ONE_OUT };
 #define TL_INPUT_SCRIPTED (1ull << 40)   /* TL_INPUT a: input.now set stick axis (a & 0xff) to b (latency_report.py: a >> 40) */
 
 int totk_tl_on(void);                                   /* the window is open (cheap after the first call) */

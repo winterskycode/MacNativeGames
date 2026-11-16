@@ -3266,7 +3266,11 @@ static void *x_thread(void *unused) {
     for (;;) {
         pthread_mutex_lock(&g_xq_mu);
         while (g_xq_done == g_xq_in && g_pq_in == g_pq_out && g_frz.state != FRZ_REPLAY) pthread_cond_wait(&g_xq_cv, &g_xq_mu);
-        if (g_xq_done == g_xq_in && g_pq_in != g_pq_out) { plan_job pj = g_pq[g_pq_out++ % PQ]; pthread_mutex_unlock(&g_xq_mu); plan_run(&pj); continue; }   /* idle: plan a finished recording */
+        if (g_xq_done == g_xq_in && g_pq_in != g_pq_out) { plan_job pj = g_pq[g_pq_out++ % PQ]; pthread_mutex_unlock(&g_xq_mu);
+            totk_tl(TL_MARK, TL_MARK_JOB, 4);
+            plan_run(&pj);
+            totk_tl(TL_MARK, TL_MARK_JOB_END, 4);
+            continue; }   /* idle: plan a finished recording */
         if (g_xq_done == g_xq_in) {   // frozen and nothing queued
             pthread_mutex_unlock(&g_xq_mu);
             int ran = 0; if (gfx_try_enter()) { pthread_mutex_lock(&g_frz_ex); ran = frz_replay(); pthread_mutex_unlock(&g_frz_ex); gfx_leave(); }
@@ -3274,6 +3278,7 @@ static void *x_thread(void *unused) {
             continue; }
         xjob j = g_xq[g_xq_done % XQ];
         pthread_mutex_unlock(&g_xq_mu);
+        totk_tl(TL_MARK, TL_MARK_JOB, (uint64_t)j.kind);
         if (g_frz.state == FRZ_ARMED && j.kind != XJ_TEXREL) frz_begin_recording();
         if (g_frz.state == FRZ_REC && j.kind != XJ_TEXREL) frz_record(&j);
         if (j.kind == XJ_SUBMIT) { if (mtl_sub_job_time) mtl_sub_job_time(j.ns); submit_exec(j.n, j.h, j.ucap); free(j.h); }
@@ -3286,6 +3291,7 @@ static void *x_thread(void *unused) {
             present_exec(j.win, j.idx, j.period, j.crop, j.frame);
             frz_after_present();
         }
+        totk_tl(TL_MARK, TL_MARK_JOB_END, (uint64_t)j.kind);
         pthread_mutex_lock(&g_xq_mu);
         if (j.kind == XJ_SUBMIT) { g_xsub_fence[j.sub % XF] = mtl_last_fence(); g_xsub_done = j.sub; }
         g_xq_done++;
@@ -3407,7 +3413,7 @@ NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h)
         uint64_t sub = async_replay() || qo_replay_async() ? xsub_pushed() + 1 : 0;
         for (int i = 0; i < n; i++) resolve_deferred((const uint8_t *)h[i], 0, sub);
         if (n > 0 && copy_of(h[n - 1])->magic == COPY_MAGIC) __atomic_store_n(&g_root_cb, copy_of(h[n - 1])->cb, __ATOMIC_RELAXED);
-        g_def_ns += now_ns() - r0;
+        g_def_ns += now_ns() - r0; totk_tl(TL_MARK, TL_MARK_DEFERRED, 0);
         if (((queue_t *)q)->submits % 600 == 0) { LOG("[nvn] 延迟绑定 至提交 %llu：提交时读句柄 %llu 次，其中与录制时不同 %llu 次；每次提交读句柄平均 %.3f ms", (unsigned long long)((queue_t *)q)->submits, (unsigned long long)g_def_n, (unsigned long long)g_def_changed, g_def_ns / 1e6 / (double)((queue_t *)q)->submits);
             LOG("[nvn] deferred binds in copies called by reference: %llu waits for an earlier submission's replay (%.2f ms in all), %llu gave up after 50 ms", (unsigned long long)g_def_waits, g_def_wait_ns / 1e6, (unsigned long long)g_def_gaveup); }
     }
@@ -3418,10 +3424,12 @@ NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h)
         if (!j.h) die("submit job");
         memcpy(j.h, h, sizeof(uint64_t) * (size_t)n);
         j.ucap = mtl_sub_capture_ubos((const uint64_t *)h, n);   /* the ranges and their buffer */
+        totk_tl(TL_MARK, TL_MARK_CAPTURE_INDEX, 0);
         static int early = -1; if (early < 0) { const char *e = getenv("TOTK_VK_UCAP_EARLY"); early = e && atoi(e); }   /* =1: the bytes before the hand-off (the old order, for an A/B) */
         void *ucap = j.ucap; if (early) mtl_sub_capture_copy(ucap);
-        x_push(&j);
+        x_push(&j); totk_tl(TL_MARK, TL_MARK_HANDED_OFF, 0);
         mtl_sub_capture_copy(ucap);   /* the bytes, while the translation thread starts on the handles; the call returns only once they are in */
+        totk_tl(TL_MARK, TL_MARK_CAPTURE_BYTES, 0);
         gfx_leave();
         totk_tl(TL_SUB_OUT, 1, 0);
 #ifdef GAME_BOTW
@@ -3477,6 +3485,7 @@ static void submit_exec(int n, const uint64_t *h, void *ucap) {
         if (stereo && project && pass == 1) (void)mtl_ucap_eye(cap, 1);   // the right eye's projection into the second replay's uniforms
         mtl_sub_begin();
         mtl_sub_snapshot_ubos_cap((const uint64_t *)h, n, cap);   // TOTK: uniforms as of the submit call (cap: bytes captured there)
+        totk_tl(TL_MARK, TL_MARK_REPLAY_READY, 0);
         mtl_sub_index((const uint64_t *)h, n);
         for (int i = 0; i < n; i++) { mtl_exec_rest((const uint64_t *)h + i + 1, n - i - 1); mtl_exec((const uint8_t *)h[i]); }
         mtl_exec_rest(NULL, 0);

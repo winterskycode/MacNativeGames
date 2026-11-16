@@ -75,6 +75,10 @@ void totk_tl_at_frame(int kind, uint64_t t_ns, uint64_t frame, uint64_t a, uint6
        (TL_REC_COPY alone is ~3,500 events a frame), far short of a latency window */
     { static int lean = -1; if (lean < 0) { const char *e = getenv("TOTK_TIMELINE_LEAN"); lean = e && atoi(e) > 0; }
       if (lean && kind != TL_INPUT && kind != TL_SHOWN && kind != TL_PIXELS && kind != TL_PRES_IN && kind != TL_PRES_OUT && kind != TL_PLAN && kind != TL_READY) return; }
+    /* TOTK Android: TOTK_TIMELINE_NOCOPY=1 drops TL_REC_COPY (~3,500 events a frame): the window then holds ~4x the frames
+       and the recording threads are not slowed by the events */
+    { static int nocopy = -1; if (nocopy < 0) { const char *e = getenv("TOTK_TIMELINE_NOCOPY"); nocopy = e && atoi(e) > 0; }
+      if (nocopy && kind == TL_REC_COPY) return; }
     if (g_gpu_only && kind >= TL_GW_IN && kind <= TL_CW_OUT) return;
     atomic_fetch_add(&g_writers, 1);
     if (atomic_load(&g_state) != 2) { atomic_fetch_sub(&g_writers, 1); return; }
@@ -109,7 +113,7 @@ static void tl_write(void) {
     static const char *names[] = {"?", "sub_in", "sub_out", "rep_begin", "rep_end", "commit", "gpu", "wait_in", "wait_out",
                                   "acq_in", "acq_out", "pres_in", "pres_out", "finish_in", "finish_out", "fence", "rs_join",
                                   "pass_begin", "pass_end", "gw_in", "gw_out", "gwake", "cw_in", "cw_out", "wb_in", "wb_out", "wb_step",
-                                  "input", "shown", "pixels", "rec_end", "rec_begin", "rec_copy", "plan", "ready"};
+                                  "input", "shown", "pixels", "rec_end", "rec_begin", "rec_copy", "plan", "ready", "mark"};
     for (uint64_t i = 0; i < n; i++) {
         const tl_ev *e = &g_ev[i];
         fprintf(f, "%llu\t%s\t%u\t%llu\t%llu\t%llu\n", (unsigned long long)e->t, e->kind < sizeof names / sizeof *names ? names[e->kind] : "?",
