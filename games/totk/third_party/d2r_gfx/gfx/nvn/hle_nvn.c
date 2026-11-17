@@ -1259,9 +1259,10 @@ typedef struct { uint64_t magic; _Atomic uint64_t used_at; uint64_t made_at; uin
                  _Atomic uint32_t walk; uint32_t rec_bytes; void *lists; uint32_t *idx_list; void *ubo_list;
                  /* ndefer: deferred binds in the body and in the copies it calls (copy_walk); held: OP_CALL records naming this copy in recordings and copies
                     not yet freed (call_ref); dropped: released by the game while held, freed with the last hold; call_list:
-                    the offsets of the body's ncall OP_CALL records (in lists); res_sub: the last submission whose deferred-bind
-                    resolution read this copy through a call (resolve_deferred) */
-                 uint32_t ndefer; _Atomic uint32_t held; uint32_t dropped, pad3_; uint32_t *call_list; uint64_t res_sub; } copy_prefix;   /* walk: 0 to do, 1 being walked, 2 done (copy_walk: the op index, uniform ranges, bulk and marker fields); rec_bytes: the body with BEGIN and END; lists: one allocation holding idx_list and ubo_list */   /* used: called or submitted at least once (NVN 53 lifetime, release_copies; Breath of the Wild); hw_bytes: the recording's command memory on hardware (EndRecording), what CopyCommands of it adds (inline_recording) */
+                    the offsets of the body's ncall OP_CALL records (in lists), followed by ndfr more: the offsets of its deferred
+                    binds and of its calls of copies that have some (UINT32_MAX: no such list, resolve_deferred walks the op index);
+                    res_sub: the last submission whose deferred-bind resolution read this copy through a call (resolve_deferred) */
+                 uint32_t ndefer; _Atomic uint32_t held; uint32_t dropped, ndfr; uint32_t *call_list; uint64_t res_sub; } copy_prefix;   /* walk: 0 to do, 1 being walked, 2 done (copy_walk: the op index, uniform ranges, bulk and marker fields); rec_bytes: the body with BEGIN and END; lists: one allocation holding idx_list and ubo_list */   /* used: called or submitted at least once (NVN 53 lifetime, release_copies; Breath of the Wild); hw_bytes: the recording's command memory on hardware (EndRecording), what CopyCommands of it adds (inline_recording) */
 static _Atomic uint64_t g_copy_serial;
 /* CallCommands by reference, counted by the walks of the calling copies (a counter every recording thread incremented
    at each call was a quarter of the call's time); copies made for deferred binds are rare and counted at the call */
@@ -1298,7 +1299,7 @@ typedef struct { uint64_t lo, hi; } ubo_range_t;
    address copy_walk takes once: this library is loaded after start, so every thread-local access is a call into
    the linker's dynamic resolver (tlsdesc_resolver_dynamic), which per op and per uniform bind was 1.5% of the process's
    CPU on the game's threads */
-typedef struct { uint32_t *idx; uint32_t idx_cap; ubo_range_t *ubo; uint32_t ubo_cap, ubo_n; ubo_range_t *ubo_set; uint32_t ubo_set_mask; uint32_t *calls; uint32_t calls_cap; } rec_scratch;
+typedef struct { uint32_t *idx; uint32_t idx_cap; ubo_range_t *ubo; uint32_t ubo_cap, ubo_n; ubo_range_t *ubo_set; uint32_t ubo_set_mask; uint32_t *calls; uint32_t calls_cap; uint32_t *dfr; uint32_t dfr_cap; } rec_scratch;
 static __thread rec_scratch t_rec;
 static void ubo_range_note(rec_scratch *T, uint64_t lo, uint64_t hi) {
     if (!T->ubo_set || T->ubo_n * 2 >= T->ubo_set_mask) {   /* grow (or first use), then re-insert the list so far */
@@ -1361,8 +1362,10 @@ static uint8_t *copy_recording(const uint8_t *p, size_t len) {
 }
 static void copy_walk(copy_prefix *c) {   /* the walk: c->walk is 1, set by the caller that claimed it */
     const uint8_t *base = (const uint8_t *)(c + 1), *p = base, *end = base + c->rec_bytes;
-    int bulk_ok = 1, idx_ok = 1; uint32_t last_size = 0, nidx = 0, ncall = 0, nmark = 0, ndefer = 0, end_size = 0; size_t n = 0; uint64_t called_bytes = 0;
+    int bulk_ok = 1, idx_ok = 1, dfr_ok = 1; uint32_t last_size = 0, nidx = 0, ncall = 0, nmark = 0, ndefer = 0, ndfr = 0, end_size = 0; size_t n = 0; uint64_t called_bytes = 0;
     rec_scratch *T = &t_rec;
+    /* the ops resolve_deferred visits at each submit: deferred binds, and calls of copies that have some */
+    #define DFR_NOTE() do { if (n > UINT32_MAX) dfr_ok = 0; else { if (ndfr == T->dfr_cap) { T->dfr_cap = T->dfr_cap ? T->dfr_cap * 2 : 256; T->dfr = realloc(T->dfr, T->dfr_cap * sizeof *T->dfr); if (!T->dfr) die("deferred bind list"); } T->dfr[ndfr++] = (uint32_t)n; } } while (0)
     T->ubo_n = 0; if (T->ubo_set) memset(T->ubo_set, 0, (size_t)(T->ubo_set_mask + 1) * sizeof *T->ubo_set);
     for (;;) {
         if ((size_t)(end - p) < 8) die("recording %p runs past its %u bytes", (const void *)base, c->rec_bytes);
@@ -1391,9 +1394,10 @@ static void copy_walk(copy_prefix *c) {   /* the walk: c->walk is 1, set by the 
             /* walked before the call was recorded (inline_recording); a walk here would reuse this walk's scratch */
             if (atomic_load_explicit(&tc->walk, memory_order_acquire) == 0) die("recording %p calls %p, which was never walked", (const void *)base, (const void *)(tc + 1));
             copy_ready(tc); called_bytes += tc->rec_bytes; call_hist_note(tc->rec_bytes); ndefer += tc->ndefer;
+            if (tc->ndefer) DFR_NOTE();
             const ubo_range_t *cr = (const ubo_range_t *)tc->ubo_list; for (uint32_t i = 0; i < tc->nubo; i++) ubo_range_note(T, cr[i].lo, cr[i].hi);
         }
-        else if (h.op == OP_BIND_TEX || h.op == OP_BIND_IMG || h.op == OP_BIND_SAMP) { uint64_t src; memcpy(&src, p + 8 + offsetof(p_bind_handles, src), 8); if (src) ndefer++; }
+        else if (h.op == OP_BIND_TEX || h.op == OP_BIND_IMG || h.op == OP_BIND_SAMP) { uint64_t src; memcpy(&src, p + 8 + offsetof(p_bind_handles, src), 8); if (src) { ndefer++; DFR_NOTE(); } }
         if (op_indexed(h.op) && idx_ok) {
             if (n > UINT32_MAX) idx_ok = 0;
             else { if (nidx == T->idx_cap) { T->idx_cap = T->idx_cap ? T->idx_cap * 2 : 4096; T->idx = realloc(T->idx, T->idx_cap * sizeof *T->idx); if (!T->idx) die("command op index"); }
@@ -1403,18 +1407,22 @@ static void copy_walk(copy_prefix *c) {   /* the walk: c->walk is 1, set by the 
         if (h.op == OP_END) { end_size = h.size; break; }
         p += h.size;
     }
+    #undef DFR_NOTE
+    if (!dfr_ok) ndfr = 0;
     size_t idx_bytes = idx_ok ? (size_t)nidx * sizeof *T->idx : 0, ubo_at = (idx_bytes + 15) & ~(size_t)15, ubo_bytes = (size_t)T->ubo_n * sizeof *T->ubo,
-           calls_at = ubo_at + ubo_bytes, calls_bytes = (size_t)ncall * sizeof *T->calls;
+           calls_at = ubo_at + ubo_bytes, calls_bytes = (size_t)ncall * sizeof *T->calls, dfr_bytes = (size_t)ndfr * sizeof *T->dfr;
     static uint64_t empty_list[2];   /* an index or range list with no entries is there (not NULL) but empty */
     uint8_t *lists = NULL;
-    if (idx_bytes || ubo_bytes || calls_bytes) {
-        lists = malloc(calls_at + calls_bytes); if (!lists) die("command copy lists");
+    if (idx_bytes || ubo_bytes || calls_bytes || dfr_bytes) {
+        lists = malloc(calls_at + calls_bytes + dfr_bytes); if (!lists) die("command copy lists");
         if (idx_bytes) memcpy(lists, T->idx, idx_bytes);
         if (ubo_bytes) { ubo_ranges_sort(T->ubo, T->ubo_n); memcpy(lists + ubo_at, T->ubo, ubo_bytes); }
         if (calls_bytes) memcpy(lists + calls_at, T->calls, calls_bytes);
+        if (dfr_bytes) memcpy(lists + calls_at + calls_bytes, T->dfr, dfr_bytes);
         g_copy_bytes += malloc_size(lists);
     }
-    c->call_list = calls_bytes ? (uint32_t *)(lists + calls_at) : (uint32_t *)empty_list;
+    c->call_list = calls_bytes || dfr_bytes ? (uint32_t *)(lists + calls_at) : (uint32_t *)empty_list;
+    c->ndfr = dfr_ok ? ndfr : UINT32_MAX;
     if (ncall) call_stats_walk(ncall, called_bytes);
     c->lists = lists;
     c->idx_off = (uint32_t)idx_ok; c->nidx = idx_ok ? nidx : 0; c->idx_list = !idx_ok ? NULL : idx_bytes ? (uint32_t *)lists : (uint32_t *)empty_list;
@@ -2728,8 +2736,9 @@ static void resolve_shared_wait(copy_prefix *c, uint64_t sub) {
 /* sub: this submission's number among the translation thread's submissions (0: none is queued) */
 static void resolve_deferred(const uint8_t *p, int depth, uint64_t sub) {   // read the handles of every deferred bind in a submitted recording
     uint32_t nx; const uint32_t *ix = nvn_copy_op_index((uint64_t)(uintptr_t)p, &nx);
-    if (ix) {   /* a copy made by EndRecording: only the indexed ops */
-        copy_prefix *self = depth ? copy_of((NVNcommandHandle)(uintptr_t)p) : NULL; int waited = 0;
+    if (ix) {   /* a copy made by EndRecording: only its deferred binds and the calls leading to more (copy_walk), else the indexed ops */
+        copy_prefix *me = copy_of((NVNcommandHandle)(uintptr_t)p), *self = depth ? me : NULL; int waited = 0;
+        if (me->ndfr != UINT32_MAX) { ix = me->call_list + me->ncall; nx = me->ndfr; }
         for (uint32_t i = 0; i < nx; i++) {
             const uint8_t *q = p + ix[i]; op_hdr h; memcpy(&h, q, sizeof h);
             if (h.op == OP_CALL) { uint64_t t; memcpy(&t, q + 8, 8); if (depth >= 16) die("deferred bind resolution: call depth over 16");
