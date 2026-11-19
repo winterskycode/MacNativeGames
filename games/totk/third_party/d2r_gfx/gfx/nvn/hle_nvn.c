@@ -904,6 +904,7 @@ void nvn_set_sync_lag(int on) { atomic_store(&g_sync_lag, on != 0); LOG("[flag] 
 static uint64_t g_pf_fence[16]; static unsigned g_pf_n; static uint64_t g_sw_frame_lagged;
 static int sync_lag_frame_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_SYNC_LAG"); v = e && atoi(e) == 2; if (v) LOG("[nvn] TOTK_SYNC_LAG=2：等上一帧渲染栅栏时放宽到再上一帧末（实验）| a wait inside frame i settles for the end of frame i-1"); } return v; }
 static int sync_lag_on(void) { int v = atomic_load(&g_sync_lag); if (v < 0) { const char *e = getenv("TOTK_SYNC_LAG"); v = e ? atoi(e) == 1 : SYNC_LAG_DEFAULT; atomic_store(&g_sync_lag, v); if (v) LOG("[nvn] TOTK_SYNC_LAG=1：游戏等最近一次提交的 GPU 完成时放宽到上一次提交 | waits for the newest submission settle for the one before it"); } return v; }
+static void boundary_arm(void);
 NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     NVN_BLOCKING();
     const sync_t *o = (const sync_t *)s;
@@ -937,6 +938,7 @@ NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     if (sync_chain_left(1)) { char w[96]; snprintf(w, sizeof w, "SyncWait sync=%p fence=%llu newest=%d", (const void *)s, (unsigned long long)o->fence, o->fence == mtl_last_fence()); guest_chain(w); }
     int ok = tok ? fence_wait_to(o->fence, want, timeout) : mtl_wait(want, timeout);
     totk_tl(TL_WAIT_OUT, o->fence, ok);
+    if (ok) boundary_arm();
     { void qo_note(uint32_t, const void *, uint64_t, uint64_t); qo_note(16, s, o->fence, (uint64_t)ok); }
     if (lg) { atomic_fetch_add(&g_sw_blocked[k], 1); atomic_fetch_add(&g_sw_ns[k], now_ns() - t0); }
     if (ok) { survey_after_wait(s); mtl_wb_fence_done(); }
@@ -3073,6 +3075,29 @@ static xjob g_xq[XQ];
 static uint64_t g_xq_in, g_xq_done, g_xsub_in, g_xsub_done, g_xsub_fence[XF];
 static pthread_mutex_t g_xq_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_xq_cv = PTHREAD_COND_INITIALIZER;
+/* Boundary spin (TOTK_BOUNDARY_SPIN_US=<us>, default off): the game blocks in nvnSyncWait once a frame, on its main
+   thread, and the next frame's submit reaches the translation thread about 0.6 ms after that wait ends. At that wake the
+   translation thread and the recording worker are woken ahead of their work and spin for the window (or until the work
+   arrives), so neither wakes cold from a futex when the frame is handed over. */
+static _Atomic uint64_t g_bnd_until;
+static _Atomic uint64_t g_bnd_arms, g_bnd_hits, g_bnd_spin_ns;
+static uint64_t bnd_clock_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
+static uint64_t bnd_window_ns(void) {
+    static int64_t v = -1;
+    if (v < 0) { const char *e = getenv("TOTK_BOUNDARY_SPIN_US"); int64_t w = e && *e ? atoll(e) * 1000 : 0; if (w < 0) w = 0; v = w; if (w) LOG("[nvn] boundary spin: %lld us after each blocking sync wait", (long long)(w / 1000)); }
+    return (uint64_t)v;
+}
+/* nvn_vulkan_defer.inc */
+void nvn_vkrec_boundary_arm(uint64_t window_ns) __attribute__((weak));
+static void boundary_arm(void) {
+    uint64_t w = bnd_window_ns(); if (!w) return;
+    atomic_store(&g_bnd_until, bnd_clock_ns() + w);
+    uint64_t n = atomic_fetch_add(&g_bnd_arms, 1) + 1;
+    pthread_mutex_lock(&g_xq_mu); pthread_cond_broadcast(&g_xq_cv); pthread_mutex_unlock(&g_xq_mu);
+    if (nvn_vkrec_boundary_arm) nvn_vkrec_boundary_arm(w);
+    if (n % 600 == 0) { uint64_t h = atomic_exchange(&g_bnd_hits, 0), ns = atomic_exchange(&g_bnd_spin_ns, 0);
+        LOG("[nvn] boundary spin: %llu arms, translation work arrived while spinning %llu/600, spun %.3f ms/arm", (unsigned long long)n, (unsigned long long)h, ns / 600 / 1e6); }
+}
 /* Predecode (nvn_vulkan_plan.inc): a recording that just completed is offered to the translation thread, which, when it has
    no submit to translate, walks the recording's copy and plans its draws (shader variants, pipeline keys, vertex input) so
    that the translation at the submit finds them ready. The copy stays pinned while it is read. */
@@ -3270,11 +3295,26 @@ static void replay_leave(void) { if (async_replay()) pthread_mutex_unlock(&g_frz
 void nvn_replay_enter(void) { replay_enter(); }   // for the graphics layer (memory-pool write-back)
 void nvn_replay_leave(void) { replay_leave(); }
 static _Thread_local int t_on_x_thread;   // set on the translation thread: x_drain there would wait for itself
+/* the translation thread's CPU time so far, updated after each job (the backend's fill controller reads its load) */
+static _Atomic uint64_t g_x_cpu_ns;
+uint64_t nvn_translate_cpu_ns(void) { return atomic_load(&g_x_cpu_ns); }
 static void *x_thread(void *unused) {
     (void)unused; pthread_setname_np("totk-translate"); t_on_x_thread = 1; x_thread_pin();
     for (;;) {
         pthread_mutex_lock(&g_xq_mu);
-        while (g_xq_done == g_xq_in && g_pq_in == g_pq_out && g_frz.state != FRZ_REPLAY) pthread_cond_wait(&g_xq_cv, &g_xq_mu);
+        while (g_xq_done == g_xq_in && g_pq_in == g_pq_out && g_frz.state != FRZ_REPLAY) {
+            uint64_t until = atomic_load(&g_bnd_until), t = until ? bnd_clock_ns() : 0;
+            if (t && t < until) {
+                pthread_mutex_unlock(&g_xq_mu);
+                uint64_t t0 = t;
+                while (__atomic_load_n(&g_xq_in, __ATOMIC_RELAXED) == g_xq_done && __atomic_load_n(&g_pq_in, __ATOMIC_RELAXED) == g_pq_out && (t = bnd_clock_ns()) < until) __asm__ volatile("yield");
+                atomic_fetch_add(&g_bnd_spin_ns, t - t0);
+                if (t < until) atomic_fetch_add(&g_bnd_hits, 1);
+                pthread_mutex_lock(&g_xq_mu);
+                continue;
+            }
+            pthread_cond_wait(&g_xq_cv, &g_xq_mu);
+        }
         if (g_xq_done == g_xq_in && g_pq_in != g_pq_out) { plan_job pj = g_pq[g_pq_out++ % PQ]; pthread_mutex_unlock(&g_xq_mu);
             totk_tl(TL_MARK, TL_MARK_JOB, 4);
             plan_run(&pj);
@@ -3301,6 +3341,7 @@ static void *x_thread(void *unused) {
             frz_after_present();
         }
         totk_tl(TL_MARK, TL_MARK_JOB_END, (uint64_t)j.kind);
+        { struct timespec c; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &c); atomic_store(&g_x_cpu_ns, (uint64_t)c.tv_sec * 1000000000ull + (uint64_t)c.tv_nsec); }
         pthread_mutex_lock(&g_xq_mu);
         if (j.kind == XJ_SUBMIT) { g_xsub_fence[j.sub % XF] = mtl_last_fence(); g_xsub_done = j.sub; }
         g_xq_done++;
@@ -4137,6 +4178,23 @@ static uint64_t panel_period(uint64_t period) {
     { static uint64_t logged; if (logged != p) { logged = p; LOG("[nvn] frame clock %.3f ms: %llu refreshes of %.3f ms (period %.3f)", p / 1e6, (unsigned long long)n, r / 1e6, period / 1e6); } }
     return p;
 }
+/* Slot clock for frame generation fill: the game renders at a real rate below the cap (nvn_fill_real_set, or
+   TOTK_FILL_REAL_HZ as a fixed diagnostic value) and every one of its frames still starts on a slot of the cap, so a
+   real frame always takes whole slots and fill's pictures take the slots in between. Each frame waits the whole number
+   of slots that keeps the average at the real rate (60 cap, 45 real: 1, 1, 2 slots). 0: every slot is a real one. */
+static _Atomic int g_fill_real_hz = -1;
+void nvn_fill_real_set(int hz) { atomic_store(&g_fill_real_hz, hz > 0 ? hz : 0); }
+int nvn_fill_real_get(void) { int v = atomic_load(&g_fill_real_hz); return v > 0 ? v : 0; }
+static uint64_t fill_slots(uint64_t period, int cap_hz) {
+    int real = atomic_load(&g_fill_real_hz);
+    if (real < 0) { const char *e = getenv("TOTK_FILL_REAL_HZ"); real = e && atoi(e) > 0 ? atoi(e) : 0; atomic_store(&g_fill_real_hz, real); if (real) LOG("[nvn] fill slot clock: real frames at %d a second on slots of %d (TOTK_FILL_REAL_HZ)", real, cap_hz); }
+    static double owed;
+    if (!real || cap_hz <= 0 || real >= cap_hz || !period) { owed = 0; return period; }
+    owed += (double)cap_hz / real;
+    unsigned k = (unsigned)owed; if (k < 1) k = 1;
+    owed -= k;
+    return period * k;
+}
 static uint64_t present_period(const win_t *o) {
     unsigned itv = present_ticks(o); int m = mfx_enabled(), hz = g_uncapped && !uncapped_now() ? g_paced_hz : g_hz;
     { static int was = -1; if (was >= 0 && m != was)
@@ -4287,13 +4345,15 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     present_cfg(o);
     uint64_t t0 = now_ns();
     gfx_enter();
+    /* this frame's period on the fill slot clock, once: the backend's present gets it too (planned fill pictures) */
+    uint64_t slotted = fill_slots(present_period(o), g_hz);
     if (async_replay()) {   // TOTK: the present (and the replay frame number below) run on the translation thread, after this frame's submits
-        xjob j = {.kind = XJ_PRESENT, .win = o, .idx = idx, .period = present_period(o) / 1e9};
+        xjob j = {.kind = XJ_PRESENT, .win = o, .idx = idx, .period = slotted / 1e9};
         memcpy(j.crop, o->crop, sizeof j.crop);
         j.frame = g_frame + 1;   // dump_frame below advances g_frame before mtl_set_frame
         uint64_t no = x_push(&j);
         if (idx >= 0 && idx < 4) { g_xp_win = o; g_xp_job[idx] = no; }
-    } else if (qo_present(q, o, idx, present_period(o) / 1e9, o->crop, g_frame + 1)) g_qo_pdefer = 1;   // queued behind the frame (dump_frame below advances g_frame)
+    } else if (qo_present(q, o, idx, slotted / 1e9, o->crop, g_frame + 1)) g_qo_pdefer = 1;   // queued behind the frame (dump_frame below advances g_frame)
     else { g_qo_pdefer = 0; qo_drain(q); replay_enter();
         if (g_frz.state == FRZ_REC) { xjob j = {.kind = XJ_PRESENT, .win = o, .idx = idx, .period = present_period(o) / 1e9}; memcpy(j.crop, o->crop, sizeof j.crop); frz_record(&j); }
         present_exec(o, idx, present_period(o) / 1e9, o->crop, 0);
@@ -4437,7 +4497,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         LOG("[nvn] 翻译线程 至帧 %llu：排空等待 %llu 次 / %.1f ms（近 300 帧），队列中 %llu 项", (unsigned long long)g_frame, (unsigned long long)d, dn / 1e6, (unsigned long long)q); }
     // 真机语义：出图只入队、立即返回；本帧显示时刻按节拍器排，该贴图到「显示时刻 + 一个周期」才可再获取（阻塞在 AcquireTexture）
     // Real-device semantics: present only enqueues and returns immediately; this frame's display time is scheduled by the pacer, and the texture can be acquired again only at "display time + one period" (blocking in AcquireTexture)
-    uint64_t period = panel_period(present_period(o)), now = dm_detclock_enabled() ? guest_ns() : now_ns();
+    uint64_t period = panel_period(slotted), now = dm_detclock_enabled() ? guest_ns() : now_ns();
     if (totk_sr_on()) sr_frame(o);
     nvn_pacer pc = {o->pace};
     uint64_t slot = now + nvn_pace(&pc, now, period);
